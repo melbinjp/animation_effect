@@ -8,10 +8,15 @@ const ctx = canvas.getContext('2d');
 let opencvReady = false;
 let ffmpegReady = false;
 
-const { FFmpeg } = FFmpegWASM;
+const { FFmpeg, toBlobURL, fetchFile } = FFmpeg;
 const ffmpeg = new FFmpeg();
 
-function onOpenCvReady() {
+ffmpeg.on('log', ({ message }) => {
+    console.log(message);
+    statusElement.innerHTML = message;
+});
+
+window.onOpenCvReady = function() {
     statusElement.innerHTML = 'OpenCV.js is ready.';
     opencvReady = true;
     loadFFmpegBtn.disabled = false;
@@ -20,10 +25,9 @@ function onOpenCvReady() {
 loadFFmpegBtn.addEventListener('click', async () => {
     statusElement.innerHTML = 'Loading FFmpeg-core...';
     loadFFmpegBtn.disabled = true;
-    const { toBlobURL } = FFmpegWASM;
-    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.15/dist/umd'
+    const baseURL = 'vendor';
     await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'application/javascript'),
         wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
     });
     ffmpegReady = true;
@@ -89,7 +93,6 @@ async function cartoonizeVideo(video, file) {
     }
     statusElement.innerHTML = 'Processing video... this might take a while.';
 
-    const { fetchFile } = FFmpegWASM;
     await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
     const videoDuration = video.duration;
