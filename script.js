@@ -20,10 +20,11 @@ function onOpenCvReady() {
 loadFFmpegBtn.addEventListener('click', async () => {
     statusElement.innerHTML = 'Loading FFmpeg-core...';
     loadFFmpegBtn.disabled = true;
+    const { toBlobURL } = FFmpegWASM;
     const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.15/dist/umd'
     await ffmpeg.load({
-        coreURL: await FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
     });
     ffmpegReady = true;
     fileInput.disabled = false;
@@ -88,7 +89,7 @@ async function cartoonizeVideo(video, file) {
     }
     statusElement.innerHTML = 'Processing video... this might take a while.';
 
-    const { fetchFile } = FFmpegUtil;
+    const { fetchFile } = FFmpegWASM;
     await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
     const videoDuration = video.duration;
