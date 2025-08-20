@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cartoonizer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Cartoonizer</h1>
+    <p>Upload an image or video to turn it into a cartoon!</p>
+    <p id="status">Loading OpenCV.js...</p>
+    <button id="load-ffmpeg" disabled>Load FFmpeg</button>
+    <input type="file" id="fileInput" accept="image/*,video/*" disabled>
+    <br>
+    <canvas id="canvasOutput"></canvas>
+    <br>
+    <a id="download" style="display: none;">Download</a>
+    <script src="https://docs.opencv.org/4.5.2/opencv.js" onload="onOpenCvReady();" async></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ffmpeg/0.12.15/umd/ffmpeg.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
