@@ -8,7 +8,8 @@ const ctx = canvas.getContext('2d');
 let opencvReady = false;
 let ffmpegReady = false;
 
-const ffmpeg = new FFmpeg.FFmpeg();
+const { FFmpeg } = FFmpegWASM;
+const ffmpeg = new FFmpeg();
 
 function onOpenCvReady() {
     statusElement.innerHTML = 'OpenCV.js is ready.';
@@ -46,13 +47,8 @@ fileInput.addEventListener('change', (e) => {
                 img.src = event.target.result;
             } else if (file.type.startsWith('video/')) {
                 const video = document.createElement('video');
-                video.muted = true;
                 video.src = event.target.result;
-                video.addEventListener('loadeddata', () => {
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
-                    cartoonizeVideo(video);
-                });
+                cartoonizeVideo(video, file);
             }
         };
         reader.readAsDataURL(file);
@@ -85,34 +81,28 @@ function cartoonizeImage() {
     downloadLink.download = 'cartoonized_image.png';
 }
 
-function cartoonizeVideo(video) {
-    // This function will be rewritten in the next step
-    // For now, I will just leave the old code here as a placeholder
-    const stream = canvas.captureStream();
-    const audioContext = new AudioContext();
-    const audioSource = audioContext.createMediaElementSource(video);
-    const dest = audioContext.createMediaStreamDestination();
-    audioSource.connect(dest);
-    stream.addTrack(dest.stream.getAudioTracks()[0]);
+async function cartoonizeVideo(video, file) {
+    if (!ffmpegReady) {
+        statusElement.innerHTML = 'FFmpeg is not loaded yet. Please click the "Load FFmpeg" button.';
+        return;
+    }
+    statusElement.innerHTML = 'Processing video... this might take a while.';
 
-    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9' });
-    const chunks = [];
+    const { fetchFile } = FFmpegUtil;
+    await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
-    recorder.ondataavailable = (e) => chunks.push(e.data);
-    recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        downloadLink.href = url;
-        downloadLink.style.display = 'block';
-        downloadLink.download = 'cartoonized_video.webm';
-    };
+    const videoDuration = video.duration;
+    const frameRate = 30; // A reasonable frame rate
+    const totalFrames = Math.floor(videoDuration * frameRate);
 
-    const processVideo = () => {
-        if (video.paused || video.ended) {
-            recorder.stop();
-            return;
-        }
+    for (let i = 0; i < totalFrames; i++) {
+        video.currentTime = i / frameRate;
+        await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
         let src = cv.imread(canvas);
         let dst = new cv.Mat();
         let gray = new cv.Mat();
@@ -127,15 +117,38 @@ function cartoonizeVideo(video) {
         cv.bitwise_and(color, color, dst, edges);
 
         cv.imshow(canvas, dst);
+
+        const frameData = canvas.toDataURL('image/png');
+        const frameBlob = await (await fetch(frameData)).blob();
+        await ffmpeg.writeFile(`frame-${i.toString().padStart(5, '0')}.png`, new Uint8Array(await frameBlob.arrayBuffer()));
+
         src.delete();
         dst.delete();
         gray.delete();
         edges.delete();
         color.delete();
-        requestAnimationFrame(processVideo);
-    };
 
-    video.play();
-    recorder.start();
-    processVideo();
+        statusElement.innerHTML = `Processing frame ${i + 1} of ${totalFrames}`;
+    }
+
+    statusElement.innerHTML = 'Combining frames and audio...';
+
+    await ffmpeg.exec([
+        '-framerate', `${frameRate}`,
+        '-i', 'frame-%05d.png',
+        '-i', 'input.mp4',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'libx264',
+        '-c:a', 'aac',
+        '-strict', 'experimental',
+        'output.mp4'
+    ]);
+
+    const data = await ffmpeg.readFile('output.mp4');
+    const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+    downloadLink.href = url;
+    downloadLink.style.display = 'block';
+    downloadLink.download = 'cartoonized_video.mp4';
+    statusElement.innerHTML = 'Done! Your video is ready for download.';
 }
