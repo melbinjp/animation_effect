@@ -99,19 +99,26 @@ async function cartoonizeVideo(video, file) {
     const frameRate = 30; // A reasonable frame rate
     const totalFrames = Math.floor(videoDuration * frameRate);
 
+    // Hoist canvas resizing and matrix allocation outside the loop
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    // Allocate matrices once
+    let src = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+    let dst = new cv.Mat(canvas.height, canvas.width, cv.CV_8UC4);
+    let gray = new cv.Mat();
+    let edges = new cv.Mat();
+    let color = new cv.Mat();
+
     for (let i = 0; i < totalFrames; i++) {
         video.currentTime = i / frameRate;
         await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        let src = cv.imread(canvas);
-        let dst = new cv.Mat();
-        let gray = new cv.Mat();
-        let edges = new cv.Mat();
-        let color = new cv.Mat();
+        // Directly copy image data to src matrix without reallocation
+        let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        src.data.set(imageData.data);
 
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.medianBlur(gray, gray, 5);
@@ -122,18 +129,19 @@ async function cartoonizeVideo(video, file) {
 
         cv.imshow(canvas, dst);
 
-        const frameData = canvas.toDataURL('image/png');
-        const frameBlob = await (await fetch(frameData)).blob();
+        // Optimize data export using toBlob instead of toDataURL + fetch
+        const frameBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
         await ffmpeg.writeFile(`frame-${i.toString().padStart(5, '0')}.png`, new Uint8Array(await frameBlob.arrayBuffer()));
-
-        src.delete();
-        dst.delete();
-        gray.delete();
-        edges.delete();
-        color.delete();
 
         statusElement.innerHTML = `Processing frame ${i + 1} of ${totalFrames}`;
     }
+
+    // Clean up matrices after the loop
+    src.delete();
+    dst.delete();
+    gray.delete();
+    edges.delete();
+    color.delete();
 
     statusElement.innerHTML = 'Combining frames and audio...';
 
