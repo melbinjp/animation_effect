@@ -99,6 +99,11 @@ async function cartoonizeVideo(video, file) {
     const frameRate = 30; // A reasonable frame rate
     const totalFrames = Math.floor(videoDuration * frameRate);
 
+    let dst = new cv.Mat();
+    let gray = new cv.Mat();
+    let edges = new cv.Mat();
+    let color = new cv.Mat();
+
     for (let i = 0; i < totalFrames; i++) {
         video.currentTime = i / frameRate;
         await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
@@ -108,10 +113,6 @@ async function cartoonizeVideo(video, file) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         let src = cv.imread(canvas);
-        let dst = new cv.Mat();
-        let gray = new cv.Mat();
-        let edges = new cv.Mat();
-        let color = new cv.Mat();
 
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.medianBlur(gray, gray, 5);
@@ -122,18 +123,18 @@ async function cartoonizeVideo(video, file) {
 
         cv.imshow(canvas, dst);
 
-        const frameData = canvas.toDataURL('image/png');
-        const frameBlob = await (await fetch(frameData)).blob();
+        const frameBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
         await ffmpeg.writeFile(`frame-${i.toString().padStart(5, '0')}.png`, new Uint8Array(await frameBlob.arrayBuffer()));
 
         src.delete();
-        dst.delete();
-        gray.delete();
-        edges.delete();
-        color.delete();
 
         statusElement.innerHTML = `Processing frame ${i + 1} of ${totalFrames}`;
     }
+
+    dst.delete();
+    gray.delete();
+    edges.delete();
+    color.delete();
 
     statusElement.innerHTML = 'Combining frames and audio...';
 
