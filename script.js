@@ -13,17 +13,17 @@ const ffmpeg = new FFmpeg();
 
 ffmpeg.on('log', ({ message }) => {
     console.log(message);
-    statusElement.innerHTML = message;
+    statusElement.textContent = message;
 });
 
 window.onOpenCvReady = function() {
-    statusElement.innerHTML = 'OpenCV.js is ready.';
+    statusElement.textContent = 'OpenCV.js is ready.';
     opencvReady = true;
     loadFFmpegBtn.disabled = false;
 }
 
 loadFFmpegBtn.addEventListener('click', async () => {
-    statusElement.innerHTML = 'Loading FFmpeg-core...';
+    statusElement.textContent = 'Loading FFmpeg-core...';
     loadFFmpegBtn.disabled = true;
     const baseURL = 'vendor';
     await ffmpeg.load({
@@ -32,7 +32,7 @@ loadFFmpegBtn.addEventListener('click', async () => {
     });
     ffmpegReady = true;
     fileInput.disabled = false;
-    statusElement.innerHTML = 'Ready to cartoonify!';
+    statusElement.textContent = 'Ready to cartoonify!';
 });
 
 
@@ -60,8 +60,8 @@ fileInput.addEventListener('change', (e) => {
     }
 });
 
-function cartoonizeImage() {
-    let src = cv.imread(canvas);
+function applyCartoonEffect(targetCanvas) {
+    let src = cv.imread(targetCanvas);
     let dst = new cv.Mat();
     let gray = new cv.Mat();
     let edges = new cv.Mat();
@@ -74,12 +74,16 @@ function cartoonizeImage() {
     cv.bilateralFilter(src, color, 9, 250, 250, cv.BORDER_DEFAULT);
     cv.bitwise_and(color, color, dst, edges);
 
-    cv.imshow(canvas, dst);
+    cv.imshow(targetCanvas, dst);
     src.delete();
     dst.delete();
     gray.delete();
     edges.delete();
     color.delete();
+}
+
+function cartoonizeImage() {
+    applyCartoonEffect(canvas);
 
     downloadLink.href = canvas.toDataURL();
     downloadLink.style.display = 'block';
@@ -88,10 +92,10 @@ function cartoonizeImage() {
 
 async function cartoonizeVideo(video, file) {
     if (!ffmpegReady) {
-        statusElement.innerHTML = 'FFmpeg is not loaded yet. Please click the "Load FFmpeg" button.';
+        statusElement.textContent = 'FFmpeg is not loaded yet. Please click the "Load FFmpeg" button.';
         return;
     }
-    statusElement.innerHTML = 'Processing video... this might take a while.';
+    statusElement.textContent = 'Processing video... this might take a while.';
 
     await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
@@ -107,35 +111,15 @@ async function cartoonizeVideo(video, file) {
         canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        let src = cv.imread(canvas);
-        let dst = new cv.Mat();
-        let gray = new cv.Mat();
-        let edges = new cv.Mat();
-        let color = new cv.Mat();
+        applyCartoonEffect(canvas);
 
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.medianBlur(gray, gray, 5);
-        cv.adaptiveThreshold(gray, edges, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 9, 9);
-        cv.bitwise_not(edges, edges);
-        cv.bilateralFilter(src, color, 9, 250, 250, cv.BORDER_DEFAULT);
-        cv.bitwise_and(color, color, dst, edges);
-
-        cv.imshow(canvas, dst);
-
-        const frameData = canvas.toDataURL('image/png');
-        const frameBlob = await (await fetch(frameData)).blob();
+        const frameBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
         await ffmpeg.writeFile(`frame-${i.toString().padStart(5, '0')}.png`, new Uint8Array(await frameBlob.arrayBuffer()));
 
-        src.delete();
-        dst.delete();
-        gray.delete();
-        edges.delete();
-        color.delete();
-
-        statusElement.innerHTML = `Processing frame ${i + 1} of ${totalFrames}`;
+        statusElement.textContent = `Processing frame ${i + 1} of ${totalFrames}`;
     }
 
-    statusElement.innerHTML = 'Combining frames and audio...';
+    statusElement.textContent = 'Combining frames and audio...';
 
     await ffmpeg.exec([
         '-framerate', `${frameRate}`,
@@ -154,5 +138,5 @@ async function cartoonizeVideo(video, file) {
     downloadLink.href = url;
     downloadLink.style.display = 'block';
     downloadLink.download = 'cartoonized_video.mp4';
-    statusElement.innerHTML = 'Done! Your video is ready for download.';
+    statusElement.textContent = 'Done! Your video is ready for download.';
 }
