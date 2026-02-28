@@ -99,12 +99,13 @@ async function cartoonizeVideo(video, file) {
     const frameRate = 30; // A reasonable frame rate
     const totalFrames = Math.floor(videoDuration * frameRate);
 
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
     for (let i = 0; i < totalFrames; i++) {
         video.currentTime = i / frameRate;
         await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         let src = cv.imread(canvas);
