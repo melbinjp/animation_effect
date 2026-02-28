@@ -137,22 +137,27 @@ async function cartoonizeVideo(video, file) {
 
     statusElement.innerHTML = 'Combining frames and audio...';
 
-    await ffmpeg.exec([
-        '-framerate', `${frameRate}`,
-        '-i', 'frame-%05d.png',
-        '-i', 'input.mp4',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'libx264',
-        '-c:a', 'aac',
-        '-strict', 'experimental',
-        'output.mp4'
-    ]);
+    try {
+        await ffmpeg.exec([
+            '-framerate', `${frameRate}`,
+            '-i', 'frame-%05d.png',
+            '-i', 'input.mp4',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-strict', 'experimental',
+            'output.mp4'
+        ]);
 
-    const data = await ffmpeg.readFile('output.mp4');
-    const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
-    downloadLink.href = url;
-    downloadLink.style.display = 'block';
-    downloadLink.download = 'cartoonized_video.mp4';
-    statusElement.innerHTML = 'Done! Your video is ready for download.';
+        const data = await ffmpeg.readFile('output.mp4');
+        const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+        downloadLink.href = url;
+        downloadLink.style.display = 'block';
+        downloadLink.download = 'cartoonized_video.mp4';
+        statusElement.innerHTML = 'Done! Your video is ready for download.';
+    } catch (error) {
+        console.error('Error during video processing:', error);
+        statusElement.textContent = 'Error processing video. Please try again or use a different file.';
+    }
 }
