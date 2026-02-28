@@ -8,7 +8,8 @@ const ctx = canvas.getContext('2d');
 let opencvReady = false;
 let ffmpegReady = false;
 
-const { FFmpeg, toBlobURL, fetchFile } = FFmpeg;
+const { FFmpeg: FFmpegClass, toBlobURL, fetchFile } = window.FFmpegWASM || window.FFmpeg;
+const FFmpeg = FFmpegClass;
 const ffmpeg = new FFmpeg();
 
 ffmpeg.on('log', ({ message }) => {
