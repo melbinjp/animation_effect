@@ -8,7 +8,7 @@ const ctx = canvas.getContext('2d');
 let opencvReady = false;
 let ffmpegReady = false;
 
-const { FFmpeg, toBlobURL, fetchFile } = FFmpeg;
+const { FFmpeg, toBlobURL, fetchFile } = window.FFmpeg;
 const ffmpeg = new FFmpeg();
 
 ffmpeg.on('log', ({ message }) => {
@@ -54,6 +54,8 @@ fileInput.addEventListener('change', (e) => {
                 const video = document.createElement('video');
                 video.src = event.target.result;
                 cartoonizeVideo(video, file);
+            } else {
+                statusElement.textContent = 'Error: Unsupported file type. Please upload an image or video.';
             }
         };
         reader.readAsDataURL(file);
