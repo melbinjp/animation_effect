@@ -234,6 +234,16 @@ video {
         linear-gradient(180deg, rgba(255, 250, 242, 0.95), rgba(245, 237, 227, 0.88));
 }
 
+.uploader.is-loading {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.uploader.is-loading .uploader-label,
+.uploader.is-loading .uploader-copy {
+    pointer-events: none;
+}
+
 .uploader.is-dragover {
     border-color: rgba(184, 92, 56, 0.45);
     background: linear-gradient(180deg, rgba(255, 248, 240, 0.98), rgba(248, 235, 219, 0.94));

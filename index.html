@@ -8,11 +8,19 @@
         name="description"
         content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server."
     >
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
-    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
-    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+    <link rel="icon" type="image/x-icon" href="https://raw.githubusercontent.com/melbinjp/favicon/gh-pages/favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/melbinjp/favicon/gh-pages/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/melbinjp/favicon/gh-pages/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/melbinjp/favicon/gh-pages/apple-touch-icon.png">
     <link rel="stylesheet" href="style.css">
+    <script>
+        // Favicon errors are non-fatal — log a note and continue.
+        document.querySelectorAll('link[rel~="icon"], link[rel="apple-touch-icon"]').forEach(function(link) {
+            link.addEventListener('error', function() {
+                console.info('Favicon not available (' + link.href + ') — skipping, site continues normally.');
+            });
+        });
+    </script>
 </head>
 <body>
     <main class="page-shell">
@@ -47,7 +55,7 @@
                 <div class="uploader" id="dropZone">
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
-                    <input type="file" id="fileInput" accept="image/*,video/*" disabled>
+                    <input type="file" id="fileInput" accept="image/*,video/*">
                     <button id="load-ffmpeg" type="button" class="secondary-button" disabled>
                         Load video export engine
                     </button>
