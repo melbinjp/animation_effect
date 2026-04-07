@@ -3,19 +3,140 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cartoonizer</title>
+    <title>Line Art Animator</title>
+    <meta
+        name="description"
+        content="Turn images and videos into clean line-art animation frames entirely in the browser using OpenCV and FFmpeg WASM."
+    >
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <h1>Cartoonizer</h1>
-    <p>Upload an image or video to turn it into a cartoon!</p>
-    <p id="status">Loading OpenCV.js...</p>
-    <button id="load-ffmpeg" disabled>Load FFmpeg</button>
-    <input type="file" id="fileInput" accept="image/*,video/*" disabled>
-    <br>
-    <canvas id="canvasOutput"></canvas>
-    <br>
-    <a id="download" style="display: none;">Download</a>
+    <main class="page-shell">
+        <section class="hero">
+            <p class="eyebrow">Client-Side Line Art Studio</p>
+            <h1>Convert stills and video clips into clean animation-style line art.</h1>
+            <p class="hero-copy">
+                This tool runs fully in your browser. Preview a line-art treatment, adjust the style,
+                and export a PNG or MP4 without uploading anything to a server.
+            </p>
+            <div class="hero-notes">
+                <span>Images: PNG export</span>
+                <span>Videos: MP4 export with audio when available</span>
+                <span>Best for short clips and reference footage</span>
+            </div>
+        </section>
+
+        <section class="studio-shell" aria-label="Line art conversion workspace">
+            <aside class="panel controls-panel">
+                <div class="panel-heading">
+                    <h2>Controls</h2>
+                    <p>Pick a file, tune the look, preview, then render the final result.</p>
+                </div>
+
+                <div class="status-card" data-tone="info">
+                    <p class="status-label">System status</p>
+                    <p id="status" class="status-copy" aria-live="polite">Loading OpenCV engine...</p>
+                </div>
+
+                <div class="uploader" id="dropZone">
+                    <label class="uploader-label" for="fileInput">Drop an image or video here</label>
+                    <p class="uploader-copy">or choose a file from disk</p>
+                    <input type="file" id="fileInput" accept="image/*,video/*" disabled>
+                    <button id="load-ffmpeg" type="button" class="secondary-button" disabled>
+                        Load video export engine
+                    </button>
+                </div>
+
+                <div class="control-group">
+                    <label for="preset">Style preset</label>
+                    <select id="preset">
+                        <option value="studio">Studio Ink</option>
+                        <option value="manga">Manga Contrast</option>
+                        <option value="blueprint">Blueprint Draft</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label for="detail">Edge detail</label>
+                    <input type="range" id="detail" min="35" max="90" value="62">
+                    <div class="range-scale">
+                        <span>Cleaner</span>
+                        <span>More detail</span>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <label for="lineWeight">Line weight</label>
+                    <select id="lineWeight">
+                        <option value="1">Fine</option>
+                        <option value="2" selected>Balanced</option>
+                        <option value="3">Bold</option>
+                        <option value="4">Heavy</option>
+                    </select>
+                </div>
+
+                <div class="control-grid">
+                    <div class="control-group">
+                        <label for="scale">Render size</label>
+                        <select id="scale">
+                            <option value="1">Full</option>
+                            <option value="0.75" selected>75%</option>
+                            <option value="0.5">50%</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label for="videoFps">Video FPS</label>
+                        <select id="videoFps">
+                            <option value="12">12</option>
+                            <option value="18" selected>18</option>
+                            <option value="24">24</option>
+                            <option value="30">30</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="action-row">
+                    <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
+                    <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="resetBtn" type="button" class="ghost-button">Reset</button>
+                </div>
+
+                <div class="download-card" id="downloadCard" hidden>
+                    <p class="status-label">Export</p>
+                    <a id="download" class="download-link" href="#">Download result</a>
+                </div>
+
+                <div class="info-card">
+                    <p class="status-label">Current file</p>
+                    <p id="fileMeta">No file selected.</p>
+                </div>
+            </aside>
+
+            <section class="panel preview-panel">
+                <div class="panel-heading">
+                    <h2>Workspace</h2>
+                    <p>Preview uses the current settings. Video preview is sampled from the selected clip.</p>
+                </div>
+
+                <div class="canvas-grid">
+                    <figure class="canvas-card">
+                        <figcaption>Source frame</figcaption>
+                        <canvas id="sourceCanvas"></canvas>
+                    </figure>
+                    <figure class="canvas-card emphasis-card">
+                        <figcaption>Line-art result</figcaption>
+                        <canvas id="canvasOutput"></canvas>
+                    </figure>
+                </div>
+
+                <div class="video-result" id="videoResult" hidden>
+                    <p class="status-label">Rendered video</p>
+                    <video id="outputVideo" controls playsinline></video>
+                </div>
+            </section>
+        </section>
+    </main>
+
     <script src="https://docs.opencv.org/4.5.2/opencv.js" onload="onOpenCvReady();" async></script>
     <script src="vendor/ffmpeg.js"></script>
     <script src="script.js"></script>
