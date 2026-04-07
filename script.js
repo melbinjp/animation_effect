@@ -209,10 +209,12 @@ function setBusy(isBusy) {
 
 function refreshActions() {
     const hasFile = Boolean(state.selectedFile);
+    const notReady = !state.cvReady || state.processing;
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
-    elements.fileInput.disabled = !state.cvReady || state.processing;
+    elements.fileInput.disabled = notReady;
     elements.loadFFmpegBtn.disabled = !state.cvReady || state.processing || state.ffmpegReady;
+    elements.dropZone.classList.toggle('is-loading', !state.cvReady);
 }
 
 function updateUnloadProtection() {
@@ -741,6 +743,11 @@ async function renderVideoExport() {
 
 async function handleFileSelection(file) {
     if (!file) {
+        return;
+    }
+
+    if (!state.cvReady) {
+        setStatus('Processing engine still loading — please wait a moment and try again.', 'warn');
         return;
     }
 
