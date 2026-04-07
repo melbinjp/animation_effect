@@ -84,93 +84,75 @@ const PRODUCTION_LIMITS = {
     hardFileSizeBytes: 250 * 1024 * 1024
 };
 
+// LineArtProcessor delegates all heavy OpenCV work to a dedicated Web Worker so
+// the main thread (and the UI) stays responsive during processing.  Pixel data
+// is transferred between threads as zero-copy ArrayBuffer Transferables.
 class LineArtProcessor {
     constructor() {
-        this.width = 0;
-        this.height = 0;
-        this.src = null;
-        this.smoothed = null;
-        this.gray = null;
-        this.edges = null;
+        this._worker = new Worker('worker.js');
+        this._pending = new Map();
+        this._idCounter = 0;
+
+        this._worker.onmessage = ({ data: msg }) => {
+            if (msg.type === 'cv-ready') {
+                state.cvReady = true;
+                refreshActions();
+                setStatus('OpenCV ready. Drop an image or video to create line art.', 'success');
+                return;
+            }
+
+            const entry = this._pending.get(msg.id);
+            this._pending.delete(msg.id);
+            if (!entry) {
+                return;
+            }
+
+            if (msg.type === 'result') {
+                const { resolve, destinationCanvas, width, height } = entry;
+                destinationCanvas.width = width;
+                destinationCanvas.height = height;
+                const ctx = destinationCanvas.getContext('2d');
+                ctx.putImageData(new ImageData(msg.data, width, height), 0, 0);
+                resolve();
+            } else if (msg.type === 'error') {
+                entry.reject(new Error(msg.message));
+            }
+        };
+
+        this._worker.onerror = (error) => {
+            console.error('OpenCV worker error:', error);
+            for (const [, { reject }] of this._pending) {
+                reject(new Error('Processing worker error.'));
+            }
+            this._pending.clear();
+            setStatus('Processing worker error. Please reload the page.', 'error');
+        };
     }
 
     reset() {
-        [this.src, this.smoothed, this.gray, this.edges].forEach((mat) => {
-            if (mat) {
-                mat.delete();
-            }
-        });
-        this.src = null;
-        this.smoothed = null;
-        this.gray = null;
-        this.edges = null;
-        this.width = 0;
-        this.height = 0;
-    }
-
-    ensureSize(width, height) {
-        if (this.width === width && this.height === height) {
-            return;
+        for (const [, { reject }] of this._pending) {
+            reject(new Error('Render cancelled.'));
         }
-
-        this.reset();
-        this.width = width;
-        this.height = height;
-        this.src = new cv.Mat(height, width, cv.CV_8UC4);
-        this.smoothed = new cv.Mat(height, width, cv.CV_8UC4);
-        this.gray = new cv.Mat(height, width, cv.CV_8UC1);
-        this.edges = new cv.Mat(height, width, cv.CV_8UC1);
+        this._pending.clear();
+        this._worker.postMessage({ type: 'reset' });
     }
 
+    // Returns a Promise that resolves once the output canvas has been updated.
     render(sourceCanvas, destinationCanvas, settings) {
-        this.ensureSize(sourceCanvas.width, sourceCanvas.height);
-
+        const width = sourceCanvas.width;
+        const height = sourceCanvas.height;
         const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true });
-        const sourceImageData = sourceContext.getImageData(0, 0, this.width, this.height);
-        this.src.data.set(sourceImageData.data);
+        const imageData = sourceContext.getImageData(0, 0, width, height);
+        const id = this._idCounter++;
 
-        const detailFactor = settings.detail / 62;
-        const lowThreshold = Math.max(12, Math.round(settings.preset.lowThreshold / detailFactor));
-        const highThreshold = Math.max(lowThreshold + 24, Math.round(settings.preset.highThreshold / detailFactor));
-        const sigma = Math.max(20, Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
-
-        cv.bilateralFilter(
-            this.src,
-            this.smoothed,
-            settings.preset.bilateralDiameter,
-            sigma,
-            sigma,
-            cv.BORDER_DEFAULT
-        );
-        cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGBA2GRAY);
-        cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
-
-        if (settings.lineWeight > 1) {
-            const kernel = cv.Mat.ones(settings.lineWeight, settings.lineWeight, cv.CV_8U);
-            cv.dilate(this.edges, this.edges, kernel);
-            kernel.delete();
-        }
-
-        cv.bitwise_not(this.edges, this.edges);
-
-        destinationCanvas.width = this.width;
-        destinationCanvas.height = this.height;
-
-        const outputContext = destinationCanvas.getContext('2d');
-        const outputImageData = outputContext.createImageData(this.width, this.height);
-        const mask = this.edges.data;
-        const output = outputImageData.data;
-
-        for (let index = 0; index < mask.length; index += 1) {
-            const offset = index * 4;
-            const color = mask[index] > 127 ? settings.preset.background : settings.preset.ink;
-            output[offset] = color[0];
-            output[offset + 1] = color[1];
-            output[offset + 2] = color[2];
-            output[offset + 3] = 255;
-        }
-
-        outputContext.putImageData(outputImageData, 0, 0);
+        return new Promise((resolve, reject) => {
+            this._pending.set(id, { resolve, reject, destinationCanvas, width, height });
+            // Transfer the pixel buffer (zero-copy) to the worker.
+            this._worker.postMessage(
+                { type: 'process', id, rgbaData: imageData.data, width, height, settings },
+                [imageData.data.buffer]
+            );
+        });
     }
 }
 
@@ -457,6 +439,8 @@ function requestCancel() {
     setStatus('Cancel requested. Finishing the current step...', 'warn');
     setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
 
+    processor.reset();
+
     if (state.ffmpeg) {
         state.ffmpeg.terminate();
         state.ffmpeg = null;
@@ -596,7 +580,7 @@ async function renderPreview() {
     throwIfCancelled();
     await drawCurrentSource();
     throwIfCancelled();
-    processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+    await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
     clearRenderedOutput();
     setStatus(
         state.fileKind === 'video'
@@ -641,7 +625,7 @@ async function renderVideoExport() {
             const frameTime = Math.min(video.duration, frameIndex / fps);
             await seekVideo(video, frameTime);
             drawMediaToCanvas(video, elements.sourceCanvas, settings.scale);
-            processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
 
             const frameBlob = await canvasToBlob(elements.outputCanvas, 'image/png');
             const frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
@@ -807,11 +791,7 @@ function attachDropZone() {
     });
 }
 
-window.onOpenCvReady = function onOpenCvReady() {
-    state.cvReady = true;
-    refreshActions();
-    setStatus('OpenCV ready. Drop an image or video to create line art.', 'success');
-};
+// OpenCV is loaded inside worker.js; cv-ready is signalled via the worker message handler above.
 
 elements.loadFFmpegBtn.addEventListener('click', async () => {
     try {
