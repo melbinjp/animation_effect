@@ -2,19 +2,16 @@
 
 let processorInstance = null;
 
-// Must be set before importScripts so OpenCV's WASM runtime calls this hook when ready.
-self.Module = {
-    onRuntimeInitialized() {
-        console.log('[Worker] OpenCV runtime initialized successfully');
-        processorInstance = new WorkerProcessor();
-        self.postMessage({ type: 'cv-ready' });
-    }
-};
-
 console.log('[Worker] Starting OpenCV load...');
 try {
     importScripts('vendor/opencv.js');
     console.log('[Worker] OpenCV script imported, waiting for runtime initialization...');
+
+    cv.onRuntimeInitialized = () => {
+        console.log('[Worker] OpenCV runtime initialized successfully');
+        processorInstance = new WorkerProcessor();
+        self.postMessage({ type: 'cv-ready' });
+    };
 } catch (error) {
     console.error('[Worker] Failed to import OpenCV script:', error);
     self.postMessage({ type: 'cv-error', message: 'Failed to load OpenCV: ' + error.message });
