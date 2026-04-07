@@ -124,6 +124,8 @@ video {
 }
 
 .status-card,
+.advisory-card,
+.progress-card,
 .download-card,
 .info-card,
 .uploader,
@@ -136,6 +138,8 @@ video {
 }
 
 .status-card,
+.advisory-card,
+.progress-card,
 .download-card,
 .info-card,
 .uploader,
@@ -158,6 +162,16 @@ video {
     background: rgba(255, 240, 240, 0.94);
 }
 
+.advisory-card[data-tone="warn"] {
+    border-color: rgba(163, 90, 28, 0.28);
+    background: rgba(255, 246, 233, 0.94);
+}
+
+.advisory-card[data-tone="success"] {
+    border-color: rgba(31, 107, 79, 0.24);
+    background: rgba(238, 251, 245, 0.9);
+}
+
 .status-label {
     margin: 0 0 6px;
     font-size: 0.76rem;
@@ -168,9 +182,47 @@ video {
 }
 
 .status-copy,
+#advisoryText,
 #fileMeta {
     margin: 0;
     line-height: 1.55;
+}
+
+.progress-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+#progressPercent {
+    margin: 0;
+    font-weight: 700;
+    color: var(--ink);
+}
+
+.progress-bar {
+    overflow: hidden;
+    width: 100%;
+    height: 10px;
+    margin-top: 10px;
+    border-radius: 999px;
+    background: rgba(22, 33, 47, 0.08);
+}
+
+#progressFill {
+    display: block;
+    width: 0%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent), #d98962);
+    transition: width 0.18s ease;
+}
+
+.progress-copy {
+    margin: 10px 0 0;
+    color: var(--ink-soft);
+    line-height: 1.5;
 }
 
 .uploader {

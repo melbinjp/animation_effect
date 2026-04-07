@@ -1,8 +1,15 @@
 const elements = {
     fileInput: document.getElementById('fileInput'),
     loadFFmpegBtn: document.getElementById('load-ffmpeg'),
+    cancelBtn: document.getElementById('cancelBtn'),
     status: document.getElementById('status'),
     statusCard: document.querySelector('.status-card'),
+    advisoryCard: document.getElementById('advisoryCard'),
+    advisoryText: document.getElementById('advisoryText'),
+    progressCard: document.getElementById('progressCard'),
+    progressFill: document.getElementById('progressFill'),
+    progressPercent: document.getElementById('progressPercent'),
+    progressText: document.getElementById('progressText'),
     preset: document.getElementById('preset'),
     detail: document.getElementById('detail'),
     lineWeight: document.getElementById('lineWeight'),
@@ -61,7 +68,20 @@ const state = {
     sourceVideo: null,
     sourceUrl: '',
     outputUrl: '',
-    processing: false
+    processing: false,
+    cancelRequested: false,
+    activeJobId: '',
+    beforeUnloadAttached: false
+};
+
+const PRODUCTION_LIMITS = {
+    recommendedVideoDurationSeconds: 20,
+    hardVideoDurationSeconds: 90,
+    recommendedVideoFrames: 540,
+    hardVideoFrames: 1800,
+    recommendedImageMegaPixels: 8,
+    recommendedVideoMegaPixels: 3,
+    hardFileSizeBytes: 250 * 1024 * 1024
 };
 
 class LineArtProcessor {
@@ -163,6 +183,8 @@ function setStatus(message, tone = 'info') {
 
 function setBusy(isBusy) {
     state.processing = isBusy;
+    elements.cancelBtn.hidden = !isBusy;
+    elements.cancelBtn.disabled = !isBusy;
     refreshActions();
 }
 
@@ -170,7 +192,30 @@ function refreshActions() {
     const hasFile = Boolean(state.selectedFile);
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
+    elements.fileInput.disabled = !state.cvReady || state.processing;
     elements.loadFFmpegBtn.disabled = !state.cvReady || state.processing || state.ffmpegReady;
+}
+
+function updateUnloadProtection() {
+    if (!state.beforeUnloadAttached && state.processing) {
+        window.addEventListener('beforeunload', beforeUnloadHandler);
+        state.beforeUnloadAttached = true;
+        return;
+    }
+
+    if (state.beforeUnloadAttached && !state.processing) {
+        window.removeEventListener('beforeunload', beforeUnloadHandler);
+        state.beforeUnloadAttached = false;
+    }
+}
+
+function beforeUnloadHandler(event) {
+    if (!state.processing) {
+        return;
+    }
+
+    event.preventDefault();
+    event.returnValue = '';
 }
 
 function revokeUrl(key) {
@@ -192,6 +237,26 @@ function clearRenderedOutput() {
 
 function updateFileMeta(message) {
     elements.fileMeta.textContent = message;
+}
+
+function setAdvisory(message, tone = 'info') {
+    elements.advisoryText.textContent = message;
+    elements.advisoryCard.dataset.tone = tone;
+}
+
+function setProgress(value, message) {
+    const clamped = Math.min(100, Math.max(0, Math.round(value)));
+    elements.progressCard.hidden = false;
+    elements.progressFill.style.width = `${clamped}%`;
+    elements.progressPercent.textContent = `${clamped}%`;
+    elements.progressText.textContent = message;
+}
+
+function resetProgress() {
+    elements.progressCard.hidden = true;
+    elements.progressFill.style.width = '0%';
+    elements.progressPercent.textContent = '0%';
+    elements.progressText.textContent = 'Idle';
 }
 
 function getMediaType(file) {
@@ -226,6 +291,80 @@ function computeScaledSize(width, height, scale) {
         width: Math.max(1, Math.round(width * ratio)),
         height: Math.max(1, Math.round(height * ratio))
     };
+}
+
+function formatFileSize(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+        return '0 B';
+    }
+
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const value = bytes / (1024 ** exponent);
+    return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+}
+
+function summarizeWorkload() {
+    if (!state.selectedFile) {
+        setAdvisory('Select a file to estimate browser workload.', 'info');
+        return;
+    }
+
+    const settings = getSettings();
+
+    if (state.fileKind === 'image' && state.sourceImage) {
+        const size = computeScaledSize(state.sourceImage.naturalWidth, state.sourceImage.naturalHeight, settings.scale);
+        const megaPixels = (size.width * size.height) / 1000000;
+        const tone = megaPixels > PRODUCTION_LIMITS.recommendedImageMegaPixels ? 'warn' : 'success';
+        const guidance = megaPixels > PRODUCTION_LIMITS.recommendedImageMegaPixels
+            ? 'Large image. Consider 75% or 50% render size for faster exports.'
+            : 'Image workload is within the browser-friendly range.';
+        setAdvisory(
+            `${guidance} Render target: ${size.width}×${size.height} at ${megaPixels.toFixed(1)} MP. Source file: ${formatFileSize(state.selectedFile.size)}.`,
+            tone
+        );
+        return;
+    }
+
+    if (state.fileKind === 'video' && state.sourceVideo) {
+        const size = computeScaledSize(state.sourceVideo.videoWidth, state.sourceVideo.videoHeight, settings.scale);
+        const totalFrames = Math.max(1, Math.floor(state.sourceVideo.duration * settings.videoFps));
+        const frameMegaPixels = (size.width * size.height) / 1000000;
+        let tone = 'success';
+        let guidance = 'Workload looks reasonable for browser-side rendering.';
+
+        if (
+            state.sourceVideo.duration > PRODUCTION_LIMITS.recommendedVideoDurationSeconds ||
+            totalFrames > PRODUCTION_LIMITS.recommendedVideoFrames ||
+            frameMegaPixels > PRODUCTION_LIMITS.recommendedVideoMegaPixels
+        ) {
+            tone = 'warn';
+            guidance = 'Heavy render. Use lower FPS or render size for better reliability.';
+        }
+
+        if (
+            state.sourceVideo.duration > PRODUCTION_LIMITS.hardVideoDurationSeconds ||
+            totalFrames > PRODUCTION_LIMITS.hardVideoFrames ||
+            state.selectedFile.size > PRODUCTION_LIMITS.hardFileSizeBytes
+        ) {
+            tone = 'warn';
+            guidance = 'This clip is near the practical browser limit. Expect long processing time and high memory use.';
+        }
+
+        setAdvisory(
+            `${guidance} Render target: ${size.width}×${size.height}, ${totalFrames} frames at ${settings.videoFps} FPS, ${state.sourceVideo.duration.toFixed(1)}s duration, file size ${formatFileSize(state.selectedFile.size)}.`,
+            tone
+        );
+        return;
+    }
+
+    setAdvisory('Select a supported image or video file.', 'warn');
+}
+
+function assertWithinOperationalLimits(file) {
+    if (file.size > PRODUCTION_LIMITS.hardFileSizeBytes) {
+        throw new Error('File is too large for reliable browser-side processing. Keep uploads under 250 MB.');
+    }
 }
 
 function drawEmptyCanvas(canvas, label) {
@@ -309,6 +448,55 @@ function setDownload(blob, fileName) {
     elements.downloadCard.hidden = false;
 }
 
+function requestCancel() {
+    if (!state.processing) {
+        return;
+    }
+
+    state.cancelRequested = true;
+    setStatus('Cancel requested. Finishing the current step...', 'warn');
+    setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
+
+    if (state.ffmpeg) {
+        state.ffmpeg.terminate();
+        state.ffmpeg = null;
+        state.ffmpegReady = false;
+    }
+}
+
+function throwIfCancelled() {
+    if (state.cancelRequested) {
+        throw new Error('Render cancelled.');
+    }
+}
+
+async function safeDeleteFile(ffmpeg, filePath) {
+    try {
+        await ffmpeg.deleteFile(filePath);
+    } catch (error) {
+        return;
+    }
+}
+
+async function cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath) {
+    if (!ffmpeg || !jobId) {
+        return;
+    }
+
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+        await safeDeleteFile(ffmpeg, `${jobId}/frame-${String(frameIndex).padStart(5, '0')}.png`);
+    }
+
+    await safeDeleteFile(ffmpeg, inputPath);
+    await safeDeleteFile(ffmpeg, outputPath);
+
+    try {
+        await ffmpeg.deleteDir(jobId);
+    } catch (error) {
+        return;
+    }
+}
+
 function getFFmpegClass() {
     const namespace = window.FFmpegWASM || window.FFmpeg;
     return namespace?.FFmpeg || namespace;
@@ -335,6 +523,7 @@ async function loadFFmpeg() {
             if (typeof progress === 'number') {
                 const percent = Math.min(100, Math.max(0, Math.round(progress * 100)));
                 setStatus(`Encoding video... ${percent}%`, 'info');
+                setProgress(92 + Math.round(percent * 0.08), 'Encoding final MP4...');
             }
         });
     }
@@ -352,6 +541,7 @@ async function loadFFmpeg() {
 }
 
 async function readSelectedFile(file) {
+    assertWithinOperationalLimits(file);
     revokeUrl('sourceUrl');
     state.sourceUrl = URL.createObjectURL(file);
     state.fileKind = getMediaType(file);
@@ -365,6 +555,7 @@ async function readSelectedFile(file) {
         await waitForMediaEvent(image, 'load');
         state.sourceImage = image;
         updateFileMeta(`${file.name} · ${image.naturalWidth}×${image.naturalHeight} image`);
+        summarizeWorkload();
         return;
     }
 
@@ -379,6 +570,7 @@ async function readSelectedFile(file) {
         updateFileMeta(
             `${file.name} · ${video.videoWidth}×${video.videoHeight} video · ${video.duration.toFixed(1)}s`
         );
+        summarizeWorkload();
         return;
     }
 
@@ -401,7 +593,9 @@ async function drawCurrentSource() {
 }
 
 async function renderPreview() {
+    throwIfCancelled();
     await drawCurrentSource();
+    throwIfCancelled();
     processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
     clearRenderedOutput();
     setStatus(
@@ -413,10 +607,12 @@ async function renderPreview() {
 }
 
 async function renderImageExport() {
+    setProgress(20, 'Rendering image line art...');
     await renderPreview();
     const fileName = `${sanitizeBaseName(state.selectedFile.name)}-lineart.png`;
     const blob = await canvasToBlob(elements.outputCanvas, 'image/png');
     setDownload(blob, fileName);
+    setProgress(100, 'PNG export ready.');
     setStatus('Image render complete. Download your PNG.', 'success');
 }
 
@@ -434,44 +630,57 @@ async function renderVideoExport() {
     const inputPath = `${jobId}/input${extension}`;
     const framePattern = `${jobId}/frame-%05d.png`;
     const outputPath = `${jobId}/output.mp4`;
+    state.activeJobId = jobId;
 
-    await ffmpeg.createDir(jobId);
-    await ffmpeg.writeFile(inputPath, new Uint8Array(await state.selectedFile.arrayBuffer()));
+    try {
+        await ffmpeg.createDir(jobId);
+        await ffmpeg.writeFile(inputPath, new Uint8Array(await state.selectedFile.arrayBuffer()));
 
-    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
-        const frameTime = Math.min(video.duration, frameIndex / fps);
-        await seekVideo(video, frameTime);
-        drawMediaToCanvas(video, elements.sourceCanvas, settings.scale);
-        processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
+        for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+            throwIfCancelled();
+            const frameTime = Math.min(video.duration, frameIndex / fps);
+            await seekVideo(video, frameTime);
+            drawMediaToCanvas(video, elements.sourceCanvas, settings.scale);
+            processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
 
-        const frameBlob = await canvasToBlob(elements.outputCanvas, 'image/png');
-        const frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
-        const frameName = `${jobId}/frame-${String(frameIndex).padStart(5, '0')}.png`;
-        await ffmpeg.writeFile(frameName, frameBytes);
-        setStatus(`Rendering frame ${frameIndex + 1} of ${totalFrames}...`, 'info');
+            const frameBlob = await canvasToBlob(elements.outputCanvas, 'image/png');
+            const frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
+            const frameName = `${jobId}/frame-${String(frameIndex).padStart(5, '0')}.png`;
+            await ffmpeg.writeFile(frameName, frameBytes);
+            const framePercent = ((frameIndex + 1) / totalFrames) * 92;
+            setProgress(framePercent, `Rendering frame ${frameIndex + 1} of ${totalFrames}...`);
+            setStatus(`Rendering frame ${frameIndex + 1} of ${totalFrames}...`, 'info');
+        }
+
+        throwIfCancelled();
+        setProgress(92, 'Encoding final MP4 in the browser...');
+        setStatus('Encoding final MP4 in the browser...', 'info');
+        await ffmpeg.exec([
+            '-y',
+            '-framerate', String(fps),
+            '-i', framePattern,
+            '-i', inputPath,
+            '-map', '0:v:0',
+            '-map', '1:a?',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-shortest',
+            outputPath
+        ]);
+
+        throwIfCancelled();
+        const outputData = await ffmpeg.readFile(outputPath);
+        const videoBlob = new Blob([outputData.buffer], { type: 'video/mp4' });
+        setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
+        elements.outputVideo.src = state.outputUrl;
+        elements.videoResult.hidden = false;
+        setProgress(100, 'MP4 export ready.');
+        setStatus('Video render complete. Download or review the MP4.', 'success');
+    } finally {
+        await cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath);
+        state.activeJobId = '';
     }
-
-    setStatus('Encoding final MP4 in the browser...', 'info');
-    await ffmpeg.exec([
-        '-y',
-        '-framerate', String(fps),
-        '-i', framePattern,
-        '-i', inputPath,
-        '-map', '0:v:0',
-        '-map', '1:a?',
-        '-c:v', 'libx264',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-shortest',
-        outputPath
-    ]);
-
-    const outputData = await ffmpeg.readFile(outputPath);
-    const videoBlob = new Blob([outputData.buffer], { type: 'video/mp4' });
-    setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
-    elements.outputVideo.src = state.outputUrl;
-    elements.videoResult.hidden = false;
-    setStatus('Video render complete. Download or review the MP4.', 'success');
 }
 
 async function handleFileSelection(file) {
@@ -481,6 +690,8 @@ async function handleFileSelection(file) {
 
     try {
         setBusy(true);
+        state.cancelRequested = false;
+        resetProgress();
         clearRenderedOutput();
         state.selectedFile = file;
         await readSelectedFile(file);
@@ -492,9 +703,11 @@ async function handleFileSelection(file) {
         updateFileMeta('No file selected.');
         drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
         drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
+        setAdvisory('Select a file to estimate browser workload.', 'info');
         setStatus(error.message, 'error');
     } finally {
         setBusy(false);
+        updateUnloadProtection();
     }
 }
 
@@ -506,8 +719,10 @@ function resetWorkspace() {
     state.sourceVideo = null;
     revokeUrl('sourceUrl');
     clearRenderedOutput();
+    resetProgress();
     elements.fileInput.value = '';
     updateFileMeta('No file selected.');
+    setAdvisory('Select a file to estimate browser workload.', 'info');
     drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
     setStatus(
@@ -517,6 +732,7 @@ function resetWorkspace() {
         'info'
     );
     refreshActions();
+    updateUnloadProtection();
 }
 
 async function onPreviewClick() {
@@ -526,12 +742,15 @@ async function onPreviewClick() {
 
     try {
         setBusy(true);
+        state.cancelRequested = false;
+        updateUnloadProtection();
         await renderPreview();
     } catch (error) {
         console.error(error);
-        setStatus(error.message, 'error');
+        setStatus(error.message, error.message === 'Render cancelled.' ? 'warn' : 'error');
     } finally {
         setBusy(false);
+        updateUnloadProtection();
     }
 }
 
@@ -542,6 +761,9 @@ async function onRenderClick() {
 
     try {
         setBusy(true);
+        state.cancelRequested = false;
+        updateUnloadProtection();
+        resetProgress();
 
         if (state.fileKind === 'image') {
             await renderImageExport();
@@ -556,9 +778,11 @@ async function onRenderClick() {
         throw new Error('Unsupported file type.');
     } catch (error) {
         console.error(error);
-        setStatus(error.message || 'Rendering failed.', 'error');
+        setStatus(error.message || 'Rendering failed.', error.message === 'Render cancelled.' ? 'warn' : 'error');
     } finally {
         setBusy(false);
+        state.cancelRequested = false;
+        updateUnloadProtection();
     }
 }
 
@@ -585,7 +809,6 @@ function attachDropZone() {
 
 window.onOpenCvReady = function onOpenCvReady() {
     state.cvReady = true;
-    elements.fileInput.disabled = false;
     refreshActions();
     setStatus('OpenCV ready. Drop an image or video to create line art.', 'success');
 };
@@ -609,10 +832,13 @@ elements.fileInput.addEventListener('change', async (event) => {
 
 elements.previewBtn.addEventListener('click', onPreviewClick);
 elements.renderBtn.addEventListener('click', onRenderClick);
+elements.cancelBtn.addEventListener('click', requestCancel);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 
-['preset', 'detail', 'lineWeight', 'scale'].forEach((id) => {
+['preset', 'detail', 'lineWeight', 'scale', 'videoFps'].forEach((id) => {
     document.getElementById(id).addEventListener('change', async () => {
+        summarizeWorkload();
+
         if (!state.selectedFile || state.processing) {
             return;
         }

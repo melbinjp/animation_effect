@@ -95,9 +95,26 @@
                     </div>
                 </div>
 
+                <div class="advisory-card" id="advisoryCard" data-tone="info">
+                    <p class="status-label">Render advisory</p>
+                    <p id="advisoryText">Select a file to estimate browser workload.</p>
+                </div>
+
+                <div class="progress-card" id="progressCard" hidden>
+                    <div class="progress-header">
+                        <p class="status-label">Render progress</p>
+                        <p id="progressPercent">0%</p>
+                    </div>
+                    <div class="progress-bar" aria-hidden="true">
+                        <span id="progressFill"></span>
+                    </div>
+                    <p id="progressText" class="progress-copy">Idle</p>
+                </div>
+
                 <div class="action-row">
                     <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
                     <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="cancelBtn" type="button" class="secondary-button" hidden disabled>Cancel render</button>
                     <button id="resetBtn" type="button" class="ghost-button">Reset</button>
                 </div>
 
