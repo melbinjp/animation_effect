@@ -22,6 +22,7 @@ const elements = {
     downloadCard: document.getElementById('downloadCard'),
     sourceCanvas: document.getElementById('sourceCanvas'),
     outputCanvas: document.getElementById('canvasOutput'),
+    outputCard: document.querySelector('.emphasis-card'),
     outputVideo: document.getElementById('outputVideo'),
     videoResult: document.getElementById('videoResult'),
     fileMeta: document.getElementById('fileMeta'),
@@ -29,6 +30,15 @@ const elements = {
 };
 
 const STYLE_PRESETS = {
+    manga: {
+        label: 'Manga Contrast',
+        background: [255, 255, 255],
+        ink: [0, 0, 0],
+        lowThreshold: 28,
+        highThreshold: 96,
+        bilateralDiameter: 9,
+        sigma: 72
+    },
     studio: {
         label: 'Studio Ink',
         background: [248, 245, 237],
@@ -38,14 +48,32 @@ const STYLE_PRESETS = {
         bilateralDiameter: 7,
         sigma: 52
     },
-    manga: {
-        label: 'Manga Contrast',
-        background: [255, 255, 255],
-        ink: [0, 0, 0],
-        lowThreshold: 28,
-        highThreshold: 96,
+    neon: {
+        label: 'Neon Pop',
+        background: [10, 8, 22],
+        ink: [0, 230, 200],
+        lowThreshold: 22,
+        highThreshold: 80,
         bilateralDiameter: 9,
-        sigma: 72
+        sigma: 68
+    },
+    warm: {
+        label: 'Warm Sketch',
+        background: [255, 248, 232],
+        ink: [102, 48, 14],
+        lowThreshold: 32,
+        highThreshold: 104,
+        bilateralDiameter: 7,
+        sigma: 58
+    },
+    vivid: {
+        label: 'Vivid Toon',
+        background: [255, 255, 255],
+        ink: [26, 26, 180],
+        lowThreshold: 20,
+        highThreshold: 72,
+        bilateralDiameter: 11,
+        sigma: 88
     },
     blueprint: {
         label: 'Blueprint Draft',
@@ -97,7 +125,7 @@ class LineArtProcessor {
             if (msg.type === 'cv-ready') {
                 state.cvReady = true;
                 refreshActions();
-                setStatus('OpenCV ready. Drop an image or video to create line art.', 'success');
+                setStatus('Ready. Drop a photo or video of animals, people, or plants to get started.', 'success');
                 return;
             }
 
@@ -204,6 +232,14 @@ function revokeUrl(key) {
     if (state[key]) {
         URL.revokeObjectURL(state[key]);
         state[key] = '';
+    }
+}
+
+function setResultGlow(active) {
+    if (active) {
+        elements.outputCard.classList.add('has-result');
+    } else {
+        elements.outputCard.classList.remove('has-result');
     }
 }
 
@@ -555,6 +591,13 @@ async function readSelectedFile(file) {
             `${file.name} · ${video.videoWidth}×${video.videoHeight} video · ${video.duration.toFixed(1)}s`
         );
         summarizeWorkload();
+        // Eagerly load the video export engine in the background so the user
+        // does not have to click the button manually before rendering.
+        if (!state.ffmpegReady) {
+            loadFFmpeg().catch((err) => {
+                console.warn('Auto-load of video export engine failed:', err.message);
+            });
+        }
         return;
     }
 
@@ -582,6 +625,7 @@ async function renderPreview() {
     throwIfCancelled();
     await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
     clearRenderedOutput();
+    setResultGlow(true);
     setStatus(
         state.fileKind === 'video'
             ? 'Preview ready. Use Render final to process the full clip.'
@@ -703,6 +747,7 @@ function resetWorkspace() {
     state.sourceVideo = null;
     revokeUrl('sourceUrl');
     clearRenderedOutput();
+    setResultGlow(false);
     resetProgress();
     elements.fileInput.value = '';
     updateFileMeta('No file selected.');
@@ -711,8 +756,8 @@ function resetWorkspace() {
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
     setStatus(
         state.cvReady
-            ? 'Ready. Drop an image or video to create line art.'
-            : 'Loading OpenCV engine...',
+            ? 'Ready. Drop a photo or video clip to get started.'
+            : 'Loading processing engine...',
         'info'
     );
     refreshActions();
