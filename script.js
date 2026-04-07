@@ -129,12 +129,44 @@ class LineArtProcessor {
         this._worker = new Worker('worker.js');
         this._pending = new Map();
         this._idCounter = 0;
+        this._initTimeout = null;
+        this._loadingStartTime = Date.now();
+
+        console.log('[Main] LineArtProcessor: Worker created, waiting for OpenCV to initialize...');
+        setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
+
+        // Set a timeout for OpenCV initialization (30 seconds)
+        this._initTimeout = setTimeout(() => {
+            if (!state.cvReady) {
+                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                console.error(`[Main] OpenCV initialization timeout after ${elapsedSeconds} seconds - worker did not signal ready`);
+                setStatus('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
+                elements.dropZone.classList.remove('is-loading');
+            }
+        }, 30000);
 
         this._worker.onmessage = ({ data: msg }) => {
             if (msg.type === 'cv-ready') {
+                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                console.log(`[Main] Received cv-ready message from worker after ${elapsedSeconds} seconds`);
+                if (this._initTimeout) {
+                    clearTimeout(this._initTimeout);
+                    this._initTimeout = null;
+                }
                 state.cvReady = true;
                 refreshActions();
                 setStatus('Ready. Drop a photo or video of animals, people, or plants to get started.', 'success');
+                return;
+            }
+
+            if (msg.type === 'cv-error') {
+                console.error('[Main] Received cv-error from worker:', msg.message);
+                if (this._initTimeout) {
+                    clearTimeout(this._initTimeout);
+                    this._initTimeout = null;
+                }
+                setStatus('Failed to load processing engine: ' + msg.message, 'error');
+                elements.dropZone.classList.remove('is-loading');
                 return;
             }
 
@@ -157,12 +189,17 @@ class LineArtProcessor {
         };
 
         this._worker.onerror = (error) => {
-            console.error('OpenCV worker error:', error);
+            console.error('[Main] OpenCV worker error:', error);
+            if (this._initTimeout) {
+                clearTimeout(this._initTimeout);
+                this._initTimeout = null;
+            }
             for (const [, { reject }] of this._pending) {
                 reject(new Error('Processing worker error.'));
             }
             this._pending.clear();
             setStatus('Processing worker error. Please reload the page.', 'error');
+            elements.dropZone.classList.remove('is-loading');
         };
     }
 
@@ -789,12 +826,16 @@ function resetWorkspace() {
     setAdvisory('Select a file to estimate browser workload.', 'info');
     drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
-    setStatus(
-        state.cvReady
-            ? 'Ready. Drop a photo or video clip to get started.'
-            : 'Loading processing engine...',
-        'info'
-    );
+    if (!state.cvReady) {
+        // Don't overwrite the detailed loading message from LineArtProcessor constructor
+        // Only set a message if the current status indicates an error or completion
+        const currentStatus = elements.status.textContent;
+        if (!currentStatus.includes('Loading processing engine')) {
+            setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
+        }
+    } else {
+        setStatus('Ready. Drop a photo or video clip to get started.', 'success');
+    }
     refreshActions();
     updateUnloadProtection();
 }

@@ -53,6 +53,20 @@ python -m http.server 8000
 
 Then open `http://localhost:8000`.
 
+## Testing
+
+To test the OpenCV processing engine loading functionality:
+
+1. Start a local server (see above)
+2. Open `http://localhost:8000/test-loading.html`
+3. The test page will automatically run tests for:
+   - Worker creation
+   - OpenCV initialization (with 30s timeout)
+   - Error handling and logging
+   - Message type validation
+
+The test page provides real-time console output and test results. All tests should pass with OpenCV initializing in 10-30 seconds depending on your connection and browser.
+
 ## Current constraints
 
 - Rendering very long clips is bounded by browser CPU and memory limits.
