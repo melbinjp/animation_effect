@@ -8,6 +8,10 @@
         name="description"
         content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server."
     >
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -58,7 +62,38 @@
                         <option value="warm">Warm Sketch</option>
                         <option value="vivid">Vivid Toon</option>
                         <option value="blueprint">Blueprint Draft</option>
+                        <option value="custom">Custom / Experiment</option>
                     </select>
+                </div>
+
+                <div class="control-group" id="customControls" hidden>
+                    <p class="custom-controls-label">Custom parameters</p>
+                    <div class="custom-color-row">
+                        <div class="custom-color-item">
+                            <label for="customBg">Background</label>
+                            <input type="color" id="customBg" value="#ffffff">
+                        </div>
+                        <div class="custom-color-item">
+                            <label for="customInk">Ink</label>
+                            <input type="color" id="customInk" value="#000000">
+                        </div>
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="customLowThresh">Low threshold <span id="customLowThreshVal">28</span></label>
+                        <input type="range" id="customLowThresh" min="1" max="150" value="28">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="customHighThresh">High threshold <span id="customHighThreshVal">96</span></label>
+                        <input type="range" id="customHighThresh" min="10" max="300" value="96">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="customBilateral">Bilateral diameter <span id="customBilateralVal">9</span></label>
+                        <input type="range" id="customBilateral" min="1" max="15" step="2" value="9">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="customSigma">Sigma <span id="customSigmaVal">72</span></label>
+                        <input type="range" id="customSigma" min="10" max="200" value="72">
+                    </div>
                 </div>
 
                 <div class="control-group">

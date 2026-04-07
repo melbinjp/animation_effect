@@ -83,6 +83,15 @@ const STYLE_PRESETS = {
         highThreshold: 144,
         bilateralDiameter: 5,
         sigma: 44
+    },
+    custom: {
+        label: 'Custom / Experiment',
+        background: [255, 255, 255],
+        ink: [0, 0, 0],
+        lowThreshold: 28,
+        highThreshold: 96,
+        bilateralDiameter: 9,
+        sigma: 72
     }
 };
 
@@ -289,9 +298,28 @@ function getMediaType(file) {
     return null;
 }
 
-function getSettings() {
+function hexToRgb(hex) {
+    const n = parseInt(hex.replace('#', ''), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function getCustomPreset() {
     return {
-        preset: STYLE_PRESETS[elements.preset.value],
+        label: 'Custom / Experiment',
+        background: hexToRgb(document.getElementById('customBg').value),
+        ink: hexToRgb(document.getElementById('customInk').value),
+        lowThreshold: Number(document.getElementById('customLowThresh').value),
+        highThreshold: Number(document.getElementById('customHighThresh').value),
+        bilateralDiameter: Number(document.getElementById('customBilateral').value),
+        sigma: Number(document.getElementById('customSigma').value)
+    };
+}
+
+function getSettings() {
+    const presetKey = elements.preset.value;
+    const preset = presetKey === 'custom' ? getCustomPreset() : STYLE_PRESETS[presetKey];
+    return {
+        preset,
         detail: Number(elements.detail.value),
         lineWeight: Number(elements.lineWeight.value),
         scale: Number(elements.scale.value),
@@ -862,12 +890,38 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 
 ['preset', 'detail', 'lineWeight', 'scale', 'videoFps'].forEach((id) => {
     document.getElementById(id).addEventListener('change', async () => {
+        if (id === 'preset') {
+            document.getElementById('customControls').hidden = elements.preset.value !== 'custom';
+        }
         summarizeWorkload();
 
         if (!state.selectedFile || state.processing) {
             return;
         }
 
+        await onPreviewClick();
+    });
+});
+
+// Custom preset controls: update live labels and re-preview on change
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma'];
+const customValueSpans = {
+    customLowThresh: document.getElementById('customLowThreshVal'),
+    customHighThresh: document.getElementById('customHighThreshVal'),
+    customBilateral: document.getElementById('customBilateralVal'),
+    customSigma: document.getElementById('customSigmaVal')
+};
+
+customInputIds.forEach((id) => {
+    document.getElementById(id).addEventListener('input', () => {
+        if (customValueSpans[id]) {
+            customValueSpans[id].textContent = document.getElementById(id).value;
+        }
+    });
+    document.getElementById(id).addEventListener('change', async () => {
+        if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
+            return;
+        }
         await onPreviewClick();
     });
 });

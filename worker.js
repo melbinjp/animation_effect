@@ -10,7 +10,7 @@ self.Module = {
     }
 };
 
-importScripts('https://docs.opencv.org/4.5.2/opencv.js');
+importScripts('vendor/opencv.js');
 
 class WorkerProcessor {
     constructor() {

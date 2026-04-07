@@ -1,0 +1,49 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download favicon from favicon.wecanuseai.com
+        run: |
+          curl -fsSL "https://favicon.wecanuseai.com/favicon.ico" -o favicon.ico \
+            || echo "Warning: could not download favicon.ico — skipping"
+          for size in 16 32 192 512; do
+            curl -fsSL "https://favicon.wecanuseai.com/favicon-${size}x${size}.png" \
+              -o "favicon-${size}x${size}.png" \
+              || true
+          done
+          curl -fsSL "https://favicon.wecanuseai.com/apple-touch-icon.png" \
+            -o apple-touch-icon.png || true
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
