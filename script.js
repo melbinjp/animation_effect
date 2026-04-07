@@ -826,12 +826,16 @@ function resetWorkspace() {
     setAdvisory('Select a file to estimate browser workload.', 'info');
     drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
-    setStatus(
-        state.cvReady
-            ? 'Ready. Drop a photo or video clip to get started.'
-            : 'Loading processing engine...',
-        'info'
-    );
+    if (!state.cvReady) {
+        // Don't overwrite the detailed loading message from LineArtProcessor constructor
+        // Only set a message if the current status indicates an error or completion
+        const currentStatus = elements.status.textContent;
+        if (!currentStatus.includes('Loading processing engine')) {
+            setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
+        }
+    } else {
+        setStatus('Ready. Drop a photo or video clip to get started.', 'success');
+    }
     refreshActions();
     updateUnloadProtection();
 }
