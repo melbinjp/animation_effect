@@ -3,26 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Line Art Animator</title>
+    <title>Line Art Animator — Turn Videos &amp; Photos into Animation</title>
     <meta
         name="description"
-        content="Turn images and videos into clean line-art animation frames entirely in the browser using OpenCV and FFmpeg WASM."
+        content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server."
     >
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <main class="page-shell">
         <section class="hero">
-            <p class="eyebrow">Client-Side Line Art Studio</p>
-            <h1>Convert stills and video clips into clean animation-style line art.</h1>
+            <p class="eyebrow">Browser-Only Animation Studio</p>
+            <h1>Turn any video or photo into eye-catching line-art animation.</h1>
             <p class="hero-copy">
-                This tool runs fully in your browser. Preview a line-art treatment, adjust the style,
-                and export a PNG or MP4 without uploading anything to a server.
+                Perfect for animals, people, and nature footage. Pick a style, preview instantly, and
+                export a share-ready PNG or MP4 — everything runs in your browser, nothing leaves your device.
             </p>
             <div class="hero-notes">
-                <span>Images: PNG export</span>
-                <span>Videos: MP4 export with audio when available</span>
-                <span>Best for short clips and reference footage</span>
+                <span>Animals &amp; wildlife</span>
+                <span>People &amp; portraits</span>
+                <span>Plants &amp; nature</span>
+                <span>PNG &amp; MP4 export</span>
+                <span>Social-media ready</span>
             </div>
         </section>
 
@@ -35,12 +37,12 @@
 
                 <div class="status-card" data-tone="info">
                     <p class="status-label">System status</p>
-                    <p id="status" class="status-copy" aria-live="polite">Loading OpenCV engine...</p>
+                    <p id="status" class="status-copy" aria-live="polite">Loading processing engine...</p>
                 </div>
 
                 <div class="uploader" id="dropZone">
-                    <label class="uploader-label" for="fileInput">Drop an image or video here</label>
-                    <p class="uploader-copy">or choose a file from disk</p>
+                    <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
+                    <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*" disabled>
                     <button id="load-ffmpeg" type="button" class="secondary-button" disabled>
                         Load video export engine
@@ -50,8 +52,11 @@
                 <div class="control-group">
                     <label for="preset">Style preset</label>
                     <select id="preset">
+                        <option value="manga" selected>Manga Contrast</option>
                         <option value="studio">Studio Ink</option>
-                        <option value="manga">Manga Contrast</option>
+                        <option value="neon">Neon Pop</option>
+                        <option value="warm">Warm Sketch</option>
+                        <option value="vivid">Vivid Toon</option>
                         <option value="blueprint">Blueprint Draft</option>
                     </select>
                 </div>
