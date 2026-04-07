@@ -130,13 +130,16 @@ class LineArtProcessor {
         this._pending = new Map();
         this._idCounter = 0;
         this._initTimeout = null;
+        this._loadingStartTime = Date.now();
 
         console.log('[Main] LineArtProcessor: Worker created, waiting for OpenCV to initialize...');
+        setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
 
         // Set a timeout for OpenCV initialization (30 seconds)
         this._initTimeout = setTimeout(() => {
             if (!state.cvReady) {
-                console.error('[Main] OpenCV initialization timeout - worker did not signal ready within 30 seconds');
+                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                console.error(`[Main] OpenCV initialization timeout after ${elapsedSeconds} seconds - worker did not signal ready`);
                 setStatus('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
                 elements.dropZone.classList.remove('is-loading');
             }
@@ -144,7 +147,8 @@ class LineArtProcessor {
 
         this._worker.onmessage = ({ data: msg }) => {
             if (msg.type === 'cv-ready') {
-                console.log('[Main] Received cv-ready message from worker');
+                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                console.log(`[Main] Received cv-ready message from worker after ${elapsedSeconds} seconds`);
                 if (this._initTimeout) {
                     clearTimeout(this._initTimeout);
                     this._initTimeout = null;
