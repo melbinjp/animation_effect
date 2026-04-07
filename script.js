@@ -129,12 +129,40 @@ class LineArtProcessor {
         this._worker = new Worker('worker.js');
         this._pending = new Map();
         this._idCounter = 0;
+        this._initTimeout = null;
+
+        console.log('[Main] LineArtProcessor: Worker created, waiting for OpenCV to initialize...');
+
+        // Set a timeout for OpenCV initialization (30 seconds)
+        this._initTimeout = setTimeout(() => {
+            if (!state.cvReady) {
+                console.error('[Main] OpenCV initialization timeout - worker did not signal ready within 30 seconds');
+                setStatus('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
+                elements.dropZone.classList.remove('is-loading');
+            }
+        }, 30000);
 
         this._worker.onmessage = ({ data: msg }) => {
             if (msg.type === 'cv-ready') {
+                console.log('[Main] Received cv-ready message from worker');
+                if (this._initTimeout) {
+                    clearTimeout(this._initTimeout);
+                    this._initTimeout = null;
+                }
                 state.cvReady = true;
                 refreshActions();
                 setStatus('Ready. Drop a photo or video of animals, people, or plants to get started.', 'success');
+                return;
+            }
+
+            if (msg.type === 'cv-error') {
+                console.error('[Main] Received cv-error from worker:', msg.message);
+                if (this._initTimeout) {
+                    clearTimeout(this._initTimeout);
+                    this._initTimeout = null;
+                }
+                setStatus('Failed to load processing engine: ' + msg.message, 'error');
+                elements.dropZone.classList.remove('is-loading');
                 return;
             }
 
@@ -157,12 +185,17 @@ class LineArtProcessor {
         };
 
         this._worker.onerror = (error) => {
-            console.error('OpenCV worker error:', error);
+            console.error('[Main] OpenCV worker error:', error);
+            if (this._initTimeout) {
+                clearTimeout(this._initTimeout);
+                this._initTimeout = null;
+            }
             for (const [, { reject }] of this._pending) {
                 reject(new Error('Processing worker error.'));
             }
             this._pending.clear();
             setStatus('Processing worker error. Please reload the page.', 'error');
+            elements.dropZone.classList.remove('is-loading');
         };
     }
 
