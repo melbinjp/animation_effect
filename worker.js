@@ -28,12 +28,13 @@ class WorkerProcessor {
     }
 
     reset() {
-        [this.src, this.smoothed, this.gray, this.edges].forEach((mat) => {
+        [this.src, this.rgb, this.smoothed, this.gray, this.edges].forEach((mat) => {
             if (mat) {
                 mat.delete();
             }
         });
         this.src = null;
+        this.rgb = null;
         this.smoothed = null;
         this.gray = null;
         this.edges = null;
@@ -50,7 +51,8 @@ class WorkerProcessor {
         this.width = width;
         this.height = height;
         this.src = new cv.Mat(height, width, cv.CV_8UC4);
-        this.smoothed = new cv.Mat(height, width, cv.CV_8UC4);
+        this.rgb = new cv.Mat(height, width, cv.CV_8UC3);
+        this.smoothed = new cv.Mat(height, width, cv.CV_8UC3);
         this.gray = new cv.Mat(height, width, cv.CV_8UC1);
         this.edges = new cv.Mat(height, width, cv.CV_8UC1);
     }
@@ -58,6 +60,7 @@ class WorkerProcessor {
     process(rgbaData, width, height, settings) {
         this.ensureSize(width, height);
         this.src.data.set(rgbaData);
+        cv.cvtColor(this.src, this.rgb, cv.COLOR_RGBA2RGB);
 
         const detailFactor = settings.detail / 62;
         const lowThreshold = Math.max(12, Math.round(settings.preset.lowThreshold / detailFactor));
@@ -65,14 +68,14 @@ class WorkerProcessor {
         const sigma = Math.max(20, Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
 
         cv.bilateralFilter(
-            this.src,
+            this.rgb,
             this.smoothed,
             settings.preset.bilateralDiameter,
             sigma,
             sigma,
             cv.BORDER_DEFAULT
         );
-        cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGBA2GRAY);
+        cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
         cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
 
         if (settings.lineWeight > 1) {
@@ -117,7 +120,12 @@ self.onmessage = function ({ data: msg }) {
             // Transfer the buffer (zero-copy) back to the main thread.
             self.postMessage({ type: 'result', id: msg.id, data: result }, [result.buffer]);
         } catch (error) {
-            self.postMessage({ type: 'error', id: msg.id, message: error.message });
+            console.error('[Worker] Error during process:', error);
+            let errMsg = error && error.message ? error.message : String(error);
+            if (typeof error === 'number' && cv && typeof cv.exceptionFromPtr === 'function') {
+                errMsg = cv.exceptionFromPtr(error).msg;
+            }
+            self.postMessage({ type: 'error', id: msg.id, message: errMsg });
         }
     } else if (msg.type === 'reset') {
         if (processorInstance) {
