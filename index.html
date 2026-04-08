@@ -47,18 +47,10 @@
                     <p>Pick a file, tune the look, preview, then render the final result.</p>
                 </div>
 
-                <div class="status-card" data-tone="info">
-                    <p class="status-label">System status</p>
-                    <p id="status" class="status-copy" aria-live="polite">Loading processing engine...</p>
-                </div>
-
                 <div class="uploader" id="dropZone">
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
-                    <button id="load-ffmpeg" type="button" class="secondary-button" disabled>
-                        Load video export engine
-                    </button>
                 </div>
 
                 <div class="control-group">
@@ -135,11 +127,14 @@
                     <div class="control-group">
                         <label for="videoFps">Video FPS</label>
                         <select id="videoFps">
+                            <option value="original">Original</option>
                             <option value="12">12</option>
                             <option value="18" selected>18</option>
                             <option value="24">24</option>
                             <option value="30">30</option>
+                            <option value="custom">Custom</option>
                         </select>
+                        <input type="number" id="customVideoFps" min="1" max="120" value="30" hidden style="margin-top: 0.5rem;" aria-label="Custom FPS">
                     </div>
                 </div>
 

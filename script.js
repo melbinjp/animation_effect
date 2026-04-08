@@ -1,9 +1,6 @@
 const elements = {
     fileInput: document.getElementById('fileInput'),
-    loadFFmpegBtn: document.getElementById('load-ffmpeg'),
     cancelBtn: document.getElementById('cancelBtn'),
-    status: document.getElementById('status'),
-    statusCard: document.querySelector('.status-card'),
     advisoryCard: document.getElementById('advisoryCard'),
     advisoryText: document.getElementById('advisoryText'),
     progressCard: document.getElementById('progressCard'),
@@ -15,6 +12,7 @@ const elements = {
     lineWeight: document.getElementById('lineWeight'),
     scale: document.getElementById('scale'),
     videoFps: document.getElementById('videoFps'),
+    customVideoFps: document.getElementById('customVideoFps'),
     previewBtn: document.getElementById('previewBtn'),
     renderBtn: document.getElementById('renderBtn'),
     resetBtn: document.getElementById('resetBtn'),
@@ -133,19 +131,20 @@ class LineArtProcessor {
         this._loadingStartTime = Date.now();
 
         console.log('[Main] LineArtProcessor: Worker created, waiting for OpenCV to initialize...');
-        setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
 
         // Set a timeout for OpenCV initialization (30 seconds)
         this._initTimeout = setTimeout(() => {
             if (!state.cvReady) {
                 const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
                 console.error(`[Main] OpenCV initialization timeout after ${elapsedSeconds} seconds - worker did not signal ready`);
-                setStatus('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
+                setAdvisory('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
                 elements.dropZone.classList.remove('is-loading');
             }
         }, 30000);
 
-        this._worker.onmessage = ({ data: msg }) => {
+        this._worker.onmessage = (event) => {
+            const msg = event && event.data;
+            if (!msg) return;
             if (msg.type === 'cv-ready') {
                 const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
                 console.log(`[Main] Received cv-ready message from worker after ${elapsedSeconds} seconds`);
@@ -155,7 +154,6 @@ class LineArtProcessor {
                 }
                 state.cvReady = true;
                 refreshActions();
-                setStatus('Ready. Drop a photo or video of animals, people, or plants to get started.', 'success');
                 return;
             }
 
@@ -165,26 +163,29 @@ class LineArtProcessor {
                     clearTimeout(this._initTimeout);
                     this._initTimeout = null;
                 }
-                setStatus('Failed to load processing engine: ' + msg.message, 'error');
+                setAdvisory('Failed to load processing engine: ' + msg.message, 'error');
                 elements.dropZone.classList.remove('is-loading');
                 return;
             }
 
-            const entry = this._pending.get(msg.id);
-            this._pending.delete(msg.id);
-            if (!entry) {
-                return;
-            }
+            if (msg.id !== undefined) {
+                const entry = this._pending.get(msg.id);
+                this._pending.delete(msg.id);
+                if (!entry) {
+                    return;
+                }
 
-            if (msg.type === 'result') {
-                const { resolve, destinationCanvas, width, height } = entry;
-                destinationCanvas.width = width;
-                destinationCanvas.height = height;
-                const ctx = destinationCanvas.getContext('2d');
-                ctx.putImageData(new ImageData(msg.data, width, height), 0, 0);
-                resolve();
-            } else if (msg.type === 'error') {
-                entry.reject(new Error(msg.message));
+                if (msg.type === 'result') {
+                    const { resolve, destinationCanvas, width, height } = entry;
+                    destinationCanvas.width = width;
+                    destinationCanvas.height = height;
+                    const ctx = destinationCanvas.getContext('2d');
+                    const clampedArray = new Uint8ClampedArray(msg.data);
+                    ctx.putImageData(new ImageData(clampedArray, width, height), 0, 0);
+                    resolve();
+                } else if (msg.type === 'error') {
+                    entry.reject(new Error(msg.message));
+                }
             }
         };
 
@@ -198,7 +199,7 @@ class LineArtProcessor {
                 reject(new Error('Processing worker error.'));
             }
             this._pending.clear();
-            setStatus('Processing worker error. Please reload the page.', 'error');
+            setAdvisory('Processing worker error. Please reload the page.', 'error');
             elements.dropZone.classList.remove('is-loading');
         };
     }
@@ -232,11 +233,6 @@ class LineArtProcessor {
 
 const processor = new LineArtProcessor();
 
-function setStatus(message, tone = 'info') {
-    elements.status.textContent = message;
-    elements.statusCard.dataset.tone = tone;
-}
-
 function setBusy(isBusy) {
     state.processing = isBusy;
     elements.cancelBtn.hidden = !isBusy;
@@ -250,7 +246,6 @@ function refreshActions() {
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.fileInput.disabled = notReady;
-    elements.loadFFmpegBtn.disabled = !state.cvReady || state.processing || state.ffmpegReady;
     elements.dropZone.classList.toggle('is-loading', !state.cvReady);
 }
 
@@ -357,12 +352,27 @@ function getCustomPreset() {
 function getSettings() {
     const presetKey = elements.preset.value;
     const preset = presetKey === 'custom' ? getCustomPreset() : STYLE_PRESETS[presetKey];
+
+    let fps = 18;
+    if (elements.videoFps.value === 'original') {
+        // Fallback to 30 if we can't extract original, though usually
+        // FFmpeg extraction just handles the source frames, but for simplicity
+        // here we assume a reasonable default or 30 if original isn't accessible
+        // natively via the HTML video element. We will attempt to rely on duration/frames if possible.
+        fps = 30; // Native video FPS is not accessible in standard JS, so we use 30 as a default "original" proxy for computations.
+    } else if (elements.videoFps.value === 'custom') {
+        fps = Number(elements.customVideoFps.value) || 30;
+    } else {
+        fps = Number(elements.videoFps.value);
+    }
+
     return {
         preset,
         detail: Number(elements.detail.value),
         lineWeight: Number(elements.lineWeight.value),
         scale: Number(elements.scale.value),
-        videoFps: Number(elements.videoFps.value)
+        videoFps: fps,
+        isOriginalFps: elements.videoFps.value === 'original'
     };
 }
 
@@ -539,7 +549,7 @@ function requestCancel() {
     }
 
     state.cancelRequested = true;
-    setStatus('Cancel requested. Finishing the current step...', 'warn');
+    console.log('Cancel requested. Finishing the current step...', 'warn');
     setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
 
     processor.reset();
@@ -603,19 +613,19 @@ async function loadFFmpeg() {
         state.ffmpeg = new FFmpegClass();
         state.ffmpeg.on('log', ({ message }) => {
             if (message.startsWith('frame=')) {
-                setStatus(`Encoding video... ${message}`, 'info');
+                console.log(`Encoding video... ${message}`, 'info');
             }
         });
         state.ffmpeg.on('progress', ({ progress }) => {
             if (typeof progress === 'number') {
                 const percent = Math.min(100, Math.max(0, Math.round(progress * 100)));
-                setStatus(`Encoding video... ${percent}%`, 'info');
+                console.log(`Encoding video... ${percent}%`, 'info');
                 setProgress(92 + Math.round(percent * 0.08), 'Encoding final MP4...');
             }
         });
     }
 
-    setStatus('Loading FFmpeg video export engine...', 'info');
+    console.log('Loading FFmpeg video export engine...', 'info');
     await state.ffmpeg.load({
         coreURL: 'vendor/ffmpeg-core.js',
         wasmURL: 'vendor/ffmpeg-core.wasm'
@@ -623,7 +633,7 @@ async function loadFFmpeg() {
 
     state.ffmpegReady = true;
     refreshActions();
-    setStatus('OpenCV ready. Video export engine loaded.', 'success');
+    console.log('OpenCV ready. Video export engine loaded.', 'success');
     return state.ffmpeg;
 }
 
@@ -693,7 +703,7 @@ async function renderPreview() {
     await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
     clearRenderedOutput();
     setResultGlow(true);
-    setStatus(
+    console.log(
         state.fileKind === 'video'
             ? 'Preview ready. Use Render final to process the full clip.'
             : 'Preview ready. Use Render final to export the PNG.',
@@ -708,15 +718,14 @@ async function renderImageExport() {
     const blob = await canvasToBlob(elements.outputCanvas, 'image/png');
     setDownload(blob, fileName);
     setProgress(100, 'PNG export ready.');
-    setStatus('Image render complete. Download your PNG.', 'success');
+    console.log('Image render complete. Download your PNG.', 'success');
 }
 
 async function renderVideoExport() {
     const ffmpeg = await loadFFmpeg();
     const settings = getSettings();
-    const fps = settings.videoFps;
+    let fps = settings.videoFps;
     const video = state.sourceVideo;
-    const totalFrames = Math.max(1, Math.floor(video.duration * fps));
     const jobId = `job-${Date.now()}`;
     const extension = state.selectedFile.name.includes('.')
         ? state.selectedFile.name.slice(state.selectedFile.name.lastIndexOf('.'))
@@ -727,9 +736,38 @@ async function renderVideoExport() {
     const outputPath = `${jobId}/output.mp4`;
     state.activeJobId = jobId;
 
+    let totalFrames = 1;
+
     try {
         await ffmpeg.createDir(jobId);
         await ffmpeg.writeFile(inputPath, new Uint8Array(await state.selectedFile.arrayBuffer()));
+
+        if (settings.isOriginalFps) {
+            setProgress(5, 'Detecting original framerate...');
+            let detectedFps = null;
+            const logHandler = ({ message }) => {
+                const fpsMatch = message.match(/(\d+(?:\.\d+)?) fps/);
+                if (fpsMatch) {
+                    detectedFps = parseFloat(fpsMatch[1]);
+                }
+            };
+            ffmpeg.on('log', logHandler);
+            try {
+                await ffmpeg.exec(['-i', inputPath]);
+            } catch (e) {
+                // ffmpeg exits with code 1 if no output file is provided, which is expected here
+            }
+            ffmpeg.off('log', logHandler);
+
+            if (detectedFps && detectedFps > 0) {
+                fps = detectedFps;
+                console.log(`Detected original FPS: ${fps}`);
+            } else {
+                console.warn('Could not detect original FPS, falling back to 30');
+                fps = 30;
+            }
+        }
+        totalFrames = Math.max(1, Math.floor(video.duration * fps));
 
         for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
             throwIfCancelled();
@@ -744,13 +782,13 @@ async function renderVideoExport() {
             await ffmpeg.writeFile(frameName, frameBytes);
             const framePercent = ((frameIndex + 1) / totalFrames) * 92;
             setProgress(framePercent, `Rendering frame ${frameIndex + 1} of ${totalFrames}...`);
-            setStatus(`Rendering frame ${frameIndex + 1} of ${totalFrames}...`, 'info');
+            console.log(`Rendering frame ${frameIndex + 1} of ${totalFrames}...`, 'info');
         }
 
         throwIfCancelled();
         setProgress(92, 'Encoding final MP4 in the browser...');
-        setStatus('Encoding final MP4 in the browser...', 'info');
-        await ffmpeg.exec([
+        console.log('Encoding final MP4 in the browser...', 'info');
+        const encodeArgs = [
             '-y',
             '-framerate', String(fps),
             '-i', framePattern,
@@ -760,9 +798,22 @@ async function renderVideoExport() {
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
-            '-shortest',
-            outputPath
-        ]);
+            '-shortest'
+        ];
+
+        if (settings.isOriginalFps) {
+            // If using original FPS, we can just let ffmpeg use the source frame rate for the video
+            // by not specifying -framerate for the input or mapping it differently. But since we extract frames based on time,
+            // we have to reconstruct. However, FFmpeg can just read the original file and apply an OpenCV filter natively,
+            // but since we render in browser canvas, we must specify framerate. We fallback to 30.
+            // A truly native way to match FPS is to use the original video stream's framerate.
+            // `-framerate` applies to the image sequence. We'll use our computed fps proxy.
+            // We can also copy the timebase and fps from the original if we processed it frame by frame using ffmpeg native extract,
+            // but for canvas readback, the above is sufficient.
+        }
+        encodeArgs.push(outputPath);
+
+        await ffmpeg.exec(encodeArgs);
 
         throwIfCancelled();
         const outputData = await ffmpeg.readFile(outputPath);
@@ -771,7 +822,7 @@ async function renderVideoExport() {
         elements.outputVideo.src = state.outputUrl;
         elements.videoResult.hidden = false;
         setProgress(100, 'MP4 export ready.');
-        setStatus('Video render complete. Download or review the MP4.', 'success');
+        console.log('Video render complete. Download or review the MP4.', 'success');
     } finally {
         await cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath);
         state.activeJobId = '';
@@ -784,7 +835,7 @@ async function handleFileSelection(file) {
     }
 
     if (!state.cvReady) {
-        setStatus('Processing engine still loading — please wait a moment and try again.', 'warn');
+        console.log('Processing engine still loading — please wait a moment and try again.', 'warn');
         return;
     }
 
@@ -804,7 +855,7 @@ async function handleFileSelection(file) {
         drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
         drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
         setAdvisory('Select a file to estimate browser workload.', 'info');
-        setStatus(error.message, 'error');
+        console.log(error.message, 'error');
     } finally {
         setBusy(false);
         updateUnloadProtection();
@@ -827,14 +878,9 @@ function resetWorkspace() {
     drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
     if (!state.cvReady) {
-        // Don't overwrite the detailed loading message from LineArtProcessor constructor
-        // Only set a message if the current status indicates an error or completion
-        const currentStatus = elements.status.textContent;
-        if (!currentStatus.includes('Loading processing engine')) {
-            setStatus('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
-        }
+        console.log('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
     } else {
-        setStatus('Ready. Drop a photo or video clip to get started.', 'success');
+        console.log('Ready. Drop a photo or video clip to get started.', 'success');
     }
     refreshActions();
     updateUnloadProtection();
@@ -852,7 +898,7 @@ async function onPreviewClick() {
         await renderPreview();
     } catch (error) {
         console.error(error);
-        setStatus(error.message, error.message === 'Render cancelled.' ? 'warn' : 'error');
+        console.log(error.message, error.message === 'Render cancelled.' ? 'warn' : 'error');
     } finally {
         setBusy(false);
         updateUnloadProtection();
@@ -883,7 +929,7 @@ async function onRenderClick() {
         throw new Error('Unsupported file type.');
     } catch (error) {
         console.error(error);
-        setStatus(error.message || 'Rendering failed.', error.message === 'Render cancelled.' ? 'warn' : 'error');
+        console.log(error.message || 'Rendering failed.', error.message === 'Render cancelled.' ? 'warn' : 'error');
     } finally {
         setBusy(false);
         state.cancelRequested = false;
@@ -914,18 +960,6 @@ function attachDropZone() {
 
 // OpenCV is loaded inside worker.js; cv-ready is signalled via the worker message handler above.
 
-elements.loadFFmpegBtn.addEventListener('click', async () => {
-    try {
-        setBusy(true);
-        await loadFFmpeg();
-    } catch (error) {
-        console.error(error);
-        setStatus(error.message, 'error');
-    } finally {
-        setBusy(false);
-    }
-});
-
 elements.fileInput.addEventListener('change', async (event) => {
     const [file] = event.target.files;
     await handleFileSelection(file);
@@ -936,10 +970,15 @@ elements.renderBtn.addEventListener('click', onRenderClick);
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 
-['preset', 'detail', 'lineWeight', 'scale', 'videoFps'].forEach((id) => {
-    document.getElementById(id).addEventListener('change', async () => {
+['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', async () => {
         if (id === 'preset') {
             document.getElementById('customControls').hidden = elements.preset.value !== 'custom';
+        }
+        if (id === 'videoFps') {
+            elements.customVideoFps.hidden = elements.videoFps.value !== 'custom';
         }
         summarizeWorkload();
 
