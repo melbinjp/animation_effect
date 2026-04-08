@@ -66,17 +66,36 @@ class WorkerProcessor {
         const lowThreshold = Math.max(12, Math.round(settings.preset.lowThreshold / detailFactor));
         const highThreshold = Math.max(lowThreshold + 24, Math.round(settings.preset.highThreshold / detailFactor));
         const sigma = Math.max(20, Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
+        const d = settings.preset.bilateralDiameter;
 
-        cv.bilateralFilter(
-            this.rgb,
-            this.smoothed,
-            settings.preset.bilateralDiameter,
-            sigma,
-            sigma,
-            cv.BORDER_DEFAULT
-        );
+        // First bilateral pass — smooths flat areas while preserving hard edges.
+        cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
+
+        // Second bilateral pass with a reduced sigma — refines smoothing without
+        // over-blurring, giving cartoonier flat regions and cleaner edge boundaries.
+        if (settings.preset.smoothPasses >= 2) {
+            // Keep refineSigma >= 15 to avoid destroying the edge-preserving
+            // property of the bilateral filter at very low sigma values.
+            const refineSigma = Math.max(15, Math.round(sigma * 0.5));
+            // Ping-pong between this.smoothed and this.rgb so each call writes
+            // to a different buffer — bilateral filter requires src ≠ dst.
+            cv.bilateralFilter(this.smoothed, this.rgb, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+            cv.bilateralFilter(this.rgb, this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+        }
+
         cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
+
+        // Light Gaussian blur on the grayscale image to suppress high-frequency
+        // noise that would otherwise generate spurious thin Canny edges.
+        cv.GaussianBlur(this.gray, this.gray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+
         cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
+
+        // Morphological closing bridges tiny gaps between nearby edge segments,
+        // producing closed, cartoon-style contours around subjects.
+        const closeKernel = cv.Mat.ones(3, 3, cv.CV_8U);
+        cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
+        closeKernel.delete();
 
         if (settings.lineWeight > 1) {
             const kernel = cv.Mat.ones(settings.lineWeight, settings.lineWeight, cv.CV_8U);

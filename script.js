@@ -35,7 +35,8 @@ const STYLE_PRESETS = {
         lowThreshold: 28,
         highThreshold: 96,
         bilateralDiameter: 9,
-        sigma: 72
+        sigma: 72,
+        smoothPasses: 2
     },
     studio: {
         label: 'Studio Ink',
@@ -44,7 +45,8 @@ const STYLE_PRESETS = {
         lowThreshold: 38,
         highThreshold: 118,
         bilateralDiameter: 7,
-        sigma: 52
+        sigma: 52,
+        smoothPasses: 2
     },
     neon: {
         label: 'Neon Pop',
@@ -53,7 +55,8 @@ const STYLE_PRESETS = {
         lowThreshold: 22,
         highThreshold: 80,
         bilateralDiameter: 9,
-        sigma: 68
+        sigma: 68,
+        smoothPasses: 2
     },
     warm: {
         label: 'Warm Sketch',
@@ -62,16 +65,18 @@ const STYLE_PRESETS = {
         lowThreshold: 32,
         highThreshold: 104,
         bilateralDiameter: 7,
-        sigma: 58
+        sigma: 58,
+        smoothPasses: 2
     },
     vivid: {
         label: 'Vivid Toon',
         background: [255, 255, 255],
         ink: [26, 26, 180],
-        lowThreshold: 20,
-        highThreshold: 72,
+        lowThreshold: 18,
+        highThreshold: 66,
         bilateralDiameter: 11,
-        sigma: 88
+        sigma: 96,
+        smoothPasses: 2
     },
     blueprint: {
         label: 'Blueprint Draft',
@@ -80,7 +85,8 @@ const STYLE_PRESETS = {
         lowThreshold: 48,
         highThreshold: 144,
         bilateralDiameter: 5,
-        sigma: 44
+        sigma: 44,
+        smoothPasses: 1
     },
     custom: {
         label: 'Custom / Experiment',
@@ -89,7 +95,8 @@ const STYLE_PRESETS = {
         lowThreshold: 28,
         highThreshold: 96,
         bilateralDiameter: 9,
-        sigma: 72
+        sigma: 72,
+        smoothPasses: 2
     }
 };
 
