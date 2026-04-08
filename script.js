@@ -626,9 +626,10 @@ async function loadFFmpeg() {
     }
 
     console.log('Loading FFmpeg video export engine...', 'info');
+    const getAssetUrl = (path) => new URL(path, window.location.href).href;
     await state.ffmpeg.load({
-        coreURL: 'vendor/ffmpeg-core.js',
-        wasmURL: 'vendor/ffmpeg-core.wasm'
+        coreURL: getAssetUrl('vendor/ffmpeg-core.js'),
+        wasmURL: getAssetUrl('vendor/ffmpeg-core.wasm')
     });
 
     state.ffmpegReady = true;
