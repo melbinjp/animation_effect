@@ -381,8 +381,14 @@ function getSettings() {
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
-        fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked,
+        useBilateral: presetKey === 'custom' && document.getElementById('customUseBilateral').checked,
+        bilateralPasses: Number(document.getElementById('customBilateralPasses').value),
+        useGaussian: presetKey === 'custom' && document.getElementById('customUseGaussian').checked,
+        gaussianPasses: Number(document.getElementById('customGaussianPasses').value),
+        useMedian: presetKey === 'custom' && document.getElementById('customUseMedian').checked,
+        medianPasses: Number(document.getElementById('customMedianPasses').value),
         cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked,
+        cleanSpecklesIntensity: Number(document.getElementById('customCleanSpecklesIntensity').value),
         darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
         mergeDoubleEdge: presetKey === 'custom' && document.getElementById('customMergeDoubleEdge').checked,
         mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value)
@@ -1012,26 +1018,49 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles', 'customDarkBoost', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customDarkBoost', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
     customBilateral: document.getElementById('customBilateralVal'),
     customSigma: document.getElementById('customSigmaVal'),
+    customBilateralPasses: document.getElementById('customBilateralPassesVal'),
+    customGaussianPasses: document.getElementById('customGaussianPassesVal'),
+    customMedianPasses: document.getElementById('customMedianPassesVal'),
+    customCleanSpecklesIntensity: document.getElementById('customCleanSpecklesIntensityVal'),
     customMergeDoubleEdgeIntensity: document.getElementById('customMergeDoubleEdgeIntensityVal')
 };
 
-// When Fast render is on, the bilateral diameter/sigma sliders have no effect
-// (Gaussian blur is used instead).  Grey them out so the user knows.
-function syncFastModeSliders() {
-    const isFast = document.getElementById('customFastMode').checked;
+// Grey out bilateral diameter/sigma/passes sliders when bilateral smooth is disabled.
+function syncBilateralRows() {
+    const enabled = document.getElementById('customUseBilateral').checked;
     ['customBilateral', 'customSigma'].forEach((id) => {
         const row = document.getElementById(id).closest('.custom-slider-row');
         if (row) {
-            row.classList.toggle('is-disabled', isFast);
-            document.getElementById(id).disabled = isFast;
+            row.classList.toggle('is-disabled', !enabled);
+            document.getElementById(id).disabled = !enabled;
         }
     });
+    document.getElementById('bilateralPassesRow').classList.toggle('is-disabled', !enabled);
+    document.getElementById('customBilateralPasses').disabled = !enabled;
+}
+
+// Show/hide Gaussian passes slider when Gaussian smooth is toggled.
+function syncGaussianPassesRow() {
+    const enabled = document.getElementById('customUseGaussian').checked;
+    document.getElementById('gaussianPassesRow').hidden = !enabled;
+}
+
+// Show/hide Median passes slider when Median smooth is toggled.
+function syncMedianPassesRow() {
+    const enabled = document.getElementById('customUseMedian').checked;
+    document.getElementById('medianPassesRow').hidden = !enabled;
+}
+
+// Show/hide clean speckles intensity slider when clean speckles is toggled.
+function syncCleanSpecklesRow() {
+    const enabled = document.getElementById('customCleanSpeckles').checked;
+    document.getElementById('cleanSpecklesIntensityRow').hidden = !enabled;
 }
 
 // Show the intensity slider only when merge double-edges is enabled.
@@ -1054,7 +1083,10 @@ customInputIds.forEach((id) => {
     });
     document.getElementById(id).addEventListener('change', async () => {
         // Keep dependent UI states in sync for controls that have visual side-effects.
-        if (id === 'customFastMode') { syncFastModeSliders(); }
+        if (id === 'customUseBilateral') { syncBilateralRows(); }
+        if (id === 'customUseGaussian') { syncGaussianPassesRow(); }
+        if (id === 'customUseMedian') { syncMedianPassesRow(); }
+        if (id === 'customCleanSpeckles') { syncCleanSpecklesRow(); }
         if (id === 'customMergeDoubleEdge') { syncMergeDoubleEdgeRow(); }
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
             return;

@@ -68,25 +68,9 @@ class WorkerProcessor {
         const sigma = Math.max(20, Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
         const d = settings.preset.bilateralDiameter;
 
-        if (settings.fastMode) {
-            // Fast mode: replace the expensive multi-pass bilateral filter with a
-            // single cheap Gaussian blur on the RGB image.  The bilateral filter's
-            // only role for line art is pre-smoothing the colour frame so that
-            // noise (skin texture, fabric grain, etc.) doesn't produce spurious
-            // Canny edges in the final line art.  A Gaussian blur achieves the
-            // same noise reduction at a fraction of the cost — the bilateral
-            // filter's edge-preserving property only matters for flat-colour
-            // rendering, not for edge extraction.
-            // A 5×5 kernel gives enough suppression for line-art work while
-            // being roughly 15–20× faster than three bilateral passes at d=9.
-            cv.GaussianBlur(this.rgb, this.smoothed, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-            cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
-        } else {
-            // First bilateral pass — smooths flat areas while preserving hard edges.
+        if (!settings.customMode) {
+            // Standard presets always use bilateral pre-smoothing; pass count from preset.
             cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
-
-            // Second bilateral pass with a reduced sigma — refines smoothing without
-            // over-blurring, giving cartoonier flat regions and cleaner edge boundaries.
             if (settings.preset.smoothPasses >= 2) {
                 // Keep refineSigma >= 15 to avoid destroying the edge-preserving
                 // property of the bilateral filter at very low sigma values.
@@ -96,8 +80,53 @@ class WorkerProcessor {
                 cv.bilateralFilter(this.smoothed, this.rgb, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
                 cv.bilateralFilter(this.rgb, this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
             }
-
             cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
+        } else {
+            // Custom mode: each smooth method is independently toggled and can be
+            // combined in any order — bilateral first (RGB), then Gaussian/median (gray).
+
+            if (settings.useBilateral) {
+                // N bilateral passes.  Pass 1 uses the full sigma; subsequent passes
+                // use a reduced sigma that refines smoothing without over-blurring.
+                // Ping-pong between this.smoothed and this.rgb (bilateral requires src ≠ dst).
+                const bilateralPasses = Math.max(1, Math.min(5, settings.bilateralPasses || 2));
+                cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
+                let bilateralResult = this.smoothed;
+                let bilateralAlt = this.rgb;
+                if (bilateralPasses > 1) {
+                    const refineSigma = Math.max(15, Math.round(sigma * 0.5));
+                    for (let p = 1; p < bilateralPasses; p++) {
+                        cv.bilateralFilter(bilateralResult, bilateralAlt, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+                        const tmp = bilateralResult;
+                        bilateralResult = bilateralAlt;
+                        bilateralAlt = tmp;
+                    }
+                }
+                cv.cvtColor(bilateralResult, this.gray, cv.COLOR_RGB2GRAY);
+            } else {
+                // No bilateral — convert directly to grayscale.
+                cv.cvtColor(this.rgb, this.gray, cv.COLOR_RGB2GRAY);
+            }
+
+            // Gaussian smooth runs on the grayscale image.  Multiple passes
+            // progressively strengthen the blur, preserving fine edges that
+            // bilateral would suppress.
+            if (settings.useGaussian) {
+                const gaussianPasses = Math.max(1, Math.min(5, settings.gaussianPasses || 1));
+                for (let p = 0; p < gaussianPasses; p++) {
+                    cv.GaussianBlur(this.gray, this.gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+                }
+            }
+
+            // Median smooth: excellent at removing salt-and-pepper noise while
+            // keeping hard edges sharp.  Each pass uses a 3×3 kernel; multiple
+            // passes compound the noise-removal effect.
+            if (settings.useMedian) {
+                const medianPasses = Math.max(1, Math.min(3, settings.medianPasses || 1));
+                for (let p = 0; p < medianPasses; p++) {
+                    cv.medianBlur(this.gray, this.gray, 3);
+                }
+            }
         }
 
         // Light Gaussian blur on the grayscale image to suppress high-frequency
@@ -135,8 +164,11 @@ class WorkerProcessor {
         // etc.).  Only enabled in Custom/Experiment mode via the "Clean speckles"
         // checkbox because the cross erosion can destroy thin continuous Canny edges
         // that are essential for subject visibility in standard modes.
+        // Intensity controls the kernel size: 1 → 3×3, 2 → 5×5, 3 → 7×7.
         if (settings.cleanSpeckles) {
-            const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(3, 3));
+            const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
+            const openSize = 1 + speckleIntensity * 2;
+            const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(openSize, openSize));
             cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
             openKernel.delete();
         }
