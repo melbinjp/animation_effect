@@ -104,6 +104,24 @@ class WorkerProcessor {
         // noise that would otherwise generate spurious thin Canny edges.
         cv.GaussianBlur(this.gray, this.gray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
 
+        // Optional: CLAHE (Contrast Limited Adaptive Histogram Equalisation) lifts
+        // the local contrast in dark regions so that Canny can see edges that would
+        // otherwise be buried in shadow — bringing out subject detail that is lost
+        // when the clip is underexposed or back-lit.  The clip limit and tile grid
+        // size are held constant; the intensity slider controls only the edge-merge
+        // step below.
+        if (settings.smartCleanup) {
+            // clipLimit 2.5 is a well-tested mid-range value: it suppresses noise
+            // amplification (clip limit prevents the histogram redistribution from
+            // running away in flat regions) while still noticeably lifting contrast
+            // in dark areas.  The 8×8 tile grid matches the OpenCV default and gives
+            // good locality without creating visible tile boundaries at typical
+            // video resolutions.
+            const clahe = new cv.CLAHE(2.5, new cv.Size(8, 8));
+            clahe.apply(this.gray, this.gray);
+            clahe.delete();
+        }
+
         cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
 
         // Morphological closing bridges tiny gaps between nearby edge segments,
@@ -121,6 +139,29 @@ class WorkerProcessor {
             const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(3, 3));
             cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
             openKernel.delete();
+        }
+
+        // Optional: Smart line cleanup — merges closely-spaced parallel edges that
+        // arise when Canny detects both sides of a thick line (e.g. a clothing seam
+        // or facial feature), then thins the merged region back to a single pixel.
+        // This removes the "double-line" or closed-loop tube artefact that becomes
+        // visible in fast mode where Gaussian pre-smoothing creates soft gradients on
+        // both sides of thick features.  A larger close kernel is used so that the
+        // gap between the two parallel edges (which is proportional to the line
+        // thickness) can be bridged; a follow-up erosion then trims the merged blob
+        // back toward single-pixel width.  Intensity 1–5 controls the close kernel
+        // size (5×5 → 13×13), allowing the user to dial in just enough merging.
+        if (settings.smartCleanup) {
+            const intensity = Math.max(1, Math.min(5, settings.smartCleanupIntensity || 2));
+            // Kernel grows: intensity 1 → 5×5, 2 → 7×7, 3 → 9×9, 4 → 11×11, 5 → 13×13
+            const mergeSize = 3 + intensity * 2;
+            const mergeKernel = cv.Mat.ones(mergeSize, mergeSize, cv.CV_8U);
+            cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, mergeKernel);
+            mergeKernel.delete();
+            // One erosion pass to thin the merged blobs back toward single-pixel edges.
+            const thinKernel = cv.Mat.ones(3, 3, cv.CV_8U);
+            cv.erode(this.edges, this.edges, thinKernel);
+            thinKernel.delete();
         }
 
         if (settings.lineWeight > 1) {

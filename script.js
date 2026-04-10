@@ -382,7 +382,9 @@ function getSettings() {
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
         fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked,
-        cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked
+        cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked,
+        smartCleanup: presetKey === 'custom' && document.getElementById('customSmartCleanup').checked,
+        smartCleanupIntensity: Number(document.getElementById('customSmartCleanupIntensity').value)
     };
 }
 
@@ -1009,13 +1011,33 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles', 'customSmartCleanup', 'customSmartCleanupIntensity'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
     customBilateral: document.getElementById('customBilateralVal'),
-    customSigma: document.getElementById('customSigmaVal')
+    customSigma: document.getElementById('customSigmaVal'),
+    customSmartCleanupIntensity: document.getElementById('customSmartCleanupIntensityVal')
 };
+
+// When Fast render is on, the bilateral diameter/sigma sliders have no effect
+// (Gaussian blur is used instead).  Grey them out so the user knows.
+function syncFastModeSliders() {
+    const isFast = document.getElementById('customFastMode').checked;
+    ['customBilateral', 'customSigma'].forEach((id) => {
+        const row = document.getElementById(id).closest('.custom-slider-row');
+        if (row) {
+            row.classList.toggle('is-disabled', isFast);
+            document.getElementById(id).disabled = isFast;
+        }
+    });
+}
+
+// Show the intensity slider only when smart cleanup is enabled.
+function syncSmartCleanupRow() {
+    const enabled = document.getElementById('customSmartCleanup').checked;
+    document.getElementById('smartCleanupIntensityRow').hidden = !enabled;
+}
 
 customInputIds.forEach((id) => {
     document.getElementById(id).addEventListener('input', () => {
@@ -1030,6 +1052,9 @@ customInputIds.forEach((id) => {
         }
     });
     document.getElementById(id).addEventListener('change', async () => {
+        // Keep dependent UI states in sync whenever a custom control changes.
+        syncFastModeSliders();
+        syncSmartCleanupRow();
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
             return;
         }
