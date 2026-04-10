@@ -908,6 +908,8 @@ async function renderVideoExport() {
             await sem.acquire();
             throwIfCancelled();
 
+            // Subtract 1 ms from the video duration cap to avoid seeking past the
+            // last decodable frame, which some browsers report as a seek error.
             const frameTime = Math.min(video.duration - 0.001, fi / fps);
             await seekVideo(video, frameTime);
             const { width, height } = drawMediaToCanvas(video, elements.sourceCanvas, settings.scale, settings.customMode);
@@ -951,6 +953,9 @@ async function renderVideoExport() {
                     const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
                     await ffmpeg.writeFile(frameName, pngBytes);
 
+                    // JavaScript's single-threaded event loop guarantees that the
+                    // read-modify-write below is never interleaved with another
+                    // microtask, so no synchronisation primitive is required.
                     completedFrames++;
                     setProgress(
                         (completedFrames / totalFrames) * 92,
@@ -959,6 +964,8 @@ async function renderVideoExport() {
 
                     // Show the latest completed frame on the output canvas for visual
                     // feedback (forward-progress only so the canvas never jumps back).
+                    // The single-threaded event loop also makes the read-compare-assign
+                    // on latestShownFrame safe against out-of-order microtask reordering.
                     if (capturedFi > latestShownFrame) {
                         latestShownFrame = capturedFi;
                         elements.outputCanvas.width = capturedW;
