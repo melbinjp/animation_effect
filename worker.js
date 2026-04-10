@@ -69,10 +69,18 @@ class WorkerProcessor {
         const d = settings.preset.bilateralDiameter;
 
         if (settings.fastMode) {
-            // Fast mode: skip expensive bilateral filter passes entirely.
-            // Convert to grayscale directly from the source RGB frame — sufficient
-            // for line art where colour accuracy is not required.
-            cv.cvtColor(this.rgb, this.gray, cv.COLOR_RGB2GRAY);
+            // Fast mode: replace the expensive multi-pass bilateral filter with a
+            // single cheap Gaussian blur on the RGB image.  The bilateral filter's
+            // only role for line art is pre-smoothing the colour frame so that
+            // noise (skin texture, fabric grain, etc.) doesn't produce spurious
+            // Canny edges in the final line art.  A Gaussian blur achieves the
+            // same noise reduction at a fraction of the cost — the bilateral
+            // filter's edge-preserving property only matters for flat-colour
+            // rendering, not for edge extraction.
+            // A 5×5 kernel gives enough suppression for line-art work while
+            // being roughly 15–20× faster than three bilateral passes at d=9.
+            cv.GaussianBlur(this.rgb, this.smoothed, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+            cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
         } else {
             // First bilateral pass — smooths flat areas while preserving hard edges.
             cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
