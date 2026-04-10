@@ -41,6 +41,7 @@ canvas,
 video {
     width: 100%;
     display: block;
+    will-change: transform;
 }
 
 .page-shell {
