@@ -381,7 +381,8 @@ function getSettings() {
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
-        fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked
+        fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked,
+        cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked
     };
 }
 
@@ -1008,7 +1009,7 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
