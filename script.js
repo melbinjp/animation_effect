@@ -807,6 +807,12 @@ async function renderVideoExport() {
             '-map', '0:v:0',
             '-map', '1:a?',
             '-c:v', 'libx264',
+            // ultrafast preset encodes 4–5× faster than the default medium preset with
+            // no visible quality difference for pure black-and-white line art.
+            // animation tune tells x264 the content has large flat areas (which is true
+            // for line art), improving both compression ratio and encode speed.
+            '-preset', 'ultrafast',
+            '-tune', 'animation',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
             '-shortest'
