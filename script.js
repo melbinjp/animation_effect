@@ -126,78 +126,124 @@ const PRODUCTION_LIMITS = {
     hardFileSizeBytes: 250 * 1024 * 1024
 };
 
-// LineArtProcessor delegates all heavy OpenCV work to a dedicated Web Worker so
-// the main thread (and the UI) stays responsive during processing.  Pixel data
-// is transferred between threads as zero-copy ArrayBuffer Transferables.
+// Semaphore used to cap the number of concurrently in-flight frame renders
+// so that the worker pool and main-thread memory usage stay bounded.
+class Semaphore {
+    constructor(n) {
+        this._count = n;
+        this._queue = [];
+    }
+    acquire() {
+        if (this._count > 0) {
+            this._count--;
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => this._queue.push(resolve));
+    }
+    release() {
+        if (this._queue.length > 0) {
+            this._queue.shift()();
+        } else {
+            this._count++;
+        }
+    }
+}
+
+// LineArtProcessor manages a pool of Web Workers so that multiple video frames
+// can be processed in parallel, fully utilising all available CPU cores.
+// Pixel data is transferred as zero-copy ArrayBuffer Transferables.
 class LineArtProcessor {
     constructor() {
-        this._worker = new Worker('worker.js');
+        // Spawn between 1 and 4 workers, reserving one logical core for the
+        // main thread / UI / FFmpeg encoder.
+        const hw = navigator.hardwareConcurrency || 2;
+        this._concurrency = Math.max(1, Math.min(4, hw - 1));
+
         this._pending = new Map();
         this._idCounter = 0;
         this._initTimeout = null;
         this._loadingStartTime = Date.now();
+        this._readyCount = 0;
 
-        console.log('[Main] LineArtProcessor: Worker created, waiting for OpenCV to initialize...');
+        // Pool management: indices of currently idle workers.
+        this._freePool = [];
+        // Queue of resolve-fns waiting for a free worker index.
+        this._waitQueue = [];
 
-        // Set a timeout for OpenCV initialization (30 seconds)
+        console.log(`[Main] Spawning ${this._concurrency} worker(s) (${hw} logical cores detected)`);
+
+        this._workers = Array.from({ length: this._concurrency }, (_, i) =>
+            this._spawnWorker(i)
+        );
+
+        // Timeout in case no worker ever signals cv-ready.
         this._initTimeout = setTimeout(() => {
             if (!state.cvReady) {
-                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
-                console.error(`[Main] OpenCV initialization timeout after ${elapsedSeconds} seconds - worker did not signal ready`);
+                const elapsed = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                console.error(`[Main] OpenCV initialization timeout after ${elapsed}s`);
                 setAdvisory('Processing engine failed to load. Please check your internet connection and reload the page.', 'error');
                 elements.dropZone.classList.remove('is-loading');
             }
         }, 30000);
+    }
 
-        this._worker.onmessage = (event) => {
+    get concurrency() { return this._concurrency; }
+
+    _spawnWorker(index) {
+        const worker = new Worker('worker.js');
+
+        worker.onmessage = (event) => {
             const msg = event && event.data;
             if (!msg) return;
+
             if (msg.type === 'cv-ready') {
-                const elapsedSeconds = Math.round((Date.now() - this._loadingStartTime) / 1000);
-                console.log(`[Main] Received cv-ready message from worker after ${elapsedSeconds} seconds`);
-                if (this._initTimeout) {
-                    clearTimeout(this._initTimeout);
-                    this._initTimeout = null;
+                this._readyCount++;
+                if (this._readyCount === 1) {
+                    // First worker ready → enable the UI.
+                    const elapsed = Math.round((Date.now() - this._loadingStartTime) / 1000);
+                    console.log(`[Main] Worker 0 ready after ${elapsed}s`);
+                    if (this._initTimeout) {
+                        clearTimeout(this._initTimeout);
+                        this._initTimeout = null;
+                    }
+                    state.cvReady = true;
+                    refreshActions();
                 }
-                state.cvReady = true;
-                refreshActions();
+                console.log(`[Main] Worker ${index} ready (${this._readyCount}/${this._concurrency})`);
+                this._releaseWorker(index);
                 return;
             }
 
             if (msg.type === 'cv-error') {
-                console.error('[Main] Received cv-error from worker:', msg.message);
+                console.error(`[Main] Worker ${index} cv-error:`, msg.message);
                 if (this._initTimeout) {
                     clearTimeout(this._initTimeout);
                     this._initTimeout = null;
                 }
-                setAdvisory('Failed to load processing engine: ' + msg.message, 'error');
-                elements.dropZone.classList.remove('is-loading');
+                if (this._readyCount === 0) {
+                    setAdvisory('Failed to load processing engine: ' + msg.message, 'error');
+                    elements.dropZone.classList.remove('is-loading');
+                }
                 return;
             }
 
             if (msg.id !== undefined) {
                 const entry = this._pending.get(msg.id);
                 this._pending.delete(msg.id);
-                if (!entry) {
-                    return;
-                }
-
+                // Free the worker before resolving so the pool can immediately
+                // accept the next queued task.
+                this._releaseWorker(index);
+                if (!entry) return;
                 if (msg.type === 'result') {
-                    const { resolve, destinationCanvas, width, height } = entry;
-                    destinationCanvas.width = width;
-                    destinationCanvas.height = height;
-                    const ctx = destinationCanvas.getContext('2d');
-                    const clampedArray = new Uint8ClampedArray(msg.data);
-                    ctx.putImageData(new ImageData(clampedArray, width, height), 0, 0);
-                    resolve();
+                    entry.resolve(msg.data);
                 } else if (msg.type === 'error') {
                     entry.reject(new Error(msg.message));
                 }
             }
         };
 
-        this._worker.onerror = (error) => {
-            console.error('[Main] OpenCV worker error:', error);
+        worker.onerror = (error) => {
+            console.error(`[Main] Worker ${index} error:`, error);
             if (this._initTimeout) {
                 clearTimeout(this._initTimeout);
                 this._initTimeout = null;
@@ -207,8 +253,28 @@ class LineArtProcessor {
             }
             this._pending.clear();
             setAdvisory('Processing worker error. Please reload the page.', 'error');
-            elements.dropZone.classList.remove('is-loading');
         };
+
+        return worker;
+    }
+
+    // Add a worker back to the idle pool (or hand it straight to a waiter).
+    _releaseWorker(index) {
+        // Guard against double-release (e.g. racing reset + normal completion).
+        if (this._freePool.includes(index)) return;
+        if (this._waitQueue.length > 0) {
+            this._waitQueue.shift()(index);
+        } else {
+            this._freePool.push(index);
+        }
+    }
+
+    // Return a Promise that resolves to a free worker index.
+    _acquireWorker() {
+        if (this._freePool.length > 0) {
+            return Promise.resolve(this._freePool.shift());
+        }
+        return new Promise((resolve) => this._waitQueue.push(resolve));
     }
 
     reset() {
@@ -216,25 +282,51 @@ class LineArtProcessor {
             reject(new Error('Render cancelled.'));
         }
         this._pending.clear();
-        this._worker.postMessage({ type: 'reset' });
+        // Unblock any tasks that are waiting for a free worker.
+        const waiting = this._waitQueue.splice(0);
+        waiting.forEach((resolve) => resolve(-1));
+        this._workers.forEach((w) => w.postMessage({ type: 'reset' }));
+        // Busy workers will call _releaseWorker when their in-progress frame
+        // completes; idle workers are already in _freePool.
     }
 
-    // Returns a Promise that resolves once the output canvas has been updated.
-    render(sourceCanvas, destinationCanvas, settings) {
+    // Returns Promise<Uint8ClampedArray> — the raw RGBA output without writing
+    // to any canvas.  Pixels are extracted from sourceCanvas synchronously
+    // (before the first await), so the caller may safely overwrite sourceCanvas
+    // on the very next iteration of an async loop.
+    async renderToData(sourceCanvas, settings) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
-        const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true });
-        const imageData = sourceContext.getImageData(0, 0, width, height);
+        const imageData = sourceCanvas
+            .getContext('2d', { willReadFrequently: true })
+            .getImageData(0, 0, width, height); // synchronous pixel copy
+
         const id = this._idCounter++;
+        const workerIndex = await this._acquireWorker();
+        if (workerIndex === -1) {
+            throw new Error('Render cancelled.');
+        }
 
         return new Promise((resolve, reject) => {
-            this._pending.set(id, { resolve, reject, destinationCanvas, width, height });
-            // Transfer the pixel buffer (zero-copy) to the worker.
-            this._worker.postMessage(
+            this._pending.set(id, { resolve, reject });
+            // Transfer the pixel buffer zero-copy to the chosen worker.
+            this._workers[workerIndex].postMessage(
                 { type: 'process', id, rgbaData: imageData.data, width, height, settings },
                 [imageData.data.buffer]
             );
         });
+    }
+
+    // Convenience wrapper: render to a visible canvas (used for single-frame preview).
+    async render(sourceCanvas, destinationCanvas, settings) {
+        const width = sourceCanvas.width;
+        const height = sourceCanvas.height;
+        const rawData = await this.renderToData(sourceCanvas, settings);
+        destinationCanvas.width = width;
+        destinationCanvas.height = height;
+        destinationCanvas.getContext('2d').putImageData(
+            new ImageData(rawData, width, height), 0, 0
+        );
     }
 }
 
@@ -600,9 +692,12 @@ async function cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPat
         return;
     }
 
-    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
-        await safeDeleteFile(ffmpeg, `${jobId}/frame-${String(frameIndex).padStart(5, '0')}.png`);
-    }
+    // Delete all frame files in parallel — they are independent and the
+    // in-memory FFmpeg FS handles concurrent deletes safely.
+    const frameDeletions = Array.from({ length: totalFrames }, (_, i) =>
+        safeDeleteFile(ffmpeg, `${jobId}/frame-${String(i).padStart(5, '0')}.png`)
+    );
+    await Promise.all(frameDeletions);
 
     await safeDeleteFile(ffmpeg, inputPath);
     await safeDeleteFile(ffmpeg, outputPath);
@@ -790,21 +885,109 @@ async function renderVideoExport() {
         }
         totalFrames = Math.max(1, Math.floor(video.duration * fps));
 
-        for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
-            throwIfCancelled();
-            const frameTime = Math.min(video.duration, frameIndex / fps);
-            await seekVideo(video, frameTime);
-            drawMediaToCanvas(video, elements.sourceCanvas, settings.scale, settings.customMode);
-            await processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
+        // ---- Parallel frame pipeline ------------------------------------------------
+        // Video seeking must stay sequential (single HTMLVideoElement), but once pixel
+        // data has been extracted from the canvas (getImageData — a synchronous copy
+        // inside renderToData) each frame's OpenCV processing and PNG encoding can run
+        // in parallel across the whole worker pool.
+        //
+        // A Semaphore limits the number of frames concurrently in-flight to the size
+        // of the worker pool, bounding peak memory use regardless of clip length.
+        // Completed frames are written to FFmpeg FS immediately and in any order;
+        // FFmpeg later assembles them in the correct order via the filename pattern.
+        // -------------------------------------------------------------------------------
+        const sem = new Semaphore(processor.concurrency);
+        let completedFrames = 0;
+        let latestShownFrame = -1;
+        const framePromises = [];
 
-            const frameBlob = await canvasToBlob(elements.outputCanvas, 'image/png');
-            const frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
-            const frameName = `${jobId}/frame-${String(frameIndex).padStart(5, '0')}.png`;
-            await ffmpeg.writeFile(frameName, frameBytes);
-            const framePercent = ((frameIndex + 1) / totalFrames) * 92;
-            setProgress(framePercent, `Rendering frame ${frameIndex + 1} of ${totalFrames}...`);
-            console.log(`Rendering frame ${frameIndex + 1} of ${totalFrames}...`, 'info');
+        for (let fi = 0; fi < totalFrames; fi++) {
+            throwIfCancelled();
+
+            // Throttle: block here until a parallel slot is available.
+            await sem.acquire();
+            throwIfCancelled();
+
+            // Subtract 1 ms from the video duration cap to avoid seeking past the
+            // last decodable frame, which some browsers report as a seek error.
+            const frameTime = Math.min(video.duration - 0.001, fi / fps);
+            await seekVideo(video, frameTime);
+            const { width, height } = drawMediaToCanvas(video, elements.sourceCanvas, settings.scale, settings.customMode);
+
+            // Capture loop variables for the async closure below.
+            const capturedFi = fi;
+            const capturedW = width;
+            const capturedH = height;
+
+            // renderToData copies pixels from the canvas synchronously (before its
+            // first internal await), so the next loop iteration may safely overwrite
+            // the source canvas immediately after this call returns.
+            const p = processor.renderToData(elements.sourceCanvas, settings)
+                .then(async (rawData) => {
+                    throwIfCancelled();
+
+                    // Encode to PNG.  Use OffscreenCanvas when available so the
+                    // browser can leverage GPU-accelerated rasterisation off the
+                    // main thread; fall back to a regular canvas otherwise.
+                    let pngBytes;
+                    if (typeof OffscreenCanvas !== 'undefined') {
+                        const oc = new OffscreenCanvas(capturedW, capturedH);
+                        oc.getContext('2d').putImageData(
+                            new ImageData(rawData, capturedW, capturedH), 0, 0
+                        );
+                        pngBytes = new Uint8Array(
+                            await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
+                        );
+                    } else {
+                        const tmpCanvas = document.createElement('canvas');
+                        tmpCanvas.width = capturedW;
+                        tmpCanvas.height = capturedH;
+                        tmpCanvas.getContext('2d').putImageData(
+                            new ImageData(rawData, capturedW, capturedH), 0, 0
+                        );
+                        pngBytes = new Uint8Array(
+                            await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
+                        );
+                    }
+
+                    const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
+                    await ffmpeg.writeFile(frameName, pngBytes);
+
+                    // JavaScript's single-threaded event loop guarantees that the
+                    // read-modify-write below is never interleaved with another
+                    // microtask, so no synchronisation primitive is required.
+                    completedFrames++;
+                    setProgress(
+                        (completedFrames / totalFrames) * 92,
+                        `Rendered frame ${completedFrames} of ${totalFrames}...`
+                    );
+
+                    // Show the latest completed frame on the output canvas for visual
+                    // feedback (forward-progress only so the canvas never jumps back).
+                    // The single-threaded event loop also makes the read-compare-assign
+                    // on latestShownFrame safe against out-of-order microtask reordering.
+                    if (capturedFi > latestShownFrame) {
+                        latestShownFrame = capturedFi;
+                        elements.outputCanvas.width = capturedW;
+                        elements.outputCanvas.height = capturedH;
+                        elements.outputCanvas.getContext('2d').putImageData(
+                            new ImageData(rawData, capturedW, capturedH), 0, 0
+                        );
+                    }
+                })
+                .finally(() => sem.release());
+
+            framePromises.push(p);
         }
+
+        // Wait for every frame to settle (allSettled avoids leaving dangling
+        // promises after a cancellation or partial failure).
+        const results = await Promise.allSettled(framePromises);
+        const firstFailure = results.find((r) => r.status === 'rejected');
+        if (firstFailure) {
+            throw firstFailure.reason;
+        }
+        // ---- End parallel frame pipeline -------------------------------------------
 
         throwIfCancelled();
         setProgress(92, 'Encoding final MP4 in the browser...');
@@ -825,20 +1008,9 @@ async function renderVideoExport() {
             '-tune', 'animation',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
-            '-shortest'
+            '-shortest',
+            outputPath
         ];
-
-        if (settings.isOriginalFps) {
-            // If using original FPS, we can just let ffmpeg use the source frame rate for the video
-            // by not specifying -framerate for the input or mapping it differently. But since we extract frames based on time,
-            // we have to reconstruct. However, FFmpeg can just read the original file and apply an OpenCV filter natively,
-            // but since we render in browser canvas, we must specify framerate. We fallback to 30.
-            // A truly native way to match FPS is to use the original video stream's framerate.
-            // `-framerate` applies to the image sequence. We'll use our computed fps proxy.
-            // We can also copy the timebase and fps from the original if we processed it frame by frame using ffmpeg native extract,
-            // but for canvas readback, the above is sufficient.
-        }
-        encodeArgs.push(outputPath);
 
         await ffmpeg.exec(encodeArgs);
 
