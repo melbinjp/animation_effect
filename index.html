@@ -108,6 +108,26 @@
                             Clean speckles <span class="toggle-hint">(remove isolated edge dots — may reduce thin subject lines)</span>
                         </label>
                     </div>
+                    <div class="custom-toggle-row">
+                        <label for="customDarkBoost" class="toggle-label">
+                            <input type="checkbox" id="customDarkBoost">
+                            Boost dark areas <span class="toggle-hint">(CLAHE contrast lift in shadows — recovers edges lost in underexposed regions)</span>
+                        </label>
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="customMergeDoubleEdge" class="toggle-label">
+                            <input type="checkbox" id="customMergeDoubleEdge">
+                            Merge double-edges <span class="toggle-hint">(collapse twin parallel lines from thick features — cleaner anime outlines)</span>
+                        </label>
+                    </div>
+                    <div class="custom-slider-row" id="mergeDoubleEdgeIntensityRow" hidden>
+                        <label for="customMergeDoubleEdgeIntensity">Merge intensity <span id="customMergeDoubleEdgeIntensityVal">2</span></label>
+                        <input type="range" id="customMergeDoubleEdgeIntensity" min="1" max="5" value="2">
+                        <div class="range-scale">
+                            <span>Subtle</span>
+                            <span>Strong</span>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="control-group">

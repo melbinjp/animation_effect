@@ -546,6 +546,13 @@ video {
     background: transparent;
 }
 
+/* Grey out slider rows whose controls have no effect in the current mode
+   (e.g. bilateral sliders when Fast render is active). */
+.custom-slider-row.is-disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
 /* Institutional Footer - Jules Standard */
 .hub-footer {
     position: fixed;
