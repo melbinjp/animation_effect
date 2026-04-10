@@ -72,10 +72,12 @@
                         <div class="custom-color-item">
                             <label for="customBg">Background</label>
                             <input type="color" id="customBg" value="#ffffff">
+                            <input type="text" id="customBgHex" class="hex-input" value="#ffffff" maxlength="25" placeholder="#rrggbb or rgb(…)" aria-label="Background colour — hex or rgb">
                         </div>
                         <div class="custom-color-item">
                             <label for="customInk">Ink</label>
                             <input type="color" id="customInk" value="#000000">
+                            <input type="text" id="customInkHex" class="hex-input" value="#000000" maxlength="25" placeholder="#rrggbb or rgb(…)" aria-label="Ink colour — hex or rgb">
                         </div>
                     </div>
                     <div class="custom-slider-row">
@@ -93,6 +95,12 @@
                     <div class="custom-slider-row">
                         <label for="customSigma">Sigma <span id="customSigmaVal">72</span></label>
                         <input type="range" id="customSigma" min="10" max="200" value="72">
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="customFastMode" class="toggle-label">
+                            <input type="checkbox" id="customFastMode">
+                            Fast render <span class="toggle-hint">(Gaussian pre-smooth instead of bilateral — faster, same edge quality)</span>
+                        </label>
                     </div>
                 </div>
 
