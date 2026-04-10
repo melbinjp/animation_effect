@@ -112,16 +112,16 @@ class WorkerProcessor {
         cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
         closeKernel.delete();
 
-        // Morphological opening with a cross-shaped kernel removes isolated edge
-        // fragments (single pixels and tiny disconnected specks from skin pores,
-        // fabric weave, background grain, etc.) while leaving all connected subject
-        // contours completely intact.  A cross kernel only erodes pixels that have
-        // no cardinal-direction neighbour on the edge map, so continuous strokes
-        // — which always have at least one connected neighbour — survive unharmed.
-        // The net effect is cleaner, cartoonier outlines with less internal texture noise.
-        const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(3, 3));
-        cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
-        openKernel.delete();
+        // Optional: morphological opening with a cross-shaped kernel removes isolated
+        // edge fragments (single pixels, tiny specks from skin pores, fabric grain,
+        // etc.).  Only enabled in Custom/Experiment mode via the "Clean speckles"
+        // checkbox because the cross erosion can destroy thin continuous Canny edges
+        // that are essential for subject visibility in standard modes.
+        if (settings.cleanSpeckles) {
+            const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(3, 3));
+            cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
+            openKernel.delete();
+        }
 
         if (settings.lineWeight > 1) {
             const kernel = cv.Mat.ones(settings.lineWeight, settings.lineWeight, cv.CV_8U);
