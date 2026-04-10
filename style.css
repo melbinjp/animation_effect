@@ -484,6 +484,50 @@ video {
     cursor: pointer;
 }
 
+.hex-input {
+    display: block;
+    width: 100%;
+    margin-top: 6px;
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-strong);
+    color: var(--ink);
+    font-size: 0.82rem;
+    font-family: "Segoe UI Mono", "Consolas", monospace;
+    letter-spacing: 0.04em;
+}
+
+.hex-input:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.custom-toggle-row {
+    margin-top: 14px;
+}
+
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.toggle-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.toggle-hint {
+    font-weight: 400;
+    color: var(--ink-soft);
+    font-size: 0.82rem;
+}
+
 .custom-slider-row {
     margin-bottom: 12px;
 }

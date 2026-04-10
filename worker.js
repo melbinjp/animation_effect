@@ -68,22 +68,29 @@ class WorkerProcessor {
         const sigma = Math.max(20, Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
         const d = settings.preset.bilateralDiameter;
 
-        // First bilateral pass — smooths flat areas while preserving hard edges.
-        cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
+        if (settings.fastMode) {
+            // Fast mode: skip expensive bilateral filter passes entirely.
+            // Convert to grayscale directly from the source RGB frame — sufficient
+            // for line art where colour accuracy is not required.
+            cv.cvtColor(this.rgb, this.gray, cv.COLOR_RGB2GRAY);
+        } else {
+            // First bilateral pass — smooths flat areas while preserving hard edges.
+            cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
 
-        // Second bilateral pass with a reduced sigma — refines smoothing without
-        // over-blurring, giving cartoonier flat regions and cleaner edge boundaries.
-        if (settings.preset.smoothPasses >= 2) {
-            // Keep refineSigma >= 15 to avoid destroying the edge-preserving
-            // property of the bilateral filter at very low sigma values.
-            const refineSigma = Math.max(15, Math.round(sigma * 0.5));
-            // Ping-pong between this.smoothed and this.rgb so each call writes
-            // to a different buffer — bilateral filter requires src ≠ dst.
-            cv.bilateralFilter(this.smoothed, this.rgb, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
-            cv.bilateralFilter(this.rgb, this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+            // Second bilateral pass with a reduced sigma — refines smoothing without
+            // over-blurring, giving cartoonier flat regions and cleaner edge boundaries.
+            if (settings.preset.smoothPasses >= 2) {
+                // Keep refineSigma >= 15 to avoid destroying the edge-preserving
+                // property of the bilateral filter at very low sigma values.
+                const refineSigma = Math.max(15, Math.round(sigma * 0.5));
+                // Ping-pong between this.smoothed and this.rgb so each call writes
+                // to a different buffer — bilateral filter requires src ≠ dst.
+                cv.bilateralFilter(this.smoothed, this.rgb, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+                cv.bilateralFilter(this.rgb, this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
+            }
+
+            cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
         }
-
-        cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
 
         // Light Gaussian blur on the grayscale image to suppress high-frequency
         // noise that would otherwise generate spurious thin Canny edges.

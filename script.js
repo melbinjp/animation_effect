@@ -379,14 +379,16 @@ function getSettings() {
         lineWeight: Number(elements.lineWeight.value),
         scale: Number(elements.scale.value),
         videoFps: fps,
-        isOriginalFps: elements.videoFps.value === 'original'
+        isOriginalFps: elements.videoFps.value === 'original',
+        customMode: presetKey === 'custom',
+        fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked
     };
 }
 
-function computeScaledSize(width, height, scale) {
+function computeScaledSize(width, height, scale, noCap = false) {
     const largestSide = Math.max(width, height);
     const dimensionCap = 1600;
-    const capRatio = largestSide > dimensionCap ? dimensionCap / largestSide : 1;
+    const capRatio = (!noCap && largestSide > dimensionCap) ? dimensionCap / largestSide : 1;
     const ratio = Math.min(1, scale * capRatio);
 
     return {
@@ -415,7 +417,7 @@ function summarizeWorkload() {
     const settings = getSettings();
 
     if (state.fileKind === 'image' && state.sourceImage) {
-        const size = computeScaledSize(state.sourceImage.naturalWidth, state.sourceImage.naturalHeight, settings.scale);
+        const size = computeScaledSize(state.sourceImage.naturalWidth, state.sourceImage.naturalHeight, settings.scale, settings.customMode);
         const megaPixels = (size.width * size.height) / 1000000;
         const tone = megaPixels > PRODUCTION_LIMITS.recommendedImageMegaPixels ? 'warn' : 'success';
         const guidance = megaPixels > PRODUCTION_LIMITS.recommendedImageMegaPixels
@@ -429,7 +431,7 @@ function summarizeWorkload() {
     }
 
     if (state.fileKind === 'video' && state.sourceVideo) {
-        const size = computeScaledSize(state.sourceVideo.videoWidth, state.sourceVideo.videoHeight, settings.scale);
+        const size = computeScaledSize(state.sourceVideo.videoWidth, state.sourceVideo.videoHeight, settings.scale, settings.customMode);
         const totalFrames = Math.max(1, Math.floor(state.sourceVideo.duration * settings.videoFps));
         const frameMegaPixels = (size.width * size.height) / 1000000;
         let tone = 'success';
@@ -464,8 +466,9 @@ function summarizeWorkload() {
 }
 
 function assertWithinOperationalLimits(file) {
-    if (file.size > PRODUCTION_LIMITS.hardFileSizeBytes) {
-        throw new Error('File is too large for reliable browser-side processing. Keep uploads under 250 MB.');
+    const isCustomMode = elements.preset.value === 'custom';
+    if (!isCustomMode && file.size > PRODUCTION_LIMITS.hardFileSizeBytes) {
+        throw new Error('File is too large for reliable browser-side processing. Keep uploads under 250 MB. Switch to the "Custom / Experiment" preset to bypass this limit.');
     }
 }
 
@@ -484,10 +487,10 @@ function drawEmptyCanvas(canvas, label) {
     context.fillText(label, width / 2, height / 2);
 }
 
-function drawMediaToCanvas(media, canvas, scale) {
+function drawMediaToCanvas(media, canvas, scale, noCap = false) {
     const naturalWidth = media.videoWidth || media.naturalWidth || media.width;
     const naturalHeight = media.videoHeight || media.naturalHeight || media.height;
-    const size = computeScaledSize(naturalWidth, naturalHeight, scale);
+    const size = computeScaledSize(naturalWidth, naturalHeight, scale, noCap);
     const context = canvas.getContext('2d');
 
     canvas.width = size.width;
@@ -693,14 +696,14 @@ async function drawCurrentSource() {
     const settings = getSettings();
 
     if (state.fileKind === 'image' && state.sourceImage) {
-        drawMediaToCanvas(state.sourceImage, elements.sourceCanvas, settings.scale);
+        drawMediaToCanvas(state.sourceImage, elements.sourceCanvas, settings.scale, settings.customMode);
         return;
     }
 
     if (state.fileKind === 'video' && state.sourceVideo) {
         const previewTime = Math.min(Math.max(state.sourceVideo.duration * 0.2, 0), Math.max(0, state.sourceVideo.duration - 0.05));
         await seekVideo(state.sourceVideo, previewTime);
-        drawMediaToCanvas(state.sourceVideo, elements.sourceCanvas, settings.scale);
+        drawMediaToCanvas(state.sourceVideo, elements.sourceCanvas, settings.scale, settings.customMode);
     }
 }
 
@@ -781,7 +784,7 @@ async function renderVideoExport() {
             throwIfCancelled();
             const frameTime = Math.min(video.duration, frameIndex / fps);
             await seekVideo(video, frameTime);
-            drawMediaToCanvas(video, elements.sourceCanvas, settings.scale);
+            drawMediaToCanvas(video, elements.sourceCanvas, settings.scale, settings.customMode);
             await processor.render(elements.sourceCanvas, elements.outputCanvas, settings);
 
             const frameBlob = await canvasToBlob(elements.outputCanvas, 'image/png');
@@ -999,7 +1002,7 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
@@ -1012,6 +1015,12 @@ customInputIds.forEach((id) => {
         if (customValueSpans[id]) {
             customValueSpans[id].textContent = document.getElementById(id).value;
         }
+        // Keep hex text inputs in sync when the color picker wheel moves
+        if (id === 'customBg') {
+            document.getElementById('customBgHex').value = document.getElementById('customBg').value;
+        } else if (id === 'customInk') {
+            document.getElementById('customInkHex').value = document.getElementById('customInk').value;
+        }
     });
     document.getElementById(id).addEventListener('change', async () => {
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
@@ -1020,6 +1029,56 @@ customInputIds.forEach((id) => {
         await onPreviewClick();
     });
 });
+
+// Parse a user-supplied colour string (hex or rgb) into a valid #rrggbb hex value.
+// Returns null when the input cannot be interpreted.
+function parseColorInput(raw) {
+    const s = raw.trim();
+    // Already a valid 6- or 3-digit hex
+    if (/^#?[0-9a-fA-F]{6}$/.test(s)) {
+        return s.startsWith('#') ? s : `#${s}`;
+    }
+    if (/^#?[0-9a-fA-F]{3}$/.test(s)) {
+        const hex = s.replace('#', '');
+        return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
+    }
+    // rgb(r, g, b) or rgb(r g b)
+    const rgbMatch = s.match(/^rgb\s*\(\s*(\d{1,3})\s*(?:,\s*|\s+)(\d{1,3})\s*(?:,\s*|\s+)(\d{1,3})\s*\)$/i);
+    if (rgbMatch) {
+        const toHex = (n) => Math.min(255, Math.max(0, Number(n))).toString(16).padStart(2, '0');
+        return `#${toHex(rgbMatch[1])}${toHex(rgbMatch[2])}${toHex(rgbMatch[3])}`;
+    }
+    return null;
+}
+
+function attachHexInput(hexInputId, colorPickerId) {
+    const hexEl = document.getElementById(hexInputId);
+    const colorEl = document.getElementById(colorPickerId);
+
+    function applyHex() {
+        const parsed = parseColorInput(hexEl.value);
+        if (!parsed) {
+            hexEl.value = colorEl.value;
+            return;
+        }
+        hexEl.value = parsed;
+        colorEl.value = parsed;
+        if (elements.preset.value === 'custom' && state.selectedFile && !state.processing) {
+            onPreviewClick();
+        }
+    }
+
+    hexEl.addEventListener('blur', applyHex);
+    hexEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            applyHex();
+        }
+    });
+}
+
+attachHexInput('customBgHex', 'customBg');
+attachHexInput('customInkHex', 'customInk');
 
 attachDropZone();
 resetWorkspace();
