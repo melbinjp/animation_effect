@@ -383,8 +383,9 @@ function getSettings() {
         customMode: presetKey === 'custom',
         fastMode: presetKey === 'custom' && document.getElementById('customFastMode').checked,
         cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked,
-        smartCleanup: presetKey === 'custom' && document.getElementById('customSmartCleanup').checked,
-        smartCleanupIntensity: Number(document.getElementById('customSmartCleanupIntensity').value)
+        darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
+        mergeDoubleEdge: presetKey === 'custom' && document.getElementById('customMergeDoubleEdge').checked,
+        mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value)
     };
 }
 
@@ -1011,13 +1012,13 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles', 'customSmartCleanup', 'customSmartCleanupIntensity'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customFastMode', 'customCleanSpeckles', 'customDarkBoost', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
     customBilateral: document.getElementById('customBilateralVal'),
     customSigma: document.getElementById('customSigmaVal'),
-    customSmartCleanupIntensity: document.getElementById('customSmartCleanupIntensityVal')
+    customMergeDoubleEdgeIntensity: document.getElementById('customMergeDoubleEdgeIntensityVal')
 };
 
 // When Fast render is on, the bilateral diameter/sigma sliders have no effect
@@ -1033,10 +1034,10 @@ function syncFastModeSliders() {
     });
 }
 
-// Show the intensity slider only when smart cleanup is enabled.
-function syncSmartCleanupRow() {
-    const enabled = document.getElementById('customSmartCleanup').checked;
-    document.getElementById('smartCleanupIntensityRow').hidden = !enabled;
+// Show the intensity slider only when merge double-edges is enabled.
+function syncMergeDoubleEdgeRow() {
+    const enabled = document.getElementById('customMergeDoubleEdge').checked;
+    document.getElementById('mergeDoubleEdgeIntensityRow').hidden = !enabled;
 }
 
 customInputIds.forEach((id) => {
@@ -1052,9 +1053,9 @@ customInputIds.forEach((id) => {
         }
     });
     document.getElementById(id).addEventListener('change', async () => {
-        // Keep dependent UI states in sync whenever a custom control changes.
-        syncFastModeSliders();
-        syncSmartCleanupRow();
+        // Keep dependent UI states in sync for controls that have visual side-effects.
+        if (id === 'customFastMode') { syncFastModeSliders(); }
+        if (id === 'customMergeDoubleEdge') { syncMergeDoubleEdgeRow(); }
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
             return;
         }

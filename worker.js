@@ -110,7 +110,7 @@ class WorkerProcessor {
         // when the clip is underexposed or back-lit.  The clip limit and tile grid
         // size are held constant; the intensity slider controls only the edge-merge
         // step below.
-        if (settings.smartCleanup) {
+        if (settings.darkBoost) {
             // clipLimit 2.5 is a well-tested mid-range value: it suppresses noise
             // amplification (clip limit prevents the histogram redistribution from
             // running away in flat regions) while still noticeably lifting contrast
@@ -141,18 +141,18 @@ class WorkerProcessor {
             openKernel.delete();
         }
 
-        // Optional: Smart line cleanup — merges closely-spaced parallel edges that
-        // arise when Canny detects both sides of a thick line (e.g. a clothing seam
-        // or facial feature), then thins the merged region back to a single pixel.
-        // This removes the "double-line" or closed-loop tube artefact that becomes
-        // visible in fast mode where Gaussian pre-smoothing creates soft gradients on
-        // both sides of thick features.  A larger close kernel is used so that the
-        // gap between the two parallel edges (which is proportional to the line
-        // thickness) can be bridged; a follow-up erosion then trims the merged blob
-        // back toward single-pixel width.  Intensity 1–5 controls the close kernel
-        // size (5×5 → 13×13), allowing the user to dial in just enough merging.
-        if (settings.smartCleanup) {
-            const intensity = Math.max(1, Math.min(5, settings.smartCleanupIntensity || 2));
+        // Optional: Merge double-edges — bridges the closely-spaced parallel edges
+        // that arise when Canny detects both sides of a thick line (e.g. a clothing
+        // seam or facial feature), then thins the merged region back to a single pixel.
+        // This removes the "double-line" or closed-loop tube artefact that is
+        // especially visible in fast mode where Gaussian pre-smoothing creates soft
+        // gradients on both sides of thick features.  A larger close kernel bridges
+        // the gap between the two parallel edges; a follow-up erosion trims the merged
+        // blob back toward single-pixel width.
+        // Intensity 1–5 controls the close kernel size (5×5 → 13×13).
+        if (settings.mergeDoubleEdge) {
+            const DEFAULT_MERGE_INTENSITY = 2;
+            const intensity = Math.max(1, Math.min(5, settings.mergeDoubleEdgeIntensity || DEFAULT_MERGE_INTENSITY));
             // Kernel grows: intensity 1 → 5×5, 2 → 7×7, 3 → 9×9, 4 → 11×11, 5 → 13×13
             const mergeSize = 3 + intensity * 2;
             const mergeKernel = cv.Mat.ones(mergeSize, mergeSize, cv.CV_8U);
