@@ -218,7 +218,10 @@
 
                 <div class="control-group" id="workerThreadsGroup">
                     <label for="workerThreads">Worker threads <span id="workerThreadsVal">…</span></label>
-                    <input type="range" id="workerThreads" min="1" max="16" value="1">
+                    <div class="worker-threads-row">
+                        <input type="range" id="workerThreads" min="1" max="16" value="1">
+                        <input type="number" id="workerThreadsManual" class="worker-threads-manual" min="1" max="64" value="1" aria-label="Worker threads — manual entry">
+                    </div>
                     <div class="range-scale">
                         <span>1</span>
                         <span id="workerThreadsMax">16</span>
@@ -245,6 +248,7 @@
                 <div class="action-row">
                     <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
                     <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="pauseBtn" type="button" class="secondary-button" hidden disabled>Pause</button>
                     <button id="cancelBtn" type="button" class="secondary-button" hidden disabled>Cancel render</button>
                     <button id="resetBtn" type="button" class="ghost-button">Reset</button>
                 </div>

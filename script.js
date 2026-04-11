@@ -1,6 +1,7 @@
 const elements = {
     fileInput: document.getElementById('fileInput'),
     cancelBtn: document.getElementById('cancelBtn'),
+    pauseBtn: document.getElementById('pauseBtn'),
     advisoryCard: document.getElementById('advisoryCard'),
     advisoryText: document.getElementById('advisoryText'),
     progressCard: document.getElementById('progressCard'),
@@ -26,6 +27,7 @@ const elements = {
     fileMeta: document.getElementById('fileMeta'),
     dropZone: document.getElementById('dropZone'),
     workerThreadsInput: document.getElementById('workerThreads'),
+    workerThreadsManual: document.getElementById('workerThreadsManual'),
     workerThreadsVal: document.getElementById('workerThreadsVal'),
     workerThreadsMax: document.getElementById('workerThreadsMax'),
     workerThreadsHint: document.getElementById('workerThreadsHint')
@@ -116,6 +118,7 @@ const state = {
     outputUrl: '',
     processing: false,
     cancelRequested: false,
+    pauseRequested: false,
     activeJobId: '',
     beforeUnloadAttached: false
 };
@@ -228,7 +231,10 @@ class LineArtProcessor {
     get concurrency() { return this._concurrency; }
 
     _spawnWorker(index) {
-        const worker = new Worker('worker.js');
+        // gpu-worker.js tries WebGPU first and transparently falls back to the
+        // OpenCV CPU pipeline when WebGPU is unavailable, so no branch is needed
+        // here.  Replace with 'worker.js' to force CPU-only processing.
+        const worker = new Worker('gpu-worker.js');
 
         worker.onmessage = (event) => {
             const msg = event && event.data;
@@ -362,7 +368,12 @@ class LineArtProcessor {
             throw new Error('Render cancelled.');
         }
 
-        return new Promise((resolve, reject) => {
+        // `await` the inner promise so V8 attaches a rejection handler to it
+        // before any microtask checkpoint.  Without `await`, returning a bare
+        // Promise from an async function can trigger spurious "Unhandled
+        // promise rejection" reports in Chrome/V8 when reset() rejects the
+        // entry while the microtask queue is being drained.
+        return await new Promise((resolve, reject) => {
             this._pending.set(id, { resolve, reject });
             // Transfer the pixel buffer zero-copy to the chosen worker.
             this._workers[workerIndex].postMessage(
@@ -388,10 +399,17 @@ class LineArtProcessor {
 const workerConfig = computeOptimalWorkers();
 let processor = new LineArtProcessor(workerConfig.auto);
 
-function setBusy(isBusy) {
+function setBusy(isBusy, isVideo = false) {
     state.processing = isBusy;
     elements.cancelBtn.hidden = !isBusy;
     elements.cancelBtn.disabled = !isBusy;
+    // Pause is only meaningful during video renders (has a multi-frame loop).
+    elements.pauseBtn.hidden = !(isBusy && isVideo);
+    elements.pauseBtn.disabled = !isBusy;
+    if (!isBusy) {
+        state.pauseRequested = false;
+        elements.pauseBtn.textContent = 'Pause';
+    }
     refreshActions();
 }
 
@@ -402,6 +420,7 @@ function refreshActions() {
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.fileInput.disabled = notReady;
     elements.workerThreadsInput.disabled = notReady;
+    elements.workerThreadsManual.disabled = notReady;
     elements.dropZone.classList.toggle('is-loading', !state.cvReady);
 }
 
@@ -718,22 +737,37 @@ function requestCancel() {
     }
 
     state.cancelRequested = true;
+    state.pauseRequested = false;
+    elements.pauseBtn.textContent = 'Pause';
     console.log('Cancel requested. Finishing the current step...', 'warn');
-    setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
+    setProgress(getCurrentProgress(), 'Stopping current job...');
 
     processor.reset();
-
-    if (state.ffmpeg) {
-        state.ffmpeg.terminate();
-        state.ffmpeg = null;
-        state.ffmpegReady = false;
-    }
+    // Do NOT call ffmpeg.terminate() here — terminating the FFmpeg worker
+    // while operations are in-flight causes unhandled promise rejections
+    // inside ffmpeg.js that cannot be caught from user code.  Instead we
+    // rely on throwIfCancelled() checks in the render loop to abort before
+    // the encode step starts, and let any already-started writeFile calls
+    // finish gracefully so the FFmpeg instance stays healthy for the next render.
 }
 
 function throwIfCancelled() {
     if (state.cancelRequested) {
         throw new Error('Render cancelled.');
     }
+}
+
+// Suspend the caller until the user resumes (or cancels).
+// Polls every PAUSE_POLL_INTERVAL_MS to keep CPU use negligible while paused.
+const PAUSE_POLL_INTERVAL_MS = 200;
+async function waitIfPaused() {
+    while (state.pauseRequested && !state.cancelRequested) {
+        await new Promise((resolve) => setTimeout(resolve, PAUSE_POLL_INTERVAL_MS));
+    }
+}
+
+function getCurrentProgress() {
+    return Number(elements.progressPercent.textContent.replace('%', '')) || 0;
 }
 
 async function safeDeleteFile(ffmpeg, filePath) {
@@ -808,6 +842,59 @@ async function loadFFmpeg() {
     refreshActions();
     console.log('OpenCV ready. Video export engine loaded.', 'success');
     return state.ffmpeg;
+}
+
+// VideoDecodePool — manages a pool of cloned HTMLVideoElement instances so
+// that multiple frames can be sought and drawn in parallel.  Each caller
+// calls acquire(), which resolves to { video, release }.  The caller seeks,
+// draws, then calls release() to return the element to the pool.
+//
+// All elements share the same object-URL src and are created from the single
+// `sourceVideo` element stored in state, so no extra network fetch occurs.
+class VideoDecodePool {
+    constructor(size, srcVideo) {
+        this._size = size;
+        this._free = [];
+        this._waiting = [];
+
+        for (let i = 0; i < size; i++) {
+            const v = document.createElement('video');
+            v.preload = 'auto';
+            v.muted = true;
+            v.playsInline = true;
+            v.src = srcVideo.src;
+            this._free.push(v);
+        }
+    }
+
+    acquire() {
+        if (this._free.length > 0) {
+            const video = this._free.shift();
+            const release = () => this._release(video);
+            return Promise.resolve({ video, release });
+        }
+        return new Promise((resolve) => {
+            this._waiting.push((video) => {
+                resolve({ video, release: () => this._release(video) });
+            });
+        });
+    }
+
+    _release(video) {
+        if (this._waiting.length > 0) {
+            this._waiting.shift()(video);
+        } else {
+            this._free.push(video);
+        }
+    }
+
+    destroy() {
+        this._free.forEach((v) => {
+            v.src = '';
+            v.load();
+        });
+        this._free = [];
+    }
 }
 
 async function readSelectedFile(file) {
@@ -943,17 +1030,18 @@ async function renderVideoExport() {
         totalFrames = Math.max(1, Math.floor(video.duration * fps));
 
         // ---- Parallel frame pipeline ------------------------------------------------
-        // Video seeking must stay sequential (single HTMLVideoElement), but once pixel
-        // data has been extracted from the canvas (getImageData — a synchronous copy
-        // inside renderToData) each frame's OpenCV processing and PNG encoding can run
-        // in parallel across the whole worker pool.
+        // A VideoDecodePool of N cloned video elements lets us seek N frames
+        // concurrently.  Each frame promise acquires a pool slot AND a worker
+        // slot, seeks to the target time, draws to a private off-screen canvas
+        // (so draws never race), copies pixels to a worker for OpenCV processing,
+        // then encodes the result as PNG and writes it to the FFmpeg FS.
         //
-        // A Semaphore limits the number of frames concurrently in-flight to the size
-        // of the worker pool, bounding peak memory use regardless of clip length.
-        // Completed frames are written to FFmpeg FS immediately and in any order;
-        // FFmpeg later assembles them in the correct order via the filename pattern.
+        // Pool size = worker count: this keeps exactly as many frames in flight
+        // as there are CPU workers, so the worker pipeline never starves.
         // -------------------------------------------------------------------------------
-        const sem = new Semaphore(processor.concurrency);
+        const decodePoolSize = processor.concurrency;
+        const decodePool = new VideoDecodePool(decodePoolSize, video);
+
         let completedFrames = 0;
         let latestShownFrame = -1;
         const framePromises = [];
@@ -961,78 +1049,104 @@ async function renderVideoExport() {
         for (let fi = 0; fi < totalFrames; fi++) {
             throwIfCancelled();
 
-            // Throttle: block here until a parallel slot is available.
-            await sem.acquire();
+            // Honour pause at the top of each iteration.
+            await waitIfPaused();
             throwIfCancelled();
 
+            // Capture the loop index before the async closure.
+            const capturedFi = fi;
             // Subtract 1 ms from the video duration cap to avoid seeking past the
             // last decodable frame, which some browsers report as a seek error.
-            const frameTime = Math.min(video.duration - 0.001, fi / fps);
-            await seekVideo(video, frameTime);
-            const { width, height } = drawMediaToCanvas(video, elements.sourceCanvas, settings.scale, settings.customMode);
+            const frameTime = Math.min(video.duration - 0.001, capturedFi / fps);
 
-            // Capture loop variables for the async closure below.
-            const capturedFi = fi;
-            const capturedW = width;
-            const capturedH = height;
+            // Each frame runs as an independent async promise.  Acquiring both
+            // a video element and a worker slot happens inside the promise so that
+            // multiple frames can be at different stages concurrently.
+            const p = (async () => {
+                // Phase 1: acquire a video element, seek, draw to a private
+                // canvas, then immediately release back to the pool.
+                // A try/finally guarantees release even if seek or cancel throws.
+                let capturedW, capturedH, offCanvas;
+                {
+                    const { video: vEl, release: releaseVideo } = await decodePool.acquire();
+                    try {
+                        throwIfCancelled();
 
-            // renderToData copies pixels from the canvas synchronously (before its
-            // first internal await), so the next loop iteration may safely overwrite
-            // the source canvas immediately after this call returns.
-            const p = processor.renderToData(elements.sourceCanvas, settings)
-                .then(async (rawData) => {
-                    throwIfCancelled();
+                        // Each frame draws into its own off-screen canvas so sibling
+                        // frames never overwrite each other's pixel data.
+                        offCanvas = document.createElement('canvas');
+                        await seekVideo(vEl, frameTime);
+                        ({ width: capturedW, height: capturedH } =
+                            drawMediaToCanvas(vEl, offCanvas, settings.scale, settings.customMode));
 
-                    // Encode to PNG.  Use OffscreenCanvas when available so the
-                    // browser can leverage GPU-accelerated rasterisation off the
-                    // main thread; fall back to a regular canvas otherwise.
-                    let pngBytes;
-                    if (typeof OffscreenCanvas !== 'undefined') {
-                        const oc = new OffscreenCanvas(capturedW, capturedH);
-                        oc.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                        pngBytes = new Uint8Array(
-                            await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
-                        );
-                    } else {
-                        const tmpCanvas = document.createElement('canvas');
-                        tmpCanvas.width = capturedW;
-                        tmpCanvas.height = capturedH;
-                        tmpCanvas.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                        pngBytes = new Uint8Array(
-                            await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
-                        );
+                        // Update the visible source canvas before releasing the
+                        // video element — forward-progress only to avoid jumps.
+                        if (capturedFi > latestShownFrame) {
+                            latestShownFrame = capturedFi;
+                            drawMediaToCanvas(vEl, elements.sourceCanvas, settings.scale, settings.customMode);
+                        }
+                    } finally {
+                        // Always return the video slot so other frames can proceed.
+                        releaseVideo();
                     }
+                }
 
-                    const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
-                    await ffmpeg.writeFile(frameName, pngBytes);
+                // Phase 2: OpenCV processing, PNG encoding, FFmpeg write.
+                // The video element is already back in the pool at this point.
+                throwIfCancelled();
 
-                    // JavaScript's single-threaded event loop guarantees that the
-                    // read-modify-write below is never interleaved with another
-                    // microtask, so no synchronisation primitive is required.
-                    completedFrames++;
-                    setProgress(
-                        (completedFrames / totalFrames) * 92,
-                        `Rendered frame ${completedFrames} of ${totalFrames}...`
+                // renderToData extracts pixels synchronously then dispatches
+                // to a free worker.  await here suspends until the worker
+                // returns the processed RGBA buffer.
+                const rawData = await processor.renderToData(offCanvas, settings);
+                throwIfCancelled();
+
+                // Encode to PNG.  Use OffscreenCanvas when available so the
+                // browser can leverage GPU-accelerated rasterisation off the
+                // main thread; fall back to a regular canvas otherwise.
+                let pngBytes;
+                if (typeof OffscreenCanvas !== 'undefined') {
+                    const oc = new OffscreenCanvas(capturedW, capturedH);
+                    oc.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
                     );
+                    pngBytes = new Uint8Array(
+                        await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
+                    );
+                } else {
+                    const tmpCanvas = document.createElement('canvas');
+                    tmpCanvas.width = capturedW;
+                    tmpCanvas.height = capturedH;
+                    tmpCanvas.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
+                    );
+                    pngBytes = new Uint8Array(
+                        await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
+                    );
+                }
 
-                    // Show the latest completed frame on the output canvas for visual
-                    // feedback (forward-progress only so the canvas never jumps back).
-                    // The single-threaded event loop also makes the read-compare-assign
-                    // on latestShownFrame safe against out-of-order microtask reordering.
-                    if (capturedFi > latestShownFrame) {
-                        latestShownFrame = capturedFi;
-                        elements.outputCanvas.width = capturedW;
-                        elements.outputCanvas.height = capturedH;
-                        elements.outputCanvas.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                    }
-                })
-                .finally(() => sem.release());
+                // Skip the write if the render was cancelled while encoding.
+                throwIfCancelled();
+
+                const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
+                await ffmpeg.writeFile(frameName, pngBytes);
+
+                completedFrames++;
+                setProgress(
+                    (completedFrames / totalFrames) * 92,
+                    `Rendered frame ${completedFrames} of ${totalFrames}...`
+                );
+
+                // Show the latest line-art frame on the output canvas.
+                if (capturedFi > latestShownFrame) {
+                    latestShownFrame = capturedFi;
+                    elements.outputCanvas.width = capturedW;
+                    elements.outputCanvas.height = capturedH;
+                    elements.outputCanvas.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
+                    );
+                }
+            })();
 
             framePromises.push(p);
         }
@@ -1040,6 +1154,7 @@ async function renderVideoExport() {
         // Wait for every frame to settle (allSettled avoids leaving dangling
         // promises after a cancellation or partial failure).
         const results = await Promise.allSettled(framePromises);
+        decodePool.destroy();
         const firstFailure = results.find((r) => r.status === 'rejected');
         if (firstFailure) {
             throw firstFailure.reason;
@@ -1150,7 +1265,10 @@ function updateWorkerThreadsHint(currentWorkers) {
     const baseInfo = `Auto: ${auto} (${cores} cores, ${memStr})`;
 
     if (currentWorkers > auto) {
-        elements.workerThreadsHint.textContent = `${baseInfo} — ⚠ above recommended, may cause memory pressure`;
+        const extraNote = currentWorkers > Number(elements.workerThreadsInput.max)
+            ? ' — ⚠ manually above detected core count, monitor memory carefully'
+            : ' — ⚠ above recommended, may cause memory pressure';
+        elements.workerThreadsHint.textContent = `${baseInfo}${extraNote}`;
         elements.workerThreadsHint.dataset.tone = 'warn';
     } else {
         elements.workerThreadsHint.textContent = baseInfo;
@@ -1168,6 +1286,11 @@ function rebuildProcessor(n) {
     updateWorkerThreadsHint(n);
 }
 
+// Absolute upper bound for the manual thread count entry.
+// Users can type up to this value; there is no slider stop here — they
+// deliberately type a number they know their device can handle.
+const WORKER_THREADS_ABSOLUTE_MAX = 64;
+
 // Initialise the worker-threads slider with the auto-detected safe values.
 function initWorkerThreadsControl() {
     const { auto, max } = workerConfig;
@@ -1178,6 +1301,9 @@ function initWorkerThreadsControl() {
     elements.workerThreadsMax.textContent = max;
     elements.workerThreadsInput.value = auto;
     elements.workerThreadsVal.textContent = auto;
+    elements.workerThreadsManual.max = WORKER_THREADS_ABSOLUTE_MAX;
+    elements.workerThreadsManual.min = 1;
+    elements.workerThreadsManual.value = auto;
     updateWorkerThreadsHint(auto);
 }
 
@@ -1200,6 +1326,29 @@ async function onPreviewClick() {
     }
 }
 
+function onPauseClick() {
+    if (!state.processing) {
+        return;
+    }
+
+    state.pauseRequested = !state.pauseRequested;
+    if (state.pauseRequested) {
+        elements.pauseBtn.textContent = 'Resume';
+        setProgress(
+            getCurrentProgress(),
+            'Paused — click Resume to continue...'
+        );
+        console.log('Render paused. Click Resume to continue.', 'warn');
+    } else {
+        elements.pauseBtn.textContent = 'Pause';
+        setProgress(
+            getCurrentProgress(),
+            'Resuming render...'
+        );
+        console.log('Render resumed.', 'info');
+    }
+}
+
 async function onRenderClick() {
     if (!state.selectedFile || state.processing) {
         return;
@@ -1217,6 +1366,7 @@ async function onRenderClick() {
         }
 
         if (state.fileKind === 'video') {
+            setBusy(true, true); // show pause button for video renders
             await renderVideoExport();
             return;
         }
@@ -1263,6 +1413,7 @@ elements.fileInput.addEventListener('change', async (event) => {
 elements.previewBtn.addEventListener('click', onPreviewClick);
 elements.renderBtn.addEventListener('click', onRenderClick);
 elements.cancelBtn.addEventListener('click', requestCancel);
+elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 
 ['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
@@ -1419,12 +1570,41 @@ attachHexInput('customInkHex', 'customInk');
 elements.workerThreadsInput.addEventListener('input', () => {
     const n = Number(elements.workerThreadsInput.value);
     elements.workerThreadsVal.textContent = n;
+    elements.workerThreadsManual.value = n;
     updateWorkerThreadsHint(n);
 });
 
 elements.workerThreadsInput.addEventListener('change', () => {
     if (state.processing) return;
     const n = Number(elements.workerThreadsInput.value);
+    rebuildProcessor(n);
+});
+
+// Manual number input — lets users type any value up to WORKER_THREADS_ABSOLUTE_MAX.
+// The slider is updated to reflect the new value (clamped to its own max).
+elements.workerThreadsManual.addEventListener('input', () => {
+    const raw = Number(elements.workerThreadsManual.value);
+    if (!Number.isFinite(raw) || raw < 1) return;
+    const n = Math.min(WORKER_THREADS_ABSOLUTE_MAX, Math.max(1, Math.round(raw)));
+    elements.workerThreadsVal.textContent = n;
+    // Clamp the slider to its own max — the slider cannot represent values
+    // above its max, but the manual input can go higher.
+    elements.workerThreadsInput.value = Math.min(n, Number(elements.workerThreadsInput.max));
+    updateWorkerThreadsHint(n);
+});
+
+elements.workerThreadsManual.addEventListener('change', () => {
+    if (state.processing) return;
+    const raw = Number(elements.workerThreadsManual.value);
+    if (!Number.isFinite(raw) || raw < 1) {
+        // Restore to the current processor count on invalid input.
+        elements.workerThreadsManual.value = processor.concurrency;
+        return;
+    }
+    const n = Math.min(WORKER_THREADS_ABSOLUTE_MAX, Math.max(1, Math.round(raw)));
+    elements.workerThreadsManual.value = n;
+    elements.workerThreadsInput.value = Math.min(n, Number(elements.workerThreadsInput.max));
+    elements.workerThreadsVal.textContent = n;
     rebuildProcessor(n);
 });
 

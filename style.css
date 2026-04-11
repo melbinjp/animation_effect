@@ -565,6 +565,42 @@ video {
     color: var(--warn);
 }
 
+/* Worker threads — slider + manual number input side-by-side */
+.worker-threads-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.worker-threads-row input[type="range"] {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: none;
+    background: transparent;
+}
+
+.worker-threads-manual {
+    width: 62px;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-strong);
+    color: var(--ink);
+    text-align: center;
+    font-size: 0.9rem;
+}
+
+.worker-threads-manual:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.worker-threads-manual:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
 /* Institutional Footer - Jules Standard */
 .hub-footer {
     position: fixed;
