@@ -1303,6 +1303,10 @@ async function renderVideoExport() {
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
             '-shortest',
+            // faststart moves the moov atom to the front of the file so the
+            // browser's video element can seek / range-request it correctly
+            // when served from a blob URL (fixes ERR_REQUEST_RANGE_NOT_SATISFIABLE).
+            '-movflags', '+faststart',
             outputPath
         ];
 
