@@ -799,6 +799,15 @@ function waitForMediaEvent(media, eventName) {
 }
 
 async function seekVideo(video, timeInSeconds) {
+    // Cloned video elements in the decode pool may not have loaded their
+    // metadata yet the first time they are acquired.  videoWidth/videoHeight
+    // remain 0 until readyState >= HAVE_METADATA (1), which causes
+    // computeScaledSize to return 1×1 and FFmpeg to fail.  Waiting here
+    // ensures dimensions are available before drawMediaToCanvas is called.
+    if (video.readyState < 1) {
+        await waitForMediaEvent(video, 'loadedmetadata');
+    }
+
     if (Math.abs(video.currentTime - timeInSeconds) < 0.001) {
         return;
     }
