@@ -115,37 +115,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// 3×3 median filter using a 19-comparison sorting network for 9 values.
+// 3×3 median filter using a fully-inlined 24-comparison sorting network.
+// The previous version used a helper fn swp(ptr<function,f32>, ptr<function,f32>)
+// and called it as swp(&v[0], &v[1]) etc.  That violates the WGSL specification
+// rule that two pointer-typed arguments to the same call must not share the same
+// root identifier — both &v[i] and &v[j] have root identifier `v`, causing a
+// shader-creation error.  On strict runtimes (naga/Firefox) the pipeline becomes
+// invalid and the pass is silently skipped; on lenient ones (tint/Chrome) the
+// swap may degenerate to the identity operation, leaving the image unsmoothed.
+// Either way the subsequent Canny step sees a noisy image and over-detects edges,
+// producing a dark preview.  The fix reads each neighbour into its own scalar
+// variable and implements every compare-and-swap inline with min/max — no
+// function calls and no pointer aliasing.
 const WGSL_MEDIAN3 = `
 struct Dims { width: u32, height: u32 }
 @group(0) @binding(0) var<storage, read>       src  : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst  : array<f32>;
 @group(0) @binding(2) var<uniform>             dims : Dims;
-fn swp(a: ptr<function, f32>, b: ptr<function, f32>) {
-    if (*a > *b) { let t = *a; *a = *b; *b = t; }
-}
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x; let y = gid.y;
     if (x >= dims.width || y >= dims.height) { return; }
     let cx = i32(x); let cy = i32(y); let w = dims.width;
-    var v: array<f32, 9>; var k = 0u;
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let nx = u32(clamp(cx + dx, 0, i32(dims.width)  - 1));
-            let ny = u32(clamp(cy + dy, 0, i32(dims.height) - 1));
-            v[k] = src[ny * w + nx]; k++;
-        }
-    }
-    swp(&v[0],&v[1]); swp(&v[3],&v[4]); swp(&v[6],&v[7]);
-    swp(&v[1],&v[2]); swp(&v[4],&v[5]); swp(&v[7],&v[8]);
-    swp(&v[0],&v[1]); swp(&v[3],&v[4]); swp(&v[6],&v[7]);
-    swp(&v[0],&v[3]); swp(&v[3],&v[6]); swp(&v[0],&v[3]);
-    swp(&v[1],&v[4]); swp(&v[4],&v[7]); swp(&v[1],&v[4]);
-    swp(&v[2],&v[5]); swp(&v[5],&v[8]); swp(&v[2],&v[5]);
-    swp(&v[1],&v[3]); swp(&v[2],&v[6]); swp(&v[2],&v[3]);
-    swp(&v[4],&v[6]); swp(&v[4],&v[5]); swp(&v[3],&v[4]);
-    dst[y * w + x] = v[4];
+    let xL = u32(clamp(cx - 1, 0, i32(dims.width)  - 1));
+    let xR = u32(clamp(cx + 1, 0, i32(dims.width)  - 1));
+    let yT = u32(clamp(cy - 1, 0, i32(dims.height) - 1));
+    let yB = u32(clamp(cy + 1, 0, i32(dims.height) - 1));
+    var a0 = src[yT*w+xL]; var a1 = src[yT*w+x]; var a2 = src[yT*w+xR];
+    var a3 = src[ y*w+xL]; var a4 = src[ y*w+x]; var a5 = src[ y*w+xR];
+    var a6 = src[yB*w+xL]; var a7 = src[yB*w+x]; var a8 = src[yB*w+xR];
+    // Inline compare-and-swap: t=ai; ai=min(t,aj); aj=max(t,aj)
+    var t: f32;
+    t=a0; a0=min(t,a1); a1=max(t,a1);  t=a3; a3=min(t,a4); a4=max(t,a4);  t=a6; a6=min(t,a7); a7=max(t,a7);
+    t=a1; a1=min(t,a2); a2=max(t,a2);  t=a4; a4=min(t,a5); a5=max(t,a5);  t=a7; a7=min(t,a8); a8=max(t,a8);
+    t=a0; a0=min(t,a1); a1=max(t,a1);  t=a3; a3=min(t,a4); a4=max(t,a4);  t=a6; a6=min(t,a7); a7=max(t,a7);
+    t=a0; a0=min(t,a3); a3=max(t,a3);  t=a3; a3=min(t,a6); a6=max(t,a6);  t=a0; a0=min(t,a3); a3=max(t,a3);
+    t=a1; a1=min(t,a4); a4=max(t,a4);  t=a4; a4=min(t,a7); a7=max(t,a7);  t=a1; a1=min(t,a4); a4=max(t,a4);
+    t=a2; a2=min(t,a5); a5=max(t,a5);  t=a5; a5=min(t,a8); a8=max(t,a8);  t=a2; a2=min(t,a5); a5=max(t,a5);
+    t=a1; a1=min(t,a3); a3=max(t,a3);  t=a2; a2=min(t,a6); a6=max(t,a6);  t=a2; a2=min(t,a3); a3=max(t,a3);
+    t=a4; a4=min(t,a6); a6=max(t,a6);  t=a4; a4=min(t,a5); a5=max(t,a5);  t=a3; a3=min(t,a4); a4=max(t,a4);
+    dst[y * w + x] = a4;
 }
 `;
 
