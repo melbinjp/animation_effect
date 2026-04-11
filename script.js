@@ -1211,34 +1211,36 @@ async function renderVideoExport() {
         ? state.selectedFile.name.slice(state.selectedFile.name.lastIndexOf('.'))
         : '.mp4';
     const safeBaseName = sanitizeBaseName(state.selectedFile.name);
-    const inputPath = `${jobId}/input${extension}`;
-    const framePattern = `${jobId}/frame-%05d.png`;
+    const inputPath  = `${jobId}/input${extension}`;
     const outputPath = `${jobId}/output.mp4`;
     state.activeJobId = jobId;
 
-    let totalFrames = 1;
+    // Declared at function scope so the finally block can always read them.
+    let totalFrames      = 1;
+    let segCount         = 1;
+    let framesPerSegment = 1;
+    let decodePool       = null;
+    // segInstances[0] is always state.ffmpeg (main); [1..N-1] are fresh workers.
+    const segInstances = [];
 
     try {
         await ffmpeg.createDir(jobId);
-        await ffmpeg.writeFile(inputPath, new Uint8Array(await state.selectedFile.arrayBuffer()));
+        await ffmpeg.writeFile(
+            inputPath,
+            new Uint8Array(await state.selectedFile.arrayBuffer())
+        );
 
+        // ── FPS detection ──────────────────────────────────────────────────────
         if (settings.isOriginalFps) {
-            setProgress(5, 'Detecting original framerate...');
+            setProgress(2, 'Detecting original framerate...');
             let detectedFps = null;
             const logHandler = ({ message }) => {
-                const fpsMatch = message.match(/(\d+(?:\.\d+)?) fps/);
-                if (fpsMatch) {
-                    detectedFps = parseFloat(fpsMatch[1]);
-                }
+                const m = message.match(/(\d+(?:\.\d+)?) fps/);
+                if (m) detectedFps = parseFloat(m[1]);
             };
             ffmpeg.on('log', logHandler);
-            try {
-                await ffmpeg.exec(['-i', inputPath]);
-            } catch (e) {
-                // ffmpeg exits with code 1 if no output file is provided, which is expected here
-            }
+            try { await ffmpeg.exec(['-i', inputPath]); } catch (_) { /* expected */ }
             ffmpeg.off('log', logHandler);
-
             if (detectedFps && detectedFps > 0) {
                 fps = detectedFps;
                 console.log(`Detected original FPS: ${fps}`);
@@ -1247,250 +1249,429 @@ async function renderVideoExport() {
                 fps = 30;
             }
         }
-        totalFrames = Math.max(1, Math.floor(video.duration * fps));
+
+        totalFrames      = Math.max(1, Math.floor(video.duration * fps));
+        framesPerSegment = totalFrames; // default (single-segment path)
+
+        // ── Parallel encode worker setup ───────────────────────────────────────
+        // Try to load N-1 extra FFmpeg instances for parallel segment encoding.
+        // If loading fails (e.g. memory pressure), we fall back to a single instance
+        // so the render still completes correctly — just without parallelism.
+        const desiredSeg = computeEncodeWorkers(totalFrames);
+        if (desiredSeg > 1) {
+            try {
+                setProgress(4, `Loading ${desiredSeg} parallel encode workers...`);
+                console.log(
+                    `Parallel encoding: requesting ${desiredSeg} FFmpeg workers...`, 'info'
+                );
+                const freshInsts = await Promise.all(
+                    Array.from({ length: desiredSeg - 1 }, () => createFreshFFmpeg())
+                );
+                segInstances.push(ffmpeg, ...freshInsts);
+                segCount         = desiredSeg;
+                framesPerSegment = Math.ceil(totalFrames / segCount);
+                console.log(
+                    `Parallel encoding ready: ${segCount} workers, ` +
+                    `${framesPerSegment} frames/segment.`, 'info'
+                );
+            } catch (loadErr) {
+                console.warn(
+                    'Could not load extra FFmpeg workers; using single instance. ' +
+                    loadErr.message
+                );
+                segInstances.length = 0;
+            }
+        }
+        if (segInstances.length === 0) {
+            segInstances.push(ffmpeg);
+            segCount         = 1;
+            framesPerSegment = totalFrames;
+        }
+
+        // Create a working directory in each segment instance's virtual FS.
+        for (let s = 0; s < segCount; s++) {
+            await segInstances[s].createDir(`seg${s}`);
+        }
+
+        // ── Max-bitrate guard — output file will never exceed input size ───────
+        // Line-art compresses far better than the source video, so in practice
+        // the output is always smaller.  This cap is a safety net for edge cases
+        // (e.g. already-compressed input, very short clips).
+        // floor at 200 kbps so the encoder never gets an impossibly tight budget.
+        const inputKbps = Math.max(
+            200,
+            Math.ceil((state.selectedFile.size * 8) / (video.duration * 1000))
+        );
 
         // ---- Parallel frame pipeline ------------------------------------------------
-        // A VideoDecodePool of N cloned video elements lets us seek N frames
-        // concurrently.  Each frame promise acquires a pool slot AND a worker
-        // slot, seeks to the target time, draws to a private off-screen canvas
-        // (so draws never race), copies pixels to a worker for OpenCV processing,
-        // then encodes the result as PNG and writes it to the FFmpeg FS.
+        // Each frame is processed concurrently (seek → OpenCV → BMP encode → write)
+        // and written to its assigned segment's FFmpeg FS.
         //
-        // Pool size = worker count: this keeps exactly as many frames in flight
-        // as there are CPU workers, so the worker pipeline never starves.
+        // A pipeline-wide Semaphore caps the number of frames simultaneously alive
+        // in the seek→process→BMP→write pipeline.  Without this cap, all frames
+        // are queued upfront; each holds ~8 MB of canvas/pixel data, totalling
+        // several GB for long/hi-res videos and causing RangeError OOM crashes.
         //
-        // STAGGER: all frame promises are created synchronously in the loop below,
-        // which means the first N frames all acquire decode slots simultaneously and
-        // start seeking at the same millisecond.  Because video seeks take a similar
-        // amount of wall-clock time they also finish together, causing every worker
-        // to submit GPU/CPU compute work at exactly the same instant — producing
-        // the spike-and-dip pattern visible in task-manager graphs.  A small per-
-        // frame delay (FRAME_STAGGER_MS) applied to frames 1…N-1 in the first batch
-        // offsets their decode start times so workers receive frames at staggered
-        // times.  The offset naturally propagates to all subsequent batches because
-        // each frame can only start decoding once the previous frame releases its
-        // decode slot (which happens at the end of its seek, already offset).
-        // -------------------------------------------------------------------------------
-        // Target gap (ms) between consecutive frame decode starts in the first batch.
-        // Value chosen to be roughly half the minimum expected GPU frame-processing
-        // time (~50 ms on desktop) — large enough to break lock-step synchronisation
-        // across workers while small enough to keep the pipeline full with no GPU
-        // idle time between frames.  On slower devices (CPU fallback, mobile) the
-        // per-frame processing time is much longer (200–2000 ms), so a 30 ms stagger
-        // is well within budget and still effective.
+        // Batching (BATCH_SIZE = 2 × concurrency) adds a GC checkpoint between
+        // batches so completed frame closures and their pixel buffers are reclaimed.
+        //
+        // STAGGER: frames 1…N-1 in the first pool-sized batch start with a small
+        // per-frame delay so GPU workers receive tasks at offset times, smoothing
+        // the sawtooth GPU utilisation pattern.
         const FRAME_STAGGER_MS = 30;
-        const decodePoolSize = processor.concurrency;
-        const decodePool = new VideoDecodePool(decodePoolSize, video);
+        const decodePoolSize   = processor.concurrency;
+        decodePool = new VideoDecodePool(decodePoolSize, video);
         state.activeDecodePool = decodePool;
 
-        let completedFrames = 0;
-        let latestShownFrame = -1;
+        // +1 slot lets FFmpeg writeFile for frame N overlap with decoding of
+        // frame N+concurrency, hiding I/O latency without extra memory cost.
+        const inFlightSem = new Semaphore(processor.concurrency + 1);
+        const BATCH_SIZE  = Math.max(1, processor.concurrency * 2);
+
+        let completedFrames   = 0;
+        let latestShownFrame  = -1;
         let latestOutputFrame = -1;
-        const framePromises = [];
 
-        for (let fi = 0; fi < totalFrames; fi++) {
+        for (let batchStart = 0; batchStart < totalFrames; batchStart += BATCH_SIZE) {
             throwIfCancelled();
-
-            // Honour pause at the top of each iteration.
             await waitIfPaused();
             throwIfCancelled();
 
-            // Capture the loop index before the async closure.
-            const capturedFi = fi;
-            // Subtract 1 ms from the video duration cap to avoid seeking past the
-            // last decodable frame, which some browsers report as a seek error.
-            const frameTime = Math.min(video.duration - 0.001, capturedFi / fps);
+            const batchEnd = Math.min(batchStart + BATCH_SIZE, totalFrames);
+            const batchPromises = [];
 
-            // Each frame runs as an independent async promise.  Acquiring both
-            // a video element and a worker slot happens inside the promise so that
-            // multiple frames can be at different stages concurrently.
-            const p = (async () => {
-                // Stagger the first batch of frames so workers start decoding at
-                // offset times rather than all simultaneously.  Frame 0 starts
-                // immediately; each subsequent frame in the first batch waits an
-                // additional FRAME_STAGGER_MS before acquiring its decode slot.
-                // Frames beyond the first batch are already naturally staggered
-                // because they only get a decode slot when a previous frame
-                // releases one (at the end of its own seek, which is already offset).
-                if (capturedFi > 0 && capturedFi < decodePoolSize) {
-                    // Check cancellation before committing to the delay so the render
-                    // responds immediately without waiting up to (N-1)*FRAME_STAGGER_MS.
-                    throwIfCancelled();
-                    await new Promise(resolve => setTimeout(resolve, capturedFi * FRAME_STAGGER_MS));
-                    throwIfCancelled();
-                }
+            for (let fi = batchStart; fi < batchEnd; fi++) {
+                const capturedFi = fi;
+                // Cap at duration-1ms so the last seek never overshoots.
+                const frameTime  = Math.min(video.duration - 0.001, capturedFi / fps);
+                // Route each frame to the correct segment instance.
+                const segIdx     = Math.min(segCount - 1, Math.floor(capturedFi / framesPerSegment));
+                const localIdx   = capturedFi - segIdx * framesPerSegment;
+                const segFfmpeg  = segInstances[segIdx];
 
-                // Phase 1: acquire a video element, seek, draw to a private
-                // canvas, then immediately release back to the pool.
-                // A try/finally guarantees release even if seek or cancel throws.
-                let capturedW, capturedH, offCanvas;
-                {
-                    const { video: vEl, release: releaseVideo } = await decodePool.acquire();
+                const p = (async () => {
+                    // Stagger the first pool-sized batch to break lock-step seek starts.
+                    if (capturedFi > 0 && capturedFi < decodePoolSize) {
+                        throwIfCancelled();
+                        await new Promise(r => setTimeout(r, capturedFi * FRAME_STAGGER_MS));
+                        throwIfCancelled();
+                    }
+
+                    // Bound total in-flight frames to prevent OOM on long/hi-res videos.
+                    await inFlightSem.acquire();
                     try {
+                        // Phase 1: seek + draw to a private off-screen canvas so
+                        // concurrent frames never overwrite each other's pixels.
+                        let capturedW, capturedH, offCanvas;
+                        {
+                            const { video: vEl, release: releaseVideo } =
+                                await decodePool.acquire();
+                            try {
+                                throwIfCancelled();
+                                offCanvas = document.createElement('canvas');
+                                await seekVideo(vEl, frameTime);
+                                ({ width: capturedW, height: capturedH } =
+                                    drawMediaToCanvas(
+                                        vEl, offCanvas,
+                                        settings.scale, settings.customMode
+                                    ));
+                                if (capturedFi > latestShownFrame) {
+                                    latestShownFrame = capturedFi;
+                                    drawMediaToCanvas(
+                                        vEl, elements.sourceCanvas,
+                                        settings.scale, settings.customMode
+                                    );
+                                }
+                            } finally {
+                                releaseVideo();
+                            }
+                        }
+
+                        // Phase 2: OpenCV/GPU processing → BMP encode → write to
+                        // the assigned segment's FFmpeg WASM filesystem.
+                        throwIfCancelled();
+                        let rawData = await processor.renderToData(offCanvas, settings);
+                        offCanvas = null; // release canvas backing store immediately
+
                         throwIfCancelled();
 
-                        // Each frame draws into its own off-screen canvas so sibling
-                        // frames never overwrite each other's pixel data.
-                        offCanvas = document.createElement('canvas');
-                        await seekVideo(vEl, frameTime);
-                        ({ width: capturedW, height: capturedH } =
-                            drawMediaToCanvas(vEl, offCanvas, settings.scale, settings.customMode));
-
-                        // Update the visible source canvas before releasing the
-                        // video element — forward-progress only to avoid jumps.
-                        if (capturedFi > latestShownFrame) {
-                            latestShownFrame = capturedFi;
-                            drawMediaToCanvas(vEl, elements.sourceCanvas, settings.scale, settings.customMode);
+                        // Live output preview (forward-progress only).
+                        if (capturedFi > latestOutputFrame) {
+                            latestOutputFrame = capturedFi;
+                            elements.outputCanvas.width  = capturedW;
+                            elements.outputCanvas.height = capturedH;
+                            elements.outputCanvas.getContext('2d').putImageData(
+                                new ImageData(rawData, capturedW, capturedH), 0, 0
+                            );
                         }
+
+                        // BMP has zero deflate overhead (~100× faster than PNG).
+                        // The raw bytes are larger but the Semaphore ensures only
+                        // O(concurrency) frames reside in the WASM heap at once.
+                        let frameBytes = rgbaToBmp(rawData, capturedW, capturedH);
+                        rawData = null; // GC: preview done, BMP encoded
+
+                        throwIfCancelled();
+                        await segFfmpeg.writeFile(
+                            `seg${segIdx}/frame-${String(localIdx).padStart(5, '0')}.bmp`,
+                            frameBytes
+                        );
+                        frameBytes = null; // GC: written to WASM FS
+
+                        completedFrames++;
+                        setProgress(
+                            5 + (completedFrames / totalFrames) * 85,
+                            `Processed frame ${completedFrames} of ${totalFrames}...`
+                        );
                     } finally {
-                        // Always return the video slot so other frames can proceed.
-                        releaseVideo();
+                        inFlightSem.release();
                     }
-                }
+                })();
 
-                // Phase 2: OpenCV processing, PNG encoding, FFmpeg write.
-                // The video element is already back in the pool at this point.
-                throwIfCancelled();
+                batchPromises.push(p);
+            }
 
-                // renderToData extracts pixels synchronously then dispatches
-                // to a free worker.  await here suspends until the worker
-                // returns the processed RGBA buffer.
-                const rawData = await processor.renderToData(offCanvas, settings);
-                throwIfCancelled();
-
-                // Encode to PNG.  Use OffscreenCanvas when available so the
-                // browser can leverage GPU-accelerated rasterisation off the
-                // main thread; fall back to a regular canvas otherwise.
-                let pngBytes;
-                if (typeof OffscreenCanvas !== 'undefined') {
-                    const oc = new OffscreenCanvas(capturedW, capturedH);
-                    oc.getContext('2d').putImageData(
-                        new ImageData(rawData, capturedW, capturedH), 0, 0
-                    );
-                    pngBytes = new Uint8Array(
-                        await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
-                    );
-                } else {
-                    const tmpCanvas = document.createElement('canvas');
-                    tmpCanvas.width = capturedW;
-                    tmpCanvas.height = capturedH;
-                    tmpCanvas.getContext('2d').putImageData(
-                        new ImageData(rawData, capturedW, capturedH), 0, 0
-                    );
-                    pngBytes = new Uint8Array(
-                        await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
-                    );
-                }
-
-                // Skip the write if the render was cancelled while encoding.
-                throwIfCancelled();
-
-                const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
-                await ffmpeg.writeFile(frameName, pngBytes);
-
-                completedFrames++;
-                setProgress(
-                    (completedFrames / totalFrames) * 92,
-                    `Rendered frame ${completedFrames} of ${totalFrames}...`
-                );
-
-                // Show the latest line-art frame on the output canvas.
-                if (capturedFi > latestOutputFrame) {
-                    latestOutputFrame = capturedFi;
-                    elements.outputCanvas.width = capturedW;
-                    elements.outputCanvas.height = capturedH;
-                    elements.outputCanvas.getContext('2d').putImageData(
-                        new ImageData(rawData, capturedW, capturedH), 0, 0
-                    );
-                }
-            })();
-
-            framePromises.push(p);
+            // Await the full batch before scheduling the next one.
+            // This gives the JS garbage collector a definite checkpoint to reclaim
+            // completed frame closures and their large pixel buffers — essential
+            // for long, high-resolution videos that would otherwise accumulate GBs.
+            const batchResults = await Promise.allSettled(batchPromises);
+            const firstFailure = batchResults.find(r => r.status === 'rejected');
+            if (firstFailure) throw firstFailure.reason;
         }
 
-        // Wait for every frame to settle (allSettled avoids leaving dangling
-        // promises after a cancellation or partial failure).
-        const results = await Promise.allSettled(framePromises);
         decodePool.destroy();
+        decodePool = null;
         state.activeDecodePool = null;
-        const firstFailure = results.find((r) => r.status === 'rejected');
-        if (firstFailure) {
-            throw firstFailure.reason;
-        }
         // ---- End parallel frame pipeline -------------------------------------------
 
         throwIfCancelled();
-        setProgress(92, 'Encoding final MP4 in the browser...');
-        console.log('Encoding final MP4 in the browser...', 'info');
-        const encodeArgs = [
-            '-y',
-            '-framerate', String(fps),
-            '-start_number', '0',
-            '-i', framePattern,
-            '-i', inputPath,
-            '-map', '0:v:0',
-            '-map', '1:a?',
-            '-c:v', 'libx264',
-            // ultrafast preset encodes 4–5× faster than the default medium preset with
-            // no visible quality difference for pure black-and-white line art.
-            // animation tune tells x264 the content has large flat areas (which is true
-            // for line art), improving both compression ratio and encode speed.
-            '-preset', 'ultrafast',
-            '-tune', 'animation',
-            // libx264 with yuv420p requires both width and height to be even.
-            // scale=trunc(iw/2)*2:trunc(ih/2)*2 rounds each dimension down to the
-            // nearest even number, preventing "width/height not divisible by 2" errors
-            // that occur when Math.round() produces odd-numbered scaled dimensions.
-            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac',
-            '-shortest',
-            // faststart moves the moov atom to the front of the file so the
-            // browser's video element can seek / range-request it correctly
-            // when served from a blob URL (fixes ERR_REQUEST_RANGE_NOT_SATISFIABLE).
-            '-movflags', '+faststart',
-            outputPath
-        ];
 
-        // Collect all FFmpeg log lines during encoding so that if the process
-        // fails we can surface a meaningful error message instead of just
-        // reporting an empty output file.
-        const encodeLog = [];
-        const encodeLogHandler = ({ message }) => { encodeLog.push(message); };
-        ffmpeg.on('log', encodeLogHandler);
-        let encodeExitCode;
-        try {
-            encodeExitCode = await ffmpeg.exec(encodeArgs);
-        } finally {
-            ffmpeg.off('log', encodeLogHandler);
+        // ── Parallel encode ────────────────────────────────────────────────────
+        // All N segment instances encode their frames simultaneously.
+        // Thread budget: floor(total-cores / segCount) per segment keeps all
+        // segments encoding in parallel without excessive thread contention.
+        const threadsPerSeg = Math.max(
+            1, Math.floor((navigator.hardwareConcurrency || 2) / segCount)
+        );
+
+        setProgress(
+            90,
+            segCount > 1
+                ? `Encoding ${segCount} video segments in parallel...`
+                : 'Encoding video...'
+        );
+        console.log(
+            segCount > 1
+                ? `Parallel encode: ${segCount} segments × ${threadsPerSeg} threads`
+                : `Encoding video (${threadsPerSeg} threads)...`,
+            'info'
+        );
+
+        // Map state.ffmpeg progress events (fired for segment 0) to 90–96 %.
+        state.encodePhaseOffset = 90;
+        state.encodePhaseScale  = 0.06;
+
+        // encodeOneSegment: encode all BMP frames in seg${s}/ to seg${s}/out.mp4
+        // (video-only), read the result, then immediately delete frame files from
+        // the WASM heap to free memory before the concat step.
+        const encodeOneSegment = async (segFfmpeg, s) => {
+            const segFrameCount = Math.min(
+                framesPerSegment, totalFrames - s * framesPerSegment
+            );
+            const segArgs = [
+                '-y',
+                '-framerate', String(fps),
+                '-start_number', '0',
+                '-i', `seg${s}/frame-%05d.bmp`,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'animation',
+                // CRF 28: perceptually lossless for binary line art, ~30 % faster
+                // than the default CRF 23 with no visible quality loss.
+                '-crf', '28',
+                // GOP = 1 second: cheap I-frames for 2-colour content; enables
+                // clean seeking.
+                '-g', String(Math.max(1, Math.round(fps))),
+                '-threads', String(threadsPerSeg),
+                '-pix_fmt', 'yuv420p',
+                // Ensure even dimensions required by yuv420p.
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                // Hard bitrate cap so the output segment never exceeds the input
+                // bitrate — guarantees the final file is no larger than the source.
+                '-maxrate', `${inputKbps}k`,
+                '-bufsize', `${inputKbps * 2}k`,
+                `seg${s}/out.mp4`,
+            ];
+            const segLog  = [];
+            const segLogH = ({ message }) => segLog.push(message);
+            segFfmpeg.on('log', segLogH);
+            let exitCode;
+            try {
+                exitCode = await segFfmpeg.exec(segArgs);
+            } finally {
+                segFfmpeg.off('log', segLogH);
+            }
+            if (exitCode !== 0) {
+                throw new Error(
+                    `Segment ${s} encode failed (exit ${exitCode}).\n` +
+                    segLog.slice(-20).join('\n')
+                );
+            }
+
+            // Read the encoded segment before freeing WASM heap.
+            const mp4Data = await segFfmpeg.readFile(`seg${s}/out.mp4`);
+
+            // Delete frame BMPs and the encoded segment from this instance's WASM
+            // heap immediately — critical for long videos where frames linger until
+            // the outer finally block and exhaust the WASM address space.
+            const frameDels = Array.from({ length: segFrameCount }, (_, i) =>
+                safeDeleteFile(
+                    segFfmpeg,
+                    `seg${s}/frame-${String(i).padStart(5, '0')}.bmp`
+                )
+            );
+            await Promise.all(frameDels);
+            await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
+            try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
+
+            return mp4Data;
+        };
+
+        const segMp4Bufs = await Promise.all(
+            segInstances.map((inst, s) => encodeOneSegment(inst, s))
+        );
+
+        throwIfCancelled();
+
+        // ── Final assembly: merge all segments + mux original audio ───────────
+        setProgress(96, 'Assembling final video with audio...');
+        console.log('Assembling final video...', 'info');
+
+        // Map progress events to the 96–100 % band during the final mux.
+        state.encodePhaseOffset = 96;
+        state.encodePhaseScale  = 0.04;
+
+        // Write segment MP4s to the main instance for concat.
+        for (let s = 0; s < segCount; s++) {
+            await ffmpeg.writeFile(`${jobId}/seg${s}.mp4`, segMp4Bufs[s]);
+            segMp4Bufs[s] = null; // GC: safely written to main FS
         }
 
-        if (encodeExitCode !== 0) {
-            const logSummary = encodeLog.slice(-30).join('\n');
+        let finalArgs;
+        if (segCount === 1) {
+            // Single segment: mux audio onto the already-encoded video.
+            // -c:v copy avoids a re-encode; -c:a aac re-encodes audio to AAC.
+            finalArgs = [
+                '-y',
+                '-i', `${jobId}/seg0.mp4`,
+                '-i', inputPath,
+                '-map', '0:v:0',
+                '-map', '1:a?',
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-shortest',
+                '-movflags', '+faststart',
+                outputPath,
+            ];
+        } else {
+            // Multiple segments: write a concat list, then stream-copy + mux audio.
+            // -safe 0 allows paths containing the jobId prefix.
+            const concatContent = Array.from(
+                { length: segCount }, (_, s) => `file '${jobId}/seg${s}.mp4'`
+            ).join('\n');
+            await ffmpeg.writeFile(
+                `${jobId}/concat.txt`,
+                new TextEncoder().encode(concatContent)
+            );
+            finalArgs = [
+                '-y',
+                '-f', 'concat', '-safe', '0',
+                '-i', `${jobId}/concat.txt`,
+                '-i', inputPath,
+                '-map', '0:v:0',
+                '-map', '1:a?',
+                '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
+                '-c:a', 'aac',
+                '-shortest',
+                '-movflags', '+faststart',
+                outputPath,
+            ];
+        }
+
+        const finalLog  = [];
+        const finalLogH = ({ message }) => finalLog.push(message);
+        ffmpeg.on('log', finalLogH);
+        let finalCode;
+        try {
+            finalCode = await ffmpeg.exec(finalArgs);
+        } finally {
+            ffmpeg.off('log', finalLogH);
+        }
+        if (finalCode !== 0) {
             throw new Error(
-                `FFmpeg encoding failed (exit code ${encodeExitCode}).\n${logSummary}`
+                `Final video assembly failed (exit ${finalCode}).\n` +
+                finalLog.slice(-30).join('\n')
             );
         }
 
         throwIfCancelled();
         const outputData = await ffmpeg.readFile(outputPath);
         if (!outputData || outputData.byteLength === 0) {
-            throw new Error('FFmpeg produced an empty output file. The video encoding may have failed.');
+            throw new Error(
+                'FFmpeg produced an empty output file. The video encoding may have failed.'
+            );
         }
         const videoBlob = new Blob([outputData], { type: 'video/mp4' });
         setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
-        // Use a separate blob URL for the video preview element so that Chrome's
-        // out-of-bounds range requests (ERR_REQUEST_RANGE_NOT_SATISFIABLE) against
-        // the media element do not taint the download link's URL.
+        // Separate blob URL for the video preview element so Chrome's range-request
+        // errors against the media element don't taint the download link URL.
         revokeUrl('videoPreviewUrl');
         state.videoPreviewUrl = URL.createObjectURL(videoBlob);
-        elements.outputVideo.src = state.videoPreviewUrl;
+        elements.outputVideo.src    = state.videoPreviewUrl;
         elements.videoResult.hidden = false;
         setProgress(100, 'MP4 export ready.');
         console.log('Video render complete. Download or review the MP4.', 'success');
+
     } finally {
+        // Always destroy the decode pool even if the render was cancelled or threw.
+        if (decodePool) {
+            try { decodePool.destroy(); } catch (_) {}
+        }
         state.activeDecodePool = null;
-        await cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath);
+
+        // Best-effort cleanup of any BMP frames / segment outputs that may still
+        // reside in a segment instance's WASM heap (handles cancel + mid-render
+        // errors).  encodeOneSegment already deletes on success, so these
+        // safeDeleteFile calls are harmless no-ops for already-deleted files.
+        await Promise.allSettled(segInstances.map(async (segFfmpeg, s) => {
+            const n = Math.max(1, framesPerSegment);
+            const frameDels = Array.from({ length: n }, (_, i) =>
+                safeDeleteFile(
+                    segFfmpeg,
+                    `seg${s}/frame-${String(i).padStart(5, '0')}.bmp`
+                )
+            );
+            await Promise.allSettled(frameDels);
+            await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
+            try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
+        }));
+
+        // Clean up the main instance's job directory (input, seg MPGs, concat, output).
+        await cleanupFfmpegJob(ffmpeg, jobId, segCount, inputPath, outputPath);
+
+        // Terminate extra segment workers (index 0 is state.ffmpeg — never terminate).
+        for (let s = 1; s < segInstances.length; s++) {
+            try {
+                if (typeof segInstances[s].terminate === 'function') {
+                    segInstances[s].terminate();
+                }
+            } catch (_) {}
+        }
+
+        // Reset progress-phase state for the next render.
+        state.encodePhaseOffset = 90;
+        state.encodePhaseScale  = 0.1;
         state.activeJobId = '';
     }
 }
