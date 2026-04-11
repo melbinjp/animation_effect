@@ -1292,6 +1292,7 @@ async function renderVideoExport() {
         const encodeArgs = [
             '-y',
             '-framerate', String(fps),
+            '-start_number', '0',
             '-i', framePattern,
             '-i', inputPath,
             '-map', '0:v:0',
