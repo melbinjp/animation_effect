@@ -1060,85 +1060,88 @@ async function renderVideoExport() {
             // a video element and a worker slot happens inside the promise so that
             // multiple frames can be at different stages concurrently.
             const p = (async () => {
-                // Acquire a free video element from the pool (resolves immediately
-                // if one is available, or waits until a sibling frame releases one).
-                const { video: vEl, release: releaseVideo } = await decodePool.acquire();
-                try {
-                    throwIfCancelled();
+                // Phase 1: acquire a video element, seek, draw to a private
+                // canvas, then immediately release back to the pool.
+                // A try/finally guarantees release even if seek or cancel throws.
+                let capturedW, capturedH, offCanvas;
+                {
+                    const { video: vEl, release: releaseVideo } = await decodePool.acquire();
+                    try {
+                        throwIfCancelled();
 
-                    // Each frame draws into its own off-screen canvas so sibling
-                    // frames never overwrite each other's pixel data.
-                    const offCanvas = document.createElement('canvas');
-                    await seekVideo(vEl, frameTime);
-                    const { width: capturedW, height: capturedH } =
-                        drawMediaToCanvas(vEl, offCanvas, settings.scale, settings.customMode);
+                        // Each frame draws into its own off-screen canvas so sibling
+                        // frames never overwrite each other's pixel data.
+                        offCanvas = document.createElement('canvas');
+                        await seekVideo(vEl, frameTime);
+                        ({ width: capturedW, height: capturedH } =
+                            drawMediaToCanvas(vEl, offCanvas, settings.scale, settings.customMode));
 
-                    // Update the visible source canvas before releasing the
-                    // video element — forward-progress only to avoid jumps.
-                    if (capturedFi > latestShownFrame) {
-                        latestShownFrame = capturedFi;
-                        drawMediaToCanvas(vEl, elements.sourceCanvas, settings.scale, settings.customMode);
+                        // Update the visible source canvas before releasing the
+                        // video element — forward-progress only to avoid jumps.
+                        if (capturedFi > latestShownFrame) {
+                            latestShownFrame = capturedFi;
+                            drawMediaToCanvas(vEl, elements.sourceCanvas, settings.scale, settings.customMode);
+                        }
+                    } finally {
+                        // Always return the video slot so other frames can proceed.
+                        releaseVideo();
                     }
+                }
 
-                    // The video element can be returned to the pool immediately
-                    // after pixel extraction — OpenCV processing runs independently.
-                    releaseVideo();
+                // Phase 2: OpenCV processing, PNG encoding, FFmpeg write.
+                // The video element is already back in the pool at this point.
+                throwIfCancelled();
 
-                    // renderToData extracts pixels synchronously then dispatches
-                    // to a free worker.  await here suspends until the worker
-                    // returns the processed RGBA buffer.
-                    const rawData = await processor.renderToData(offCanvas, settings);
-                    throwIfCancelled();
+                // renderToData extracts pixels synchronously then dispatches
+                // to a free worker.  await here suspends until the worker
+                // returns the processed RGBA buffer.
+                const rawData = await processor.renderToData(offCanvas, settings);
+                throwIfCancelled();
 
-                    // Encode to PNG.  Use OffscreenCanvas when available so the
-                    // browser can leverage GPU-accelerated rasterisation off the
-                    // main thread; fall back to a regular canvas otherwise.
-                    let pngBytes;
-                    if (typeof OffscreenCanvas !== 'undefined') {
-                        const oc = new OffscreenCanvas(capturedW, capturedH);
-                        oc.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                        pngBytes = new Uint8Array(
-                            await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
-                        );
-                    } else {
-                        const tmpCanvas = document.createElement('canvas');
-                        tmpCanvas.width = capturedW;
-                        tmpCanvas.height = capturedH;
-                        tmpCanvas.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                        pngBytes = new Uint8Array(
-                            await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
-                        );
-                    }
-
-                    // Skip the write if the render was cancelled while encoding.
-                    throwIfCancelled();
-
-                    const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
-                    await ffmpeg.writeFile(frameName, pngBytes);
-
-                    completedFrames++;
-                    setProgress(
-                        (completedFrames / totalFrames) * 92,
-                        `Rendered frame ${completedFrames} of ${totalFrames}...`
+                // Encode to PNG.  Use OffscreenCanvas when available so the
+                // browser can leverage GPU-accelerated rasterisation off the
+                // main thread; fall back to a regular canvas otherwise.
+                let pngBytes;
+                if (typeof OffscreenCanvas !== 'undefined') {
+                    const oc = new OffscreenCanvas(capturedW, capturedH);
+                    oc.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
                     );
+                    pngBytes = new Uint8Array(
+                        await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer()
+                    );
+                } else {
+                    const tmpCanvas = document.createElement('canvas');
+                    tmpCanvas.width = capturedW;
+                    tmpCanvas.height = capturedH;
+                    tmpCanvas.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
+                    );
+                    pngBytes = new Uint8Array(
+                        await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
+                    );
+                }
 
-                    // Show the latest line-art frame on the output canvas.
-                    if (capturedFi > latestShownFrame) {
-                        latestShownFrame = capturedFi;
-                        elements.outputCanvas.width = capturedW;
-                        elements.outputCanvas.height = capturedH;
-                        elements.outputCanvas.getContext('2d').putImageData(
-                            new ImageData(rawData, capturedW, capturedH), 0, 0
-                        );
-                    }
-                } catch (err) {
-                    // Ensure the video slot is always returned even on failure.
-                    releaseVideo();
-                    throw err;
+                // Skip the write if the render was cancelled while encoding.
+                throwIfCancelled();
+
+                const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
+                await ffmpeg.writeFile(frameName, pngBytes);
+
+                completedFrames++;
+                setProgress(
+                    (completedFrames / totalFrames) * 92,
+                    `Rendered frame ${completedFrames} of ${totalFrames}...`
+                );
+
+                // Show the latest line-art frame on the output canvas.
+                if (capturedFi > latestShownFrame) {
+                    latestShownFrame = capturedFi;
+                    elements.outputCanvas.width = capturedW;
+                    elements.outputCanvas.height = capturedH;
+                    elements.outputCanvas.getContext('2d').putImageData(
+                        new ImageData(rawData, capturedW, capturedH), 0, 0
+                    );
                 }
             })();
 
