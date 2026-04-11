@@ -1192,10 +1192,14 @@ async function createFreshFFmpeg() {
 //     the page, budget 250 MB per extra FFmpeg instance.
 const MIN_FRAMES_PER_SEGMENT = 60;
 const MAX_ENCODE_WORKERS = 4;
+// Memory budget per extra FFmpeg WASM instance (MB).
+const FFMPEG_WORKER_MB = 250;
+// RAM we leave free for the browser runtime, main thread, and the page itself (MB).
+const FFMPEG_RESERVED_MB = 1024; // 1 GB
 function computeEncodeWorkers(totalFrames) {
     if (totalFrames < MIN_FRAMES_PER_SEGMENT) return 1;
     const mem = (typeof navigator.deviceMemory === 'number') ? navigator.deviceMemory : 4;
-    const maxByMem  = Math.max(1, Math.floor((mem * 1024 - 1024) / 250));
+    const maxByMem   = Math.max(1, Math.floor((mem * 1024 - FFMPEG_RESERVED_MB) / FFMPEG_WORKER_MB));
     const maxByCores = Math.max(1, (navigator.hardwareConcurrency || 2) - 1);
     const maxByFrames = Math.floor(totalFrames / MIN_FRAMES_PER_SEGMENT);
     return Math.min(MAX_ENCODE_WORKERS, maxByMem, maxByCores, maxByFrames);
@@ -1297,9 +1301,11 @@ async function renderVideoExport() {
         // Line-art compresses far better than the source video, so in practice
         // the output is always smaller.  This cap is a safety net for edge cases
         // (e.g. already-compressed input, very short clips).
-        // floor at 200 kbps so the encoder never gets an impossibly tight budget.
+        // Floor at MIN_OUTPUT_BITRATE_KBPS so the encoder never gets an impossibly
+        // tight budget (e.g. for very short clips where the arithmetic gives <100).
+        const MIN_OUTPUT_BITRATE_KBPS = 200;
         const inputKbps = Math.max(
-            200,
+            MIN_OUTPUT_BITRATE_KBPS,
             Math.ceil((state.selectedFile.size * 8) / (video.duration * 1000))
         );
 
@@ -1318,6 +1324,9 @@ async function renderVideoExport() {
         // STAGGER: frames 1…N-1 in the first pool-sized batch start with a small
         // per-frame delay so GPU workers receive tasks at offset times, smoothing
         // the sawtooth GPU utilisation pattern.
+        // Delay (ms) between consecutive frame-decode starts in the first batch.
+        // Large enough to break lock-step GPU submission; small enough to keep
+        // the pipeline full with no idle time between workers.
         const FRAME_STAGGER_MS = 30;
         const decodePoolSize   = processor.concurrency;
         decodePool = new VideoDecodePool(decodePoolSize, video);
@@ -1657,7 +1666,7 @@ async function renderVideoExport() {
             try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
         }));
 
-        // Clean up the main instance's job directory (input, seg MPGs, concat, output).
+        // Clean up the main instance's job directory (input, segment MP4s, concat list, output).
         await cleanupFfmpegJob(ffmpeg, jobId, segCount, inputPath, outputPath);
 
         // Terminate extra segment workers (index 0 is state.ffmpeg — never terminate).
