@@ -116,6 +116,7 @@ const state = {
     sourceVideo: null,
     sourceUrl: '',
     outputUrl: '',
+    videoPreviewUrl: '',
     processing: false,
     cancelRequested: false,
     pauseRequested: false,
@@ -550,6 +551,7 @@ function setResultGlow(active) {
 
 function clearRenderedOutput() {
     revokeUrl('outputUrl');
+    revokeUrl('videoPreviewUrl');
     elements.downloadCard.hidden = true;
     elements.downloadLink.removeAttribute('href');
     elements.downloadLink.removeAttribute('download');
@@ -1315,9 +1317,17 @@ async function renderVideoExport() {
 
         throwIfCancelled();
         const outputData = await ffmpeg.readFile(outputPath);
+        if (!outputData || outputData.byteLength === 0) {
+            throw new Error('FFmpeg produced an empty output file. The video encoding may have failed.');
+        }
         const videoBlob = new Blob([outputData], { type: 'video/mp4' });
         setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
-        elements.outputVideo.src = state.outputUrl;
+        // Use a separate blob URL for the video preview element so that Chrome's
+        // out-of-bounds range requests (ERR_REQUEST_RANGE_NOT_SATISFIABLE) against
+        // the media element do not taint the download link's URL.
+        revokeUrl('videoPreviewUrl');
+        state.videoPreviewUrl = URL.createObjectURL(videoBlob);
+        elements.outputVideo.src = state.videoPreviewUrl;
         elements.videoResult.hidden = false;
         setProgress(100, 'MP4 export ready.');
         console.log('Video render complete. Download or review the MP4.', 'success');
@@ -1754,4 +1764,7 @@ elements.workerThreadsManual.addEventListener('change', () => {
 
 attachDropZone();
 initWorkerThreadsControl();
+// Pre-create the source canvas context with willReadFrequently so that
+// repeated getImageData calls in renderToData do not trigger a browser warning.
+elements.sourceCanvas.getContext('2d', { willReadFrequently: true });
 resetWorkspace();
