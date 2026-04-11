@@ -24,7 +24,11 @@ const elements = {
     outputVideo: document.getElementById('outputVideo'),
     videoResult: document.getElementById('videoResult'),
     fileMeta: document.getElementById('fileMeta'),
-    dropZone: document.getElementById('dropZone')
+    dropZone: document.getElementById('dropZone'),
+    workerThreadsInput: document.getElementById('workerThreads'),
+    workerThreadsVal: document.getElementById('workerThreadsVal'),
+    workerThreadsMax: document.getElementById('workerThreadsMax'),
+    workerThreadsHint: document.getElementById('workerThreadsHint')
 };
 
 const STYLE_PRESETS = {
@@ -126,6 +130,43 @@ const PRODUCTION_LIMITS = {
     hardFileSizeBytes: 250 * 1024 * 1024
 };
 
+// Compute the recommended number of Web Workers based on the number of logical
+// CPU cores and the amount of RAM reported by the browser.
+//
+// Core budget: reserve 2 logical cores (one for the main thread / UI, one for
+// the FFmpeg encoder) so the UI stays responsive during rendering.
+//
+// Memory budget: each worker loads a separate OpenCV WASM instance (~30 MB) and
+// holds several CV matrices per in-flight frame (~50 MB at typical resolutions),
+// so we budget ~80 MB per worker.  We reserve ~300 MB for the browser, main
+// thread, and FFmpeg.  navigator.deviceMemory is capped at 8 by the spec; when
+// it reports 8 GB we assume memory is not the bottleneck.
+//
+// Returns { auto, max, cores, memoryGB }
+//   auto      — recommended worker count
+//   max       — core-based upper limit (used as the slider ceiling)
+//   cores     — raw navigator.hardwareConcurrency value
+//   memoryGB  — navigator.deviceMemory (null if unavailable)
+function computeOptimalWorkers() {
+    const hw = navigator.hardwareConcurrency || 2;
+    // Reserve 2 cores for UI/FFmpeg; always allow at least 1 worker.
+    const maxFromCores = Math.max(1, hw - 2);
+
+    const reportedMemoryGB = (typeof navigator.deviceMemory === 'number') ? navigator.deviceMemory : null;
+
+    let maxFromMemory = maxFromCores; // default: memory constraint not tighter than cores
+    if (reportedMemoryGB !== null && reportedMemoryGB < 8) {
+        const deviceMemoryMB = reportedMemoryGB * 1024;
+        // Use up to 65 % of available RAM; subtract a fixed overhead for the
+        // browser runtime, main thread, and FFmpeg (~300 MB).
+        const availableForWorkersMB = Math.max(0, deviceMemoryMB * 0.65 - 300);
+        maxFromMemory = Math.max(1, Math.floor(availableForWorkersMB / 80));
+    }
+
+    const auto = Math.min(maxFromCores, maxFromMemory);
+    return { auto, max: maxFromCores, cores: hw, memoryGB: reportedMemoryGB };
+}
+
 // Semaphore used to cap the number of concurrently in-flight frame renders
 // so that the worker pool and main-thread memory usage stay bounded.
 class Semaphore {
@@ -153,11 +194,8 @@ class Semaphore {
 // can be processed in parallel, fully utilising all available CPU cores.
 // Pixel data is transferred as zero-copy ArrayBuffer Transferables.
 class LineArtProcessor {
-    constructor() {
-        // Spawn between 1 and 4 workers, reserving one logical core for the
-        // main thread / UI / FFmpeg encoder.
-        const hw = navigator.hardwareConcurrency || 2;
-        this._concurrency = Math.max(1, Math.min(4, hw - 1));
+    constructor(concurrency) {
+        this._concurrency = Math.max(1, concurrency || 1);
 
         this._pending = new Map();
         this._idCounter = 0;
@@ -170,7 +208,7 @@ class LineArtProcessor {
         // Queue of resolve-fns waiting for a free worker index.
         this._waitQueue = [];
 
-        console.log(`[Main] Spawning ${this._concurrency} worker(s) (${hw} logical cores detected)`);
+        console.log(`[Main] Spawning ${this._concurrency} worker(s)`);
 
         this._workers = Array.from({ length: this._concurrency }, (_, i) =>
             this._spawnWorker(i)
@@ -290,6 +328,23 @@ class LineArtProcessor {
         // completes; idle workers are already in _freePool.
     }
 
+    // Hard-stop all workers and clear all internal state.  Call before
+    // recreating the pool with a different concurrency level.
+    terminate() {
+        if (this._initTimeout) {
+            clearTimeout(this._initTimeout);
+            this._initTimeout = null;
+        }
+        for (const [, { reject }] of this._pending) {
+            reject(new Error('Render cancelled.'));
+        }
+        this._pending.clear();
+        this._waitQueue.splice(0).forEach((resolve) => resolve(-1));
+        this._freePool = [];
+        this._workers.forEach((w) => w.terminate());
+        this._workers = [];
+    }
+
     // Returns Promise<Uint8ClampedArray> — the raw RGBA output without writing
     // to any canvas.  Pixels are extracted from sourceCanvas synchronously
     // (before the first await), so the caller may safely overwrite sourceCanvas
@@ -330,7 +385,8 @@ class LineArtProcessor {
     }
 }
 
-const processor = new LineArtProcessor();
+const workerConfig = computeOptimalWorkers();
+let processor = new LineArtProcessor(workerConfig.auto);
 
 function setBusy(isBusy) {
     state.processing = isBusy;
@@ -345,6 +401,7 @@ function refreshActions() {
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.fileInput.disabled = notReady;
+    elements.workerThreadsInput.disabled = notReady;
     elements.dropZone.classList.toggle('is-loading', !state.cvReady);
 }
 
@@ -1085,6 +1142,45 @@ function resetWorkspace() {
     updateUnloadProtection();
 }
 
+// Update the hint text below the worker threads slider.
+// currentWorkers — the value the slider is currently set to.
+function updateWorkerThreadsHint(currentWorkers) {
+    const { auto, cores, memoryGB } = workerConfig;
+    const memStr = memoryGB !== null ? `${memoryGB} GB RAM` : 'RAM unknown';
+    const baseInfo = `Auto: ${auto} (${cores} cores, ${memStr})`;
+
+    if (currentWorkers > auto) {
+        elements.workerThreadsHint.textContent = `${baseInfo} — ⚠ above recommended, may cause memory pressure`;
+        elements.workerThreadsHint.dataset.tone = 'warn';
+    } else {
+        elements.workerThreadsHint.textContent = baseInfo;
+        delete elements.workerThreadsHint.dataset.tone;
+    }
+}
+
+// Tear down the current processor pool and replace it with a new one of
+// the requested size.  The UI is temporarily locked while workers reload.
+function rebuildProcessor(n) {
+    processor.terminate();
+    state.cvReady = false;
+    processor = new LineArtProcessor(n);
+    refreshActions();
+    updateWorkerThreadsHint(n);
+}
+
+// Initialise the worker-threads slider with the auto-detected safe values.
+function initWorkerThreadsControl() {
+    const { auto, max } = workerConfig;
+    // Slider ceiling: core-based max (always reserves 2 cores for UI/FFmpeg).
+    // Users who want more can increase beyond the memory-safe auto value and
+    // will see an ⚠ warning; the slider still won't allow starving the UI.
+    elements.workerThreadsInput.max = max;
+    elements.workerThreadsMax.textContent = max;
+    elements.workerThreadsInput.value = auto;
+    elements.workerThreadsVal.textContent = auto;
+    updateWorkerThreadsHint(auto);
+}
+
 async function onPreviewClick() {
     if (!state.selectedFile || state.processing) {
         return;
@@ -1317,5 +1413,21 @@ function attachHexInput(hexInputId, colorPickerId) {
 attachHexInput('customBgHex', 'customBg');
 attachHexInput('customInkHex', 'customInk');
 
+// Worker threads slider — update label and hint in real time (input); rebuild
+// the pool only when the user commits a value (change) to avoid spawning many
+// short-lived pools while dragging.
+elements.workerThreadsInput.addEventListener('input', () => {
+    const n = Number(elements.workerThreadsInput.value);
+    elements.workerThreadsVal.textContent = n;
+    updateWorkerThreadsHint(n);
+});
+
+elements.workerThreadsInput.addEventListener('change', () => {
+    if (state.processing) return;
+    const n = Number(elements.workerThreadsInput.value);
+    rebuildProcessor(n);
+});
+
 attachDropZone();
+initWorkerThreadsControl();
 resetWorkspace();
