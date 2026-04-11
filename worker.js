@@ -159,18 +159,47 @@ class WorkerProcessor {
         cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
         closeKernel.delete();
 
-        // Optional: morphological opening with a cross-shaped kernel removes isolated
-        // edge fragments (single pixels, tiny specks from skin pores, fabric grain,
-        // etc.).  Only enabled in Custom/Experiment mode via the "Clean speckles"
-        // checkbox because the cross erosion can destroy thin continuous Canny edges
-        // that are essential for subject visibility in standard modes.
-        // Intensity controls the kernel size: 1 → 3×3, 2 → 5×5, 3 → 7×7.
+        // Optional: connected-component dot removal — removes isolated edge fragments
+        // (single pixels, tiny specks from skin pores, fabric grain, etc.) without
+        // harming thin continuous Canny edges.  Only enabled in Custom/Experiment mode.
+        //
+        // Why connected components instead of morphological OPEN?
+        // Morphological OPEN with a cross-shaped kernel erodes in 4 directions, which
+        // destroys thin diagonal lines along with the dots it targets.  Connected
+        // component analysis works differently: it labels every contiguous group of
+        // white pixels, then discards only the groups whose total pixel count falls
+        // below a minimum area threshold.  A continuous line — however thin — always
+        // accumulates enough pixels to survive; an isolated dot or tiny speckle does
+        // not.  The result is a strictly cleaner removal of dot-art artefacts with no
+        // collateral loss of subject lines.
+        //
+        // Intensity → minimum component area (pixel count):
+        //   1 (fine)   →  4 px  — removes single pixels and 2–3-pixel blobs
+        //   2 (medium) → 12 px  — removes clusters up to roughly 3 × 4 pixels
+        //   3 (coarse) → 30 px  — removes larger speckle patches
         if (settings.cleanSpeckles) {
             const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
-            const openSize = 1 + speckleIntensity * 2;
-            const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(openSize, openSize));
-            cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
-            openKernel.delete();
+            const minArea = [4, 12, 30][speckleIntensity - 1];
+            const labels = new cv.Mat();
+            const stats = new cv.Mat();
+            const centroids = new cv.Mat();
+            const numLabels = cv.connectedComponentsWithStats(
+                this.edges, labels, stats, centroids, 8, cv.CV_32S
+            );
+            const statsData = stats.data32S;
+            const labelsData = labels.data32S;
+            const edgeData = this.edges.data;
+            // CC_STAT_AREA is the 5th column (index 4) in the stats matrix.
+            // Label 0 is the background; skip it.
+            for (let i = 0, len = labelsData.length; i < len; i++) {
+                const label = labelsData[i];
+                if (label !== 0 && statsData[label * 5 + 4] < minArea) {
+                    edgeData[i] = 0;
+                }
+            }
+            labels.delete();
+            stats.delete();
+            centroids.delete();
         }
 
         // Optional: Merge double-edges — bridges the closely-spaced parallel edges
