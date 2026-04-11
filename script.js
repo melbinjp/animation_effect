@@ -1182,7 +1182,14 @@ async function renderVideoExport() {
         // each frame can only start decoding once the previous frame releases its
         // decode slot (which happens at the end of its seek, already offset).
         // -------------------------------------------------------------------------------
-        const FRAME_STAGGER_MS = 30; // ms between consecutive frame decode starts in the first batch
+        // Target gap (ms) between consecutive frame decode starts in the first batch.
+        // Value chosen to be roughly half the minimum expected GPU frame-processing
+        // time (~50 ms on desktop) — large enough to break lock-step synchronisation
+        // across workers while small enough to keep the pipeline full with no GPU
+        // idle time between frames.  On slower devices (CPU fallback, mobile) the
+        // per-frame processing time is much longer (200–2000 ms), so a 30 ms stagger
+        // is well within budget and still effective.
+        const FRAME_STAGGER_MS = 30;
         const decodePoolSize = processor.concurrency;
         const decodePool = new VideoDecodePool(decodePoolSize, video);
         state.activeDecodePool = decodePool;
@@ -1217,6 +1224,9 @@ async function renderVideoExport() {
                 // because they only get a decode slot when a previous frame
                 // releases one (at the end of its own seek, which is already offset).
                 if (capturedFi > 0 && capturedFi < decodePoolSize) {
+                    // Check cancellation before committing to the delay so the render
+                    // responds immediately without waiting up to (N-1)*FRAME_STAGGER_MS.
+                    throwIfCancelled();
                     await new Promise(resolve => setTimeout(resolve, capturedFi * FRAME_STAGGER_MS));
                     throwIfCancelled();
                 }
