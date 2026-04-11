@@ -735,7 +735,7 @@ function requestCancel() {
     state.pauseRequested = false;
     elements.pauseBtn.textContent = 'Pause';
     console.log('Cancel requested. Finishing the current step...', 'warn');
-    setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
+    setProgress(getCurrentProgress(), 'Stopping current job...');
 
     processor.reset();
     // Do NOT call ffmpeg.terminate() here — terminating the FFmpeg worker
@@ -753,11 +753,16 @@ function throwIfCancelled() {
 }
 
 // Suspend the caller until the user resumes (or cancels).
-// Polls every 200 ms to keep CPU use negligible while paused.
+// Polls every PAUSE_POLL_INTERVAL_MS to keep CPU use negligible while paused.
+const PAUSE_POLL_INTERVAL_MS = 200;
 async function waitIfPaused() {
     while (state.pauseRequested && !state.cancelRequested) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await new Promise((resolve) => setTimeout(resolve, PAUSE_POLL_INTERVAL_MS));
     }
+}
+
+function getCurrentProgress() {
+    return Number(elements.progressPercent.textContent.replace('%', '')) || 0;
 }
 
 async function safeDeleteFile(ffmpeg, filePath) {
@@ -1243,14 +1248,14 @@ function onPauseClick() {
     if (state.pauseRequested) {
         elements.pauseBtn.textContent = 'Resume';
         setProgress(
-            Number(elements.progressPercent.textContent.replace('%', '')) || 0,
+            getCurrentProgress(),
             'Paused — click Resume to continue...'
         );
         console.log('Render paused. Click Resume to continue.', 'warn');
     } else {
         elements.pauseBtn.textContent = 'Pause';
         setProgress(
-            Number(elements.progressPercent.textContent.replace('%', '')) || 0,
+            getCurrentProgress(),
             'Resuming render...'
         );
         console.log('Render resumed.', 'info');
