@@ -822,7 +822,7 @@ class CpuProcessor {
 
 async function initGpu() {
     if (!self.navigator?.gpu) throw new Error('WebGPU not available in this context');
-    const adapter = await self.navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    const adapter = await self.navigator.gpu.requestAdapter();
     if (!adapter) throw new Error('No WebGPU adapter found');
     const device = await adapter.requestDevice();
 
