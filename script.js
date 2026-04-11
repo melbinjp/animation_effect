@@ -1169,7 +1169,27 @@ async function renderVideoExport() {
         //
         // Pool size = worker count: this keeps exactly as many frames in flight
         // as there are CPU workers, so the worker pipeline never starves.
+        //
+        // STAGGER: all frame promises are created synchronously in the loop below,
+        // which means the first N frames all acquire decode slots simultaneously and
+        // start seeking at the same millisecond.  Because video seeks take a similar
+        // amount of wall-clock time they also finish together, causing every worker
+        // to submit GPU/CPU compute work at exactly the same instant — producing
+        // the spike-and-dip pattern visible in task-manager graphs.  A small per-
+        // frame delay (FRAME_STAGGER_MS) applied to frames 1…N-1 in the first batch
+        // offsets their decode start times so workers receive frames at staggered
+        // times.  The offset naturally propagates to all subsequent batches because
+        // each frame can only start decoding once the previous frame releases its
+        // decode slot (which happens at the end of its seek, already offset).
         // -------------------------------------------------------------------------------
+        // Target gap (ms) between consecutive frame decode starts in the first batch.
+        // Value chosen to be roughly half the minimum expected GPU frame-processing
+        // time (~50 ms on desktop) — large enough to break lock-step synchronisation
+        // across workers while small enough to keep the pipeline full with no GPU
+        // idle time between frames.  On slower devices (CPU fallback, mobile) the
+        // per-frame processing time is much longer (200–2000 ms), so a 30 ms stagger
+        // is well within budget and still effective.
+        const FRAME_STAGGER_MS = 30;
         const decodePoolSize = processor.concurrency;
         const decodePool = new VideoDecodePool(decodePoolSize, video);
         state.activeDecodePool = decodePool;
@@ -1196,6 +1216,21 @@ async function renderVideoExport() {
             // a video element and a worker slot happens inside the promise so that
             // multiple frames can be at different stages concurrently.
             const p = (async () => {
+                // Stagger the first batch of frames so workers start decoding at
+                // offset times rather than all simultaneously.  Frame 0 starts
+                // immediately; each subsequent frame in the first batch waits an
+                // additional FRAME_STAGGER_MS before acquiring its decode slot.
+                // Frames beyond the first batch are already naturally staggered
+                // because they only get a decode slot when a previous frame
+                // releases one (at the end of its own seek, which is already offset).
+                if (capturedFi > 0 && capturedFi < decodePoolSize) {
+                    // Check cancellation before committing to the delay so the render
+                    // responds immediately without waiting up to (N-1)*FRAME_STAGGER_MS.
+                    throwIfCancelled();
+                    await new Promise(resolve => setTimeout(resolve, capturedFi * FRAME_STAGGER_MS));
+                    throwIfCancelled();
+                }
+
                 // Phase 1: acquire a video element, seek, draw to a private
                 // canvas, then immediately release back to the pool.
                 // A try/finally guarantees release even if seek or cancel throws.
