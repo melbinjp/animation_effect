@@ -190,10 +190,14 @@ class WorkerProcessor {
             const labelsData = labels.data32S;
             const edgeData = this.edges.data;
             // CC_STAT_AREA is the 5th column (index 4) in the stats matrix.
+            // Each row in the stats matrix has CC_STATS_COLS = 5 entries:
+            // [left, top, width, height, area].
             // Label 0 is the background; skip it.
+            const CC_STATS_COLS = 5;
+            const CC_STAT_AREA = 4;
             for (let i = 0, len = labelsData.length; i < len; i++) {
                 const label = labelsData[i];
-                if (label !== 0 && statsData[label * 5 + 4] < minArea) {
+                if (label !== 0 && statsData[label * CC_STATS_COLS + CC_STAT_AREA] < minArea) {
                     edgeData[i] = 0;
                 }
             }
