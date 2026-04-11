@@ -216,6 +216,16 @@
                     </div>
                 </div>
 
+                <div class="control-group" id="workerThreadsGroup">
+                    <label for="workerThreads">Worker threads <span id="workerThreadsVal">…</span></label>
+                    <input type="range" id="workerThreads" min="1" max="16" value="1">
+                    <div class="range-scale">
+                        <span>1</span>
+                        <span id="workerThreadsMax">16</span>
+                    </div>
+                    <p class="control-hint" id="workerThreadsHint" aria-live="polite"></p>
+                </div>
+
                 <div class="advisory-card" id="advisoryCard" data-tone="info">
                     <p class="status-label">Render advisory</p>
                     <p id="advisoryText">Select a file to estimate browser workload.</p>
