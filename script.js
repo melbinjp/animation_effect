@@ -1,6 +1,7 @@
 const elements = {
     fileInput: document.getElementById('fileInput'),
     cancelBtn: document.getElementById('cancelBtn'),
+    pauseBtn: document.getElementById('pauseBtn'),
     advisoryCard: document.getElementById('advisoryCard'),
     advisoryText: document.getElementById('advisoryText'),
     progressCard: document.getElementById('progressCard'),
@@ -116,6 +117,7 @@ const state = {
     outputUrl: '',
     processing: false,
     cancelRequested: false,
+    pauseRequested: false,
     activeJobId: '',
     beforeUnloadAttached: false
 };
@@ -362,7 +364,12 @@ class LineArtProcessor {
             throw new Error('Render cancelled.');
         }
 
-        return new Promise((resolve, reject) => {
+        // `await` the inner promise so V8 attaches a rejection handler to it
+        // before any microtask checkpoint.  Without `await`, returning a bare
+        // Promise from an async function can trigger spurious "Unhandled
+        // promise rejection" reports in Chrome/V8 when reset() rejects the
+        // entry while the microtask queue is being drained.
+        return await new Promise((resolve, reject) => {
             this._pending.set(id, { resolve, reject });
             // Transfer the pixel buffer zero-copy to the chosen worker.
             this._workers[workerIndex].postMessage(
@@ -388,10 +395,17 @@ class LineArtProcessor {
 const workerConfig = computeOptimalWorkers();
 let processor = new LineArtProcessor(workerConfig.auto);
 
-function setBusy(isBusy) {
+function setBusy(isBusy, isVideo = false) {
     state.processing = isBusy;
     elements.cancelBtn.hidden = !isBusy;
     elements.cancelBtn.disabled = !isBusy;
+    // Pause is only meaningful during video renders (has a multi-frame loop).
+    elements.pauseBtn.hidden = !(isBusy && isVideo);
+    elements.pauseBtn.disabled = !isBusy;
+    if (!isBusy) {
+        state.pauseRequested = false;
+        elements.pauseBtn.textContent = 'Pause';
+    }
     refreshActions();
 }
 
@@ -718,21 +732,31 @@ function requestCancel() {
     }
 
     state.cancelRequested = true;
+    state.pauseRequested = false;
+    elements.pauseBtn.textContent = 'Pause';
     console.log('Cancel requested. Finishing the current step...', 'warn');
     setProgress(Number(elements.progressPercent.textContent.replace('%', '')) || 0, 'Stopping current job...');
 
     processor.reset();
-
-    if (state.ffmpeg) {
-        state.ffmpeg.terminate();
-        state.ffmpeg = null;
-        state.ffmpegReady = false;
-    }
+    // Do NOT call ffmpeg.terminate() here — terminating the FFmpeg worker
+    // while operations are in-flight causes unhandled promise rejections
+    // inside ffmpeg.js that cannot be caught from user code.  Instead we
+    // rely on throwIfCancelled() checks in the render loop to abort before
+    // the encode step starts, and let any already-started writeFile calls
+    // finish gracefully so the FFmpeg instance stays healthy for the next render.
 }
 
 function throwIfCancelled() {
     if (state.cancelRequested) {
         throw new Error('Render cancelled.');
+    }
+}
+
+// Suspend the caller until the user resumes (or cancels).
+// Polls every 200 ms to keep CPU use negligible while paused.
+async function waitIfPaused() {
+    while (state.pauseRequested && !state.cancelRequested) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
     }
 }
 
@@ -965,6 +989,11 @@ async function renderVideoExport() {
             await sem.acquire();
             throwIfCancelled();
 
+            // Honour pause — suspend before touching the video element so
+            // the current source frame stays stable on screen.
+            await waitIfPaused();
+            throwIfCancelled();
+
             // Subtract 1 ms from the video duration cap to avoid seeking past the
             // last decodable frame, which some browsers report as a seek error.
             const frameTime = Math.min(video.duration - 0.001, fi / fps);
@@ -1006,6 +1035,11 @@ async function renderVideoExport() {
                             await (await canvasToBlob(tmpCanvas, 'image/png')).arrayBuffer()
                         );
                     }
+
+                    // Skip the write if the render was cancelled while we were
+                    // encoding the PNG above — avoids writing partial frames to
+                    // the FFmpeg FS and keeps the instance clean for reuse.
+                    throwIfCancelled();
 
                     const frameName = `${jobId}/frame-${String(capturedFi).padStart(5, '0')}.png`;
                     await ffmpeg.writeFile(frameName, pngBytes);
@@ -1200,6 +1234,29 @@ async function onPreviewClick() {
     }
 }
 
+function onPauseClick() {
+    if (!state.processing) {
+        return;
+    }
+
+    state.pauseRequested = !state.pauseRequested;
+    if (state.pauseRequested) {
+        elements.pauseBtn.textContent = 'Resume';
+        setProgress(
+            Number(elements.progressPercent.textContent.replace('%', '')) || 0,
+            'Paused — click Resume to continue...'
+        );
+        console.log('Render paused. Click Resume to continue.', 'warn');
+    } else {
+        elements.pauseBtn.textContent = 'Pause';
+        setProgress(
+            Number(elements.progressPercent.textContent.replace('%', '')) || 0,
+            'Resuming render...'
+        );
+        console.log('Render resumed.', 'info');
+    }
+}
+
 async function onRenderClick() {
     if (!state.selectedFile || state.processing) {
         return;
@@ -1217,6 +1274,7 @@ async function onRenderClick() {
         }
 
         if (state.fileKind === 'video') {
+            setBusy(true, true); // show pause button for video renders
             await renderVideoExport();
             return;
         }
@@ -1263,6 +1321,7 @@ elements.fileInput.addEventListener('change', async (event) => {
 elements.previewBtn.addEventListener('click', onPreviewClick);
 elements.renderBtn.addEventListener('click', onRenderClick);
 elements.cancelBtn.addEventListener('click', requestCancel);
+elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 
 ['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
