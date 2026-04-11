@@ -1304,6 +1304,11 @@ async function renderVideoExport() {
             // for line art), improving both compression ratio and encode speed.
             '-preset', 'ultrafast',
             '-tune', 'animation',
+            // libx264 with yuv420p requires both width and height to be even.
+            // scale=trunc(iw/2)*2:trunc(ih/2)*2 rounds each dimension down to the
+            // nearest even number, preventing "width/height not divisible by 2" errors
+            // that occur when Math.round() produces odd-numbered scaled dimensions.
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
             '-shortest',
@@ -1314,7 +1319,25 @@ async function renderVideoExport() {
             outputPath
         ];
 
-        await ffmpeg.exec(encodeArgs);
+        // Collect all FFmpeg log lines during encoding so that if the process
+        // fails we can surface a meaningful error message instead of just
+        // reporting an empty output file.
+        const encodeLog = [];
+        const encodeLogHandler = ({ message }) => { encodeLog.push(message); };
+        ffmpeg.on('log', encodeLogHandler);
+        let encodeExitCode;
+        try {
+            encodeExitCode = await ffmpeg.exec(encodeArgs);
+        } finally {
+            ffmpeg.off('log', encodeLogHandler);
+        }
+
+        if (encodeExitCode !== 0) {
+            const logSummary = encodeLog.slice(-30).join('\n');
+            throw new Error(
+                `FFmpeg encoding failed (exit code ${encodeExitCode}).\n${logSummary}`
+            );
+        }
 
         throwIfCancelled();
         const outputData = await ffmpeg.readFile(outputPath);
