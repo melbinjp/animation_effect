@@ -231,6 +231,9 @@ class LineArtProcessor {
     get concurrency() { return this._concurrency; }
 
     _spawnWorker(index) {
+        // gpu-worker.js tries WebGPU first and transparently falls back to the
+        // OpenCV CPU pipeline when WebGPU is unavailable, so no branch is needed
+        // here.  Replace with 'worker.js' to force CPU-only processing.
         const worker = new Worker('gpu-worker.js');
 
         worker.onmessage = (event) => {

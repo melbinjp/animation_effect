@@ -379,32 +379,38 @@ class GpuProcessor {
         if (this._bufs) Object.values(this._bufs).forEach(b => b.destroy());
         this._width  = width;
         this._height = height;
-        const n4 = width * height * 4; // bytes: one f32 or u32 per pixel
-        const S  = GPUBufferUsage.STORAGE;
-        const CD = GPUBufferUsage.COPY_DST;
-        const CS = GPUBufferUsage.COPY_SRC;
+        const n4      = width * height * 4; // bytes: one f32 or u32 per pixel
+        const STORAGE = GPUBufferUsage.STORAGE;
+        const COPY_DST= GPUBufferUsage.COPY_DST;
+        const COPY_SRC= GPUBufferUsage.COPY_SRC;
         const mk = (usage) => this._device.createBuffer({ size: n4, usage });
         this._bufs = {
-            rgbaIn    : mk(S | CD),  // input  RGBA u8 (packed as u32)
-            gray      : mk(S),       // greyscale f32 after RGBA→grey conversion
-            smooth1   : mk(S),       // ping-pong smoothing buffer A
-            smooth2   : mk(S),       // ping-pong smoothing buffer B
-            magnitude : mk(S),       // Sobel L1 magnitude f32
-            direction : mk(S),       // quantised gradient direction u32
-            suppressed: mk(S),       // after NMS f32
-            edgesA    : mk(S),       // Canny edge state u32 (0/1/2)
-            edgesB    : mk(S),       // hysteresis ping-pong partner
-            maskA     : mk(S),       // binary mask u32 (0/255)
-            maskB     : mk(S),       // morph ping-pong partner
-            rgbaOut   : mk(S | CS),  // output RGBA u8 (packed as u32)
+            rgbaIn    : mk(STORAGE | COPY_DST),  // input  RGBA u8 (packed as u32)
+            gray      : mk(STORAGE),             // greyscale f32 after RGBA→grey conversion
+            smooth1   : mk(STORAGE),             // ping-pong smoothing buffer A
+            smooth2   : mk(STORAGE),             // ping-pong smoothing buffer B
+            magnitude : mk(STORAGE),             // Sobel L1 magnitude f32
+            direction : mk(STORAGE),             // quantised gradient direction u32
+            suppressed: mk(STORAGE),             // after NMS f32
+            edgesA    : mk(STORAGE),             // Canny edge state u32 (0/1/2)
+            edgesB    : mk(STORAGE),             // hysteresis ping-pong partner
+            maskA     : mk(STORAGE),             // binary mask u32 (0/255)
+            maskB     : mk(STORAGE),             // morph ping-pong partner
+            rgbaOut   : mk(STORAGE | COPY_SRC),  // output RGBA u8 (packed as u32)
         };
     }
 
     // Create a small uniform buffer from a typed field descriptor array.
     // Each entry is { type: 'u32'|'f32', value: number }.
-    // The buffer is padded to the minimum WebGPU uniform size (16 bytes).
+    // Only 4-byte scalar types (u32, f32) are supported; all fields are written
+    // at stride 4 bytes which matches the WGSL struct layout for these types.
+    // The buffer is padded to UNIFORM_MIN_BINDING_SIZE per the WebGPU spec.
     _mkUniform(fields) {
-        const size = Math.max(16, Math.ceil(fields.length * 4 / 16) * 16);
+        const UNIFORM_MIN_BINDING_SIZE = 16; // bytes, per WebGPU spec §6.4
+        const size = Math.max(
+            UNIFORM_MIN_BINDING_SIZE,
+            Math.ceil(fields.length * 4 / UNIFORM_MIN_BINDING_SIZE) * UNIFORM_MIN_BINDING_SIZE,
+        );
         const buf  = this._device.createBuffer({
             size,
             usage          : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
