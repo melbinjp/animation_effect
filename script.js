@@ -124,7 +124,12 @@ const state = {
     beforeUnloadAttached: false,
     mediaWidth: null,
     mediaHeight: null,
-    activeDecodePool: null
+    activeDecodePool: null,
+    // Progress-bar mapping for FFmpeg 'progress' events.  renderVideoExport
+    // updates these before each ffmpeg.exec() call so the bar moves in the
+    // correct sub-range (encoding vs. final concat/mux).
+    encodePhaseOffset: 90,
+    encodePhaseScale: 0.1
 };
 
 const PRODUCTION_LIMITS = {
@@ -876,26 +881,28 @@ async function safeDeleteFile(ffmpeg, filePath) {
     }
 }
 
-async function cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath) {
+async function cleanupFfmpegJob(ffmpeg, jobId, segCount, inputPath, outputPath) {
     if (!ffmpeg || !jobId) {
         return;
     }
 
-    // Delete all frame files in parallel — they are independent and the
-    // in-memory FFmpeg FS handles concurrent deletes safely.
-    const frameDeletions = Array.from({ length: totalFrames }, (_, i) =>
-        safeDeleteFile(ffmpeg, `${jobId}/frame-${String(i).padStart(5, '0')}.png`)
-    );
-    await Promise.all(frameDeletions);
-
-    await safeDeleteFile(ffmpeg, inputPath);
-    await safeDeleteFile(ffmpeg, outputPath);
+    // Delete per-segment MP4 files and the concat list written by the parallel
+    // encode path.  safeDeleteFile silently ignores files that do not exist, so
+    // this is safe whether parallel encoding ran or not.
+    const fileDels = [];
+    for (let s = 0; s < segCount; s++) {
+        fileDels.push(safeDeleteFile(ffmpeg, `${jobId}/seg${s}.mp4`));
+    }
+    if (segCount > 1) {
+        fileDels.push(safeDeleteFile(ffmpeg, `${jobId}/concat.txt`));
+    }
+    fileDels.push(safeDeleteFile(ffmpeg, inputPath));
+    fileDels.push(safeDeleteFile(ffmpeg, outputPath));
+    await Promise.all(fileDels);
 
     try {
         await ffmpeg.deleteDir(jobId);
-    } catch (error) {
-        return;
-    }
+    } catch (_) {}
 }
 
 function getFFmpegClass() {
@@ -922,9 +929,9 @@ async function loadFFmpeg() {
         });
         state.ffmpeg.on('progress', ({ progress }) => {
             if (typeof progress === 'number') {
-                const percent = Math.min(100, Math.max(0, Math.round(progress * 100)));
-                console.log(`Encoding video... ${percent}%`, 'info');
-                setProgress(92 + Math.round(percent * 0.08), 'Encoding final MP4...');
+                const pct = Math.min(100, Math.max(0, Math.round(progress * 100)));
+                const mapped = state.encodePhaseOffset + Math.round(pct * state.encodePhaseScale);
+                setProgress(mapped, 'Encoding...');
             }
         });
     }
@@ -1110,6 +1117,88 @@ async function renderImageExport() {
     setDownload(blob, fileName);
     setProgress(100, 'PNG export ready.');
     console.log('Image render complete. Download your PNG.', 'success');
+}
+
+// ── BMP encoder ──────────────────────────────────────────────────────────────
+// Encode a Uint8ClampedArray of RGBA pixels to an uncompressed 24-bit BMP.
+// BMP has zero deflate overhead, making it ~100× faster to produce than PNG
+// for the intermediate frame files.  FFmpeg reads BMP natively.
+// A negative biHeight in the header signals top-down row order so we never
+// need to flip rows before writing.
+function rgbaToBmp(rgba, width, height) {
+    const rowBytes = Math.ceil(width * 3 / 4) * 4; // rows padded to 4 bytes
+    const pixelBytes = rowBytes * height;
+    const fileSize = 54 + pixelBytes;
+    const buf = new Uint8Array(fileSize);
+    const v = new DataView(buf.buffer);
+    // BITMAPFILEHEADER
+    buf[0] = 0x42; buf[1] = 0x4D;         // 'BM'
+    v.setUint32(2,  fileSize,      true);  // bfSize
+    v.setUint32(6,  0,             true);  // bfReserved
+    v.setUint32(10, 54,            true);  // bfOffBits
+    // BITMAPINFOHEADER
+    v.setUint32(14, 40,            true);  // biSize
+    v.setInt32 (18, width,         true);  // biWidth
+    v.setInt32 (22, -height,       true);  // biHeight (negative = top-down)
+    v.setUint16(26, 1,             true);  // biPlanes
+    v.setUint16(28, 24,            true);  // biBitCount
+    v.setUint32(30, 0,             true);  // biCompression (BI_RGB)
+    v.setUint32(34, pixelBytes,    true);  // biSizeImage
+    v.setUint32(38, 2835,          true);  // biXPelsPerMeter (~72 dpi)
+    v.setUint32(42, 2835,          true);  // biYPelsPerMeter
+    v.setUint32(46, 0,             true);  // biClrUsed
+    v.setUint32(50, 0,             true);  // biClrImportant
+    // Pixel data: RGBA → BGR, row by row (top-to-bottom matches negative biHeight)
+    for (let y = 0; y < height; y++) {
+        const rowBase = 54 + y * rowBytes;
+        const srcBase = y * width * 4;
+        for (let x = 0; x < width; x++) {
+            const s = srcBase + x * 4;
+            const d = rowBase + x * 3;
+            buf[d]     = rgba[s + 2]; // B
+            buf[d + 1] = rgba[s + 1]; // G
+            buf[d + 2] = rgba[s];     // R
+        }
+    }
+    return buf;
+}
+
+// Load and return a fresh FFmpeg instance independent of state.ffmpeg.
+// Each instance gets its own WASM heap, allowing true parallel encoding.
+// The WASM binary is cached by the browser after the first load, so subsequent
+// calls are fast (compile from cache, ~100–300 ms) rather than a full download.
+async function createFreshFFmpeg() {
+    const FFmpegClass = getFFmpegClass();
+    if (typeof FFmpegClass !== 'function') {
+        throw new Error('FFmpeg runtime was not found in vendor/ffmpeg.js.');
+    }
+    const inst = new FFmpegClass();
+    const getAssetUrl = (path) => new URL(path, window.location.href).href;
+    await inst.load({
+        coreURL: getAssetUrl('vendor/ffmpeg-core.js'),
+        wasmURL: getAssetUrl('vendor/ffmpeg-core.wasm'),
+    });
+    return inst;
+}
+
+// Determine how many parallel FFmpeg encode workers to use.
+// Each worker encodes a separate segment of the video, so N workers gives
+// roughly N× speedup on the final encode step.
+//   • Require at least MIN_FRAMES_PER_SEGMENT frames per segment to avoid
+//     header/concat overhead swamping the actual encode work.
+//   • Cap at MAX_ENCODE_WORKERS to stay within browser memory budget
+//     (~250 MB per FFmpeg WASM instance).
+//   • Respect navigator.deviceMemory: leave at least 1 GB for the rest of
+//     the page, budget 250 MB per extra FFmpeg instance.
+const MIN_FRAMES_PER_SEGMENT = 60;
+const MAX_ENCODE_WORKERS = 4;
+function computeEncodeWorkers(totalFrames) {
+    if (totalFrames < MIN_FRAMES_PER_SEGMENT) return 1;
+    const mem = (typeof navigator.deviceMemory === 'number') ? navigator.deviceMemory : 4;
+    const maxByMem  = Math.max(1, Math.floor((mem * 1024 - 1024) / 250));
+    const maxByCores = Math.max(1, (navigator.hardwareConcurrency || 2) - 1);
+    const maxByFrames = Math.floor(totalFrames / MIN_FRAMES_PER_SEGMENT);
+    return Math.min(MAX_ENCODE_WORKERS, maxByMem, maxByCores, maxByFrames);
 }
 
 async function renderVideoExport() {
