@@ -357,6 +357,14 @@ class GpuProcessor {
         this._height = 0;
         this._bufs   = null;
         this._pl     = {};
+        // Cached uniform buffers — rebuilt only when settings or dimensions change.
+        // Eliminates ~12 GPU buffer alloc/destroy cycles per frame during steady-
+        // state rendering, removing the per-frame GPU memory allocation spikes.
+        this._uniformCache    = null;
+        this._uniformCacheKey = '';
+        // Persistent MAP_READ staging buffer — recreated only on dimension change.
+        // Avoids one GPU allocation + deallocation per frame.
+        this._readBuf = null;
     }
 
     // Compile all WGSL compute pipelines synchronously.
@@ -386,6 +394,9 @@ class GpuProcessor {
     _ensureBuffers(width, height) {
         if (this._width === width && this._height === height) return;
         if (this._bufs) Object.values(this._bufs).forEach(b => b.destroy());
+        // Dimension change invalidates all caches derived from W/H.
+        this._destroyUniformCache();
+        if (this._readBuf) { this._readBuf.destroy(); this._readBuf = null; }
         this._width  = width;
         this._height = height;
         const n4      = width * height * 4; // bytes: one f32 or u32 per pixel
@@ -394,44 +405,125 @@ class GpuProcessor {
         const COPY_SRC= GPUBufferUsage.COPY_SRC;
         const mk = (usage) => this._device.createBuffer({ size: n4, usage });
         this._bufs = {
-            rgbaIn    : mk(STORAGE | COPY_DST),  // input  RGBA u8 (packed as u32)
-            gray      : mk(STORAGE),             // greyscale f32 after RGBA→grey conversion
-            smooth1   : mk(STORAGE),             // ping-pong smoothing buffer A
-            smooth2   : mk(STORAGE),             // ping-pong smoothing buffer B
-            magnitude : mk(STORAGE),             // Sobel L1 magnitude f32
-            direction : mk(STORAGE),             // quantised gradient direction u32
-            suppressed: mk(STORAGE),             // after NMS f32
-            edgesA    : mk(STORAGE),             // Canny edge state u32 (0/1/2)
-            edgesB    : mk(STORAGE),             // hysteresis ping-pong partner
-            maskA     : mk(STORAGE),             // binary mask u32 (0/255)
-            maskB     : mk(STORAGE),             // morph ping-pong partner
-            rgbaOut   : mk(STORAGE | COPY_SRC),  // output RGBA u8 (packed as u32)
+            rgbaIn    : mk(STORAGE | COPY_DST),
+            gray      : mk(STORAGE),
+            smooth1   : mk(STORAGE),
+            smooth2   : mk(STORAGE),
+            magnitude : mk(STORAGE),
+            direction : mk(STORAGE),
+            suppressed: mk(STORAGE),
+            edgesA    : mk(STORAGE),
+            edgesB    : mk(STORAGE),
+            maskA     : mk(STORAGE),
+            maskB     : mk(STORAGE),
+            rgbaOut   : mk(STORAGE | COPY_SRC),
         };
     }
 
     // Create a small uniform buffer from a typed field descriptor array.
-    // Each entry is { type: 'u32'|'f32', value: number }.
-    // Only 4-byte scalar types (u32, f32) are supported; all fields are written
-    // at stride 4 bytes which matches the WGSL struct layout for these types.
-    // The buffer is padded to UNIFORM_MIN_BINDING_SIZE per the WebGPU spec.
     _mkUniform(fields) {
-        const UNIFORM_MIN_BINDING_SIZE = 16; // bytes, per WebGPU spec §6.4
+        const UNIFORM_MIN_BINDING_SIZE = 16;
         const size = Math.max(
             UNIFORM_MIN_BINDING_SIZE,
             Math.ceil(fields.length * 4 / UNIFORM_MIN_BINDING_SIZE) * UNIFORM_MIN_BINDING_SIZE,
         );
-        const buf  = this._device.createBuffer({
+        const buf = this._device.createBuffer({
             size,
-            usage          : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            usage           : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true,
         });
         const view = new DataView(buf.getMappedRange());
         fields.forEach(({ type, value }, i) => {
-            if (type === 'f32') view.setFloat32(i * 4, value, /* little-endian */ true);
+            if (type === 'f32') view.setFloat32(i * 4, value, true);
             else                view.setUint32 (i * 4, value >>> 0, true);
         });
         buf.unmap();
         return buf;
+    }
+
+    // Compact key that captures every setting affecting uniform buffer values.
+    // Same key across frames → cached uniforms are still valid.
+    _computeUniformKey(W, H, settings) {
+        const p = settings.preset;
+        return [
+            W, H, settings.detail,
+            p.lowThreshold, p.highThreshold, p.bilateralDiameter, p.sigma,
+            p.background[0], p.background[1], p.background[2],
+            p.ink[0], p.ink[1], p.ink[2],
+            settings.lineWeight,
+            settings.cleanSpeckles       ? 1 : 0,
+            settings.cleanSpecklesIntensity    || 0,
+            settings.mergeDoubleEdge     ? 1 : 0,
+            settings.mergeDoubleEdgeIntensity  || 0,
+        ].join(':');
+    }
+
+    // Build every GPU uniform buffer needed for the given (W, H, settings).
+    // Returned object is stored in this._uniformCache for reuse.
+    _buildUniformCache(W, H, settings) {
+        const mk = (fields) => this._mkUniform(fields);
+        const detailFactor  = settings.detail / 62;
+        const lowThreshold  = Math.max(12,
+            Math.round(settings.preset.lowThreshold  / detailFactor));
+        const highThreshold = Math.max(lowThreshold + 24,
+            Math.round(settings.preset.highThreshold / detailFactor));
+        const sigma         = Math.max(20,
+            Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
+        const bilRadius     = Math.floor(settings.preset.bilateralDiameter / 2);
+        const refineSigma   = Math.max(15, Math.round(sigma * 0.5));
+        const gpuLow        = lowThreshold  / 255.0;
+        const gpuHigh       = highThreshold / 255.0;
+
+        const mkBilU = (s) => mk([
+            { type: 'u32', value: W },
+            { type: 'u32', value: H },
+            { type: 'u32', value: bilRadius },
+            { type: 'f32', value: -0.5 / (s * s) },
+            { type: 'f32', value: -0.5 / ((s / 255.0) * (s / 255.0)) },
+        ]);
+
+        const bgArr  = settings.preset.background;
+        const inkArr = settings.preset.ink;
+        const bgPx   = ((255 << 24) | (bgArr[2]  << 16) | (bgArr[1]  << 8) | bgArr[0])  >>> 0;
+        const inkPx  = ((255 << 24) | (inkArr[2] << 16) | (inkArr[1] << 8) | inkArr[0]) >>> 0;
+
+        const u = {
+            dims    : mk([{type:'u32',value:W},{type:'u32',value:H}]),
+            bilFull : mkBilU(sigma),
+            bilRef  : mkBilU(refineSigma),
+            g3h : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1},{type:'u32',value:1}]),
+            g3v : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1},{type:'u32',value:0}]),
+            g5h : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:2},{type:'u32',value:1}]),
+            g5v : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:2},{type:'u32',value:0}]),
+            thresh  : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'f32',value:gpuLow},{type:'f32',value:gpuHigh}]),
+            morph1  : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1}]),
+            colorize: mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:inkPx},{type:'u32',value:bgPx}]),
+        };
+
+        // Conditional uniforms — only allocated when the corresponding option is on.
+        if (settings.cleanSpeckles) {
+            const openR = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
+            u.open = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:openR}]);
+        }
+        if (settings.mergeDoubleEdge) {
+            const intensity = Math.max(1, Math.min(5, settings.mergeDoubleEdgeIntensity || 2));
+            const mergeR    = 1 + intensity;
+            u.merge = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:mergeR}]);
+            u.thin  = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1}]);
+        }
+        if (settings.lineWeight > 1) {
+            const lwR = settings.lineWeight - 1;
+            u.lw = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:lwR}]);
+        }
+        return u;
+    }
+
+    _destroyUniformCache() {
+        if (this._uniformCache) {
+            Object.values(this._uniformCache).forEach(b => b.destroy());
+            this._uniformCache    = null;
+            this._uniformCacheKey = '';
+        }
     }
 
     async process(rgbaData, width, height, settings) {
@@ -442,66 +534,30 @@ class GpuProcessor {
         const W  = width;
         const H  = height;
 
-        // Upload RGBA input (Uint8ClampedArray or Uint8Array → GPU buffer).
+        // Upload RGBA input.
         dev.queue.writeBuffer(b.rgbaIn, 0, rgbaData.buffer,
             rgbaData.byteOffset, rgbaData.byteLength);
 
-        // ── Derive processing parameters (mirrors worker.js logic) ────────────
-        const detailFactor  = settings.detail / 62;
-        const lowThreshold  = Math.max(12,
-            Math.round(settings.preset.lowThreshold  / detailFactor));
-        const highThreshold = Math.max(lowThreshold + 24,
-            Math.round(settings.preset.highThreshold / detailFactor));
-        const sigma         = Math.max(20,
-            Math.round(settings.preset.sigma * (0.75 + (settings.detail - 35) / 100)));
-        const bilRadius     = Math.floor(settings.preset.bilateralDiameter / 2);
-        const refineSigma   = Math.max(15, Math.round(sigma * 0.5));
-
-        // Sobel magnitude on normalised [0,1] floats:
-        //   For a step edge 0→1, L1 magnitude ≈ 4.0 (pure H/V) to 8.0 (diagonal).
-        //   OpenCV Canny on uint8 [0,255]: same edge gives L1 ≈ 1020 to 2040.
-        //   Scale factor = 1/255 maps OpenCV thresholds to our float range.
-        const gpuLow  = lowThreshold  / 255.0;
-        const gpuHigh = highThreshold / 255.0;
-
-        // Bilateral uniform builder: spatial sigma stays in pixels; range sigma
-        // is normalised to [0,1] to match the f32 greyscale input.
-        const mkBilU = (s) => this._mkUniform([
-            { type: 'u32', value: W },
-            { type: 'u32', value: H },
-            { type: 'u32', value: bilRadius },
-            { type: 'f32', value: -0.5 / (s * s) },
-            { type: 'f32', value: -0.5 / ((s / 255.0) * (s / 255.0)) },
-        ]);
-
-        // ── Pre-compute all per-frame uniform buffers ──────────────────────────
-        const uDims    = this._mkUniform([{ type:'u32',value:W },{ type:'u32',value:H }]);
-        const uBilFull = mkBilU(sigma);
-        const uBilRef  = mkBilU(refineSigma);
-        // Gaussian radius=1 → 3×3 (light pre-Canny blur, sigma ≈ 1 px)
-        const uG3H = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1},{type:'u32',value:1}]);
-        const uG3V = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1},{type:'u32',value:0}]);
-        // Gaussian radius=2 → 5×5 (custom-mode Gaussian passes, matches OpenCV Size(5,5))
-        const uG5H = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:2},{type:'u32',value:1}]);
-        const uG5V = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:2},{type:'u32',value:0}]);
-        const uThresh  = this._mkUniform([
-            {type:'u32',value:W},{type:'u32',value:H},
-            {type:'f32',value:gpuLow},{type:'f32',value:gpuHigh},
-        ]);
-        const uMorph1 = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1}]);
-
-        // Collect per-frame uniforms for destruction after GPU work completes.
-        const tempU = [uDims, uBilFull, uBilRef, uG3H, uG3V, uG5H, uG5V, uThresh, uMorph1];
+        // ── Uniform buffers: reuse cache if settings haven't changed ───────────
+        // For video rendering every frame shares the same settings, so this
+        // eliminates ~12 GPU buffer alloc/destroy operations per frame.
+        const uKey = this._computeUniformKey(W, H, settings);
+        if (uKey !== this._uniformCacheKey) {
+            this._destroyUniformCache();
+            this._uniformCache    = this._buildUniformCache(W, H, settings);
+            this._uniformCacheKey = uKey;
+        }
+        const u = this._uniformCache;
 
         // ── Helpers ────────────────────────────────────────────────────────────
-
-        // Create a bind group by listing buffers in binding order.
         const mkBg = (pipeline, ...buffers) => dev.createBindGroup({
             layout : pipeline.getBindGroupLayout(0),
             entries: buffers.map((buf, i) => ({ binding: i, resource: { buffer: buf } })),
         });
 
-        // Build the command encoder containing all compute passes for this frame.
+        // Single command encoder covers both compute passes AND the copy-to-staging
+        // pass.  Submitting everything in one call reduces driver round-trips and
+        // allows the GPU to pipeline the copy immediately after compute.
         const enc = dev.createCommandEncoder();
 
         const disp1d = (pipeline, bg) => {
@@ -517,165 +573,114 @@ class GpuProcessor {
             pass.end();
         };
 
-        // Returns the smoothing buffer that is NOT the given one (alternates
-        // smooth1/smooth2).  When cur is b.gray (before any smoothing pass has
-        // run) it also returns smooth1 so the very first write goes to smooth1.
         const getOther = (cur) => (cur === b.smooth1) ? b.smooth2 : b.smooth1;
 
         // ── Step 1: RGBA → greyscale ───────────────────────────────────────────
-        disp1d(pl.rgbaToGray, mkBg(pl.rgbaToGray, b.rgbaIn, b.gray, uDims));
+        disp1d(pl.rgbaToGray, mkBg(pl.rgbaToGray, b.rgbaIn, b.gray, u.dims));
 
         // ── Step 2: Pre-smoothing ──────────────────────────────────────────────
-        // The GPU bilateral operates on single-channel greyscale (vs OpenCV's RGB).
-        // This is equivalent for edge-detection since edges are detected on the
-        // luminance channel that Canny ultimately uses.
-        // CLAHE (darkBoost) is not implemented on the GPU path.
         let curSmooth = b.gray;
         const useBilateral = !settings.customMode || settings.useBilateral;
-
         if (useBilateral) {
             const bilPasses = settings.customMode
                 ? Math.max(1, Math.min(5, settings.bilateralPasses || 2))
                 : (settings.preset.smoothPasses || 2);
-
             for (let p = 0; p < bilPasses; p++) {
-                // Pass 1: full sigma; subsequent passes: refineSigma (mirrors CPU path).
-                const uBil = (p === 0) ? uBilFull : uBilRef;
+                const uBil = (p === 0) ? u.bilFull : u.bilRef;
                 const next = getOther(curSmooth);
                 disp2d(pl.bilateral, mkBg(pl.bilateral, curSmooth, next, uBil));
                 curSmooth = next;
             }
         }
 
-        // Custom-mode 5×5 Gaussian passes (matches cv.GaussianBlur Size(5,5)).
         if (settings.customMode && settings.useGaussian) {
             const gaussPasses = Math.max(1, Math.min(5, settings.gaussianPasses || 1));
             for (let p = 0; p < gaussPasses; p++) {
-                // Separable H then V: writes to other, then back to curSmooth.
                 const other = getOther(curSmooth);
-                disp1d(pl.gaussian, mkBg(pl.gaussian, curSmooth, other,     uG5H));
-                disp1d(pl.gaussian, mkBg(pl.gaussian, other,     curSmooth, uG5V));
-                // curSmooth reference unchanged; its buffer now holds H+V result.
+                disp1d(pl.gaussian, mkBg(pl.gaussian, curSmooth, other,     u.g5h));
+                disp1d(pl.gaussian, mkBg(pl.gaussian, other,     curSmooth, u.g5v));
             }
         }
 
-        // Custom-mode 3×3 median passes (matches cv.medianBlur ksize=3).
         if (settings.customMode && settings.useMedian) {
             const medPasses = Math.max(1, Math.min(3, settings.medianPasses || 1));
             for (let p = 0; p < medPasses; p++) {
                 const other = getOther(curSmooth);
-                disp2d(pl.median3, mkBg(pl.median3, curSmooth, other, uDims));
-                curSmooth = other; // reference must advance after median
+                disp2d(pl.median3, mkBg(pl.median3, curSmooth, other, u.dims));
+                curSmooth = other;
             }
         }
 
-        // ── Step 3: Light 3×3 Gaussian before Canny (matches cv.GaussianBlur 3×3)
+        // ── Step 3: Light 3×3 Gaussian before Canny ───────────────────────────
         {
             const other = getOther(curSmooth);
-            disp1d(pl.gaussian, mkBg(pl.gaussian, curSmooth, other,     uG3H));
-            disp1d(pl.gaussian, mkBg(pl.gaussian, other,     curSmooth, uG3V));
+            disp1d(pl.gaussian, mkBg(pl.gaussian, curSmooth, other,     u.g3h));
+            disp1d(pl.gaussian, mkBg(pl.gaussian, other,     curSmooth, u.g3v));
         }
 
-        // ── Step 4: Sobel gradient ─────────────────────────────────────────────
-        disp2d(pl.sobel, mkBg(pl.sobel, curSmooth, b.magnitude, b.direction, uDims));
+        // ── Steps 4–8: Sobel → NMS → threshold → hysteresis → finalise ────────
+        disp2d(pl.sobel,     mkBg(pl.sobel,     curSmooth,   b.magnitude, b.direction, u.dims));
+        disp2d(pl.nms,       mkBg(pl.nms,       b.magnitude, b.direction, b.suppressed, u.dims));
+        disp1d(pl.threshold, mkBg(pl.threshold, b.suppressed, b.edgesA,   u.thresh));
 
-        // ── Step 5: Non-maximum suppression ───────────────────────────────────
-        disp2d(pl.nms, mkBg(pl.nms, b.magnitude, b.direction, b.suppressed, uDims));
-
-        // ── Step 6: Double threshold ───────────────────────────────────────────
-        disp1d(pl.threshold, mkBg(pl.threshold, b.suppressed, b.edgesA, uThresh));
-
-        // ── Step 7: Canny hysteresis (8 fixed iterations) ─────────────────────
-        // 8 passes (even) means eIn returns to edgesA at the end.
         let eIn = b.edgesA, eOut = b.edgesB;
         for (let i = 0; i < 8; i++) {
-            disp2d(pl.hysteresis, mkBg(pl.hysteresis, eIn, eOut, uDims));
+            disp2d(pl.hysteresis, mkBg(pl.hysteresis, eIn, eOut, u.dims));
             [eIn, eOut] = [eOut, eIn];
         }
-        // eIn = edgesA holds the converged result.
+        disp1d(pl.finalize, mkBg(pl.finalize, eIn, b.maskA, u.dims));
 
-        // ── Step 8: Finalise → binary mask {0,255} ────────────────────────────
-        disp1d(pl.finalize, mkBg(pl.finalize, eIn, b.maskA, uDims));
-
-        // ── Step 9: Morphological close (dilate 3×3 → erode 3×3) ─────────────
-        // Matches: cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, 3×3 kernel)
-        disp2d(pl.morphDilate, mkBg(pl.morphDilate, b.maskA, b.maskB, uMorph1));
-        disp2d(pl.morphErode,  mkBg(pl.morphErode,  b.maskB, b.maskA, uMorph1));
+        // ── Step 9: Morphological close ────────────────────────────────────────
+        disp2d(pl.morphDilate, mkBg(pl.morphDilate, b.maskA, b.maskB, u.morph1));
+        disp2d(pl.morphErode,  mkBg(pl.morphErode,  b.maskB, b.maskA, u.morph1));
         let curMask = b.maskA;
 
-        // ── Step 10: Optional clean speckles (morphological open) ─────────────
-        // Matches: cv.morphologyEx(edges, edges, cv.MORPH_OPEN, cross kernel)
-        // GPU uses a square kernel (slightly more aggressive than a cross, acceptable).
+        // ── Step 10: Optional clean speckles ──────────────────────────────────
         if (settings.cleanSpeckles) {
-            const openR = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
-            const uOpen = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:openR}]);
-            tempU.push(uOpen);
-            disp2d(pl.morphErode,  mkBg(pl.morphErode,  curMask, b.maskB, uOpen));
-            disp2d(pl.morphDilate, mkBg(pl.morphDilate, b.maskB, b.maskA, uOpen));
+            disp2d(pl.morphErode,  mkBg(pl.morphErode,  curMask, b.maskB, u.open));
+            disp2d(pl.morphDilate, mkBg(pl.morphDilate, b.maskB, b.maskA, u.open));
             curMask = b.maskA;
         }
 
         // ── Step 11: Optional merge double-edges ──────────────────────────────
-        // Matches: MORPH_CLOSE(mergeKernel) then erode(3×3).
         if (settings.mergeDoubleEdge) {
-            const intensity   = Math.max(1, Math.min(5, settings.mergeDoubleEdgeIntensity || 2));
-            const mergeR      = 1 + intensity; // intensity 1 → r=2 (5×5) … 5 → r=6 (13×13)
-            const uMerge = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:mergeR}]);
-            const uThin  = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1}]);
-            tempU.push(uMerge, uThin);
             const alt = (curMask === b.maskA) ? b.maskB : b.maskA;
-            disp2d(pl.morphDilate, mkBg(pl.morphDilate, curMask, alt,     uMerge));
-            disp2d(pl.morphErode,  mkBg(pl.morphErode,  alt,     curMask, uMerge));
-            disp2d(pl.morphErode,  mkBg(pl.morphErode,  curMask, alt,     uThin));
+            disp2d(pl.morphDilate, mkBg(pl.morphDilate, curMask, alt,     u.merge));
+            disp2d(pl.morphErode,  mkBg(pl.morphErode,  alt,     curMask, u.merge));
+            disp2d(pl.morphErode,  mkBg(pl.morphErode,  curMask, alt,     u.thin));
             curMask = alt;
         }
 
         // ── Step 12: Optional line-weight dilation ────────────────────────────
-        // Matches: cv.dilate(edges, edges, lineWeight×lineWeight kernel).
-        // GPU maps lineWeight 2→r1, 3→r2, 4→r3 (square kernel, ≈ same visual weight).
         if (settings.lineWeight > 1) {
-            const lwR  = settings.lineWeight - 1;
-            const uLw  = this._mkUniform([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:lwR}]);
-            tempU.push(uLw);
-            const alt  = (curMask === b.maskA) ? b.maskB : b.maskA;
-            disp2d(pl.morphDilate, mkBg(pl.morphDilate, curMask, alt, uLw));
+            const alt = (curMask === b.maskA) ? b.maskB : b.maskA;
+            disp2d(pl.morphDilate, mkBg(pl.morphDilate, curMask, alt, u.lw));
             curMask = alt;
         }
 
-        // ── Step 13: Colourize (edge mask → ink / background RGBA) ────────────
-        // Edge pixels (mask=255) → ink colour; non-edge (mask=0) → background.
-        // This combines cv.bitwise_not + the final pixel-mapping loop in one pass.
-        const bgArr  = settings.preset.background;
-        const inkArr = settings.preset.ink;
-        const bgPx   = ((255 << 24) | (bgArr[2]  << 16) | (bgArr[1]  << 8) | bgArr[0])  >>> 0;
-        const inkPx  = ((255 << 24) | (inkArr[2] << 16) | (inkArr[1] << 8) | inkArr[0]) >>> 0;
-        const uColor = this._mkUniform([
-            {type:'u32',value:W},{type:'u32',value:H},
-            {type:'u32',value:inkPx},{type:'u32',value:bgPx},
-        ]);
-        tempU.push(uColor);
-        disp1d(pl.colorize, mkBg(pl.colorize, curMask, b.rgbaOut, uColor));
+        // ── Step 13: Colourize ─────────────────────────────────────────────────
+        disp1d(pl.colorize, mkBg(pl.colorize, curMask, b.rgbaOut, u.colorize));
 
-        // Submit all compute work in one batch.
+        // ── Copy output to the persistent staging buffer ───────────────────────
+        // Reusing this._readBuf across frames avoids one GPU alloc/dealloc per
+        // frame — a significant GPU memory allocation hotspot at high frame rates.
+        if (!this._readBuf) {
+            this._readBuf = dev.createBuffer({
+                size : W * H * 4,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+        }
+        // Fold the copy command into the same encoder that holds all compute work.
+        // Submitting one command buffer instead of two reduces driver overhead and
+        // allows the GPU driver to pipeline the copy right after the last compute.
+        enc.copyBufferToBuffer(b.rgbaOut, 0, this._readBuf, 0, W * H * 4);
         dev.queue.submit([enc.finish()]);
 
-        // Copy the output storage buffer to a CPU-readable mapping buffer.
-        const readBuf = dev.createBuffer({
-            size : W * H * 4,
-            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        });
-        const encCopy = dev.createCommandEncoder();
-        encCopy.copyBufferToBuffer(b.rgbaOut, 0, readBuf, 0, W * H * 4);
-        dev.queue.submit([encCopy.finish()]);
-
-        // mapAsync resolves after all submitted GPU work is done — safe to read.
-        await readBuf.mapAsync(GPUMapMode.READ);
-        const result = new Uint8ClampedArray(readBuf.getMappedRange().slice(0));
-        readBuf.unmap();
-        readBuf.destroy();
-
-        // Destroy per-frame uniform buffers now that the GPU is finished with them.
-        tempU.forEach(u => u.destroy());
+        // mapAsync resolves once all submitted work (compute + copy) is done.
+        await this._readBuf.mapAsync(GPUMapMode.READ);
+        const result = new Uint8ClampedArray(this._readBuf.getMappedRange().slice(0));
+        this._readBuf.unmap();
+        // Do NOT destroy — buffer is reused next frame.
 
         return result;
     }
@@ -684,6 +689,11 @@ class GpuProcessor {
         if (this._bufs) {
             Object.values(this._bufs).forEach(b => b.destroy());
             this._bufs = null;
+        }
+        this._destroyUniformCache();
+        if (this._readBuf) {
+            this._readBuf.destroy();
+            this._readBuf = null;
         }
     }
 }
