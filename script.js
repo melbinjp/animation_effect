@@ -120,7 +120,10 @@ const state = {
     cancelRequested: false,
     pauseRequested: false,
     activeJobId: '',
-    beforeUnloadAttached: false
+    beforeUnloadAttached: false,
+    mediaWidth: null,
+    mediaHeight: null,
+    activeDecodePool: null
 };
 
 const PRODUCTION_LIMITS = {
@@ -132,6 +135,11 @@ const PRODUCTION_LIMITS = {
     recommendedVideoMegaPixels: 3,
     hardFileSizeBytes: 250 * 1024 * 1024
 };
+
+// Safe default cap on worker count.  Even on a 16-core machine spawning 16
+// WebGPU workers simultaneously saturates the GPU command queue and causes
+// device-lost errors.  Users can always raise the limit manually.
+const DEFAULT_SAFE_WORKER_CAP = 4;
 
 // Compute the recommended number of Web Workers based on the number of logical
 // CPU cores and the amount of RAM reported by the browser.
@@ -166,8 +174,36 @@ function computeOptimalWorkers() {
         maxFromMemory = Math.max(1, Math.floor(availableForWorkersMB / 80));
     }
 
-    const auto = Math.min(maxFromCores, maxFromMemory);
+    // Cap at DEFAULT_SAFE_WORKER_CAP to prevent GPU device-lost crashes.
+    // The user can always raise this via the slider.
+    const auto = Math.min(maxFromCores, maxFromMemory, DEFAULT_SAFE_WORKER_CAP);
     return { auto, max: maxFromCores, cores: hw, memoryGB: reportedMemoryGB };
+}
+
+// Compute per-worker memory requirement and recommended worker count for a
+// specific media resolution.  Call this after loading a file when dimensions
+// are known to produce a more accurate recommendation than the device-only
+// estimate in computeOptimalWorkers().
+//
+// Returns { auto, max, perWorkerMB }
+//   auto        — recommended worker count for this resolution
+//   max         — upper safe limit based on available RAM and cores
+//   perWorkerMB — estimated RAM each worker will use for this resolution
+function computeWorkersForResolution(width, height) {
+    const frameSizeMB = (width * height * 4) / (1024 * 1024);
+    // OpenCV processing uses ~5 intermediate matrices (RGBA source, greyscale,
+    // blur, edges, output) plus the WASM module (~30 MB overhead per worker).
+    const perWorkerMB = Math.ceil(frameSizeMB * 5 + 30);
+    const { max, memoryGB } = workerConfig;
+    let maxFromMemory = max;
+    if (memoryGB !== null && memoryGB < 8) {
+        const deviceMemoryMB = memoryGB * 1024;
+        const availableForWorkersMB = Math.max(0, deviceMemoryMB * 0.65 - 300);
+        maxFromMemory = Math.max(1, Math.floor(availableForWorkersMB / perWorkerMB));
+    }
+    const safeMax = Math.min(max, maxFromMemory);
+    const auto = Math.min(safeMax, DEFAULT_SAFE_WORKER_CAP);
+    return { auto, max: safeMax, perWorkerMB };
 }
 
 // Semaphore used to cap the number of concurrently in-flight frame renders
@@ -210,6 +246,9 @@ class LineArtProcessor {
         this._freePool = [];
         // Queue of resolve-fns waiting for a free worker index.
         this._waitQueue = [];
+        // Indices of workers that should be terminated instead of returned to
+        // the pool when they next complete a task (used by resize() scale-down).
+        this._drainSet = new Set();
 
         console.log(`[Main] Spawning ${this._concurrency} worker(s)`);
 
@@ -306,6 +345,12 @@ class LineArtProcessor {
     _releaseWorker(index) {
         // Guard against double-release (e.g. racing reset + normal completion).
         if (this._freePool.includes(index)) return;
+        // If this worker was marked for removal by resize(), terminate it now.
+        if (this._drainSet.has(index)) {
+            this._drainSet.delete(index);
+            this._workers[index].terminate();
+            return;
+        }
         if (this._waitQueue.length > 0) {
             this._waitQueue.shift()(index);
         } else {
@@ -347,8 +392,48 @@ class LineArtProcessor {
         this._pending.clear();
         this._waitQueue.splice(0).forEach((resolve) => resolve(-1));
         this._freePool = [];
+        this._drainSet.clear();
         this._workers.forEach((w) => w.terminate());
         this._workers = [];
+    }
+
+    // Dynamically change the number of active workers without interrupting
+    // any in-flight processing.
+    //
+    // Scale-up  — new workers are spawned immediately and added to the pool
+    //             once their WebGPU pipeline is ready.
+    // Scale-down — excess workers are terminated as soon as they finish their
+    //              current task (they are added to _drainSet and never returned
+    //              to the free pool).  Idle excess workers are stopped at once.
+    resize(n) {
+        n = Math.max(1, n);
+        if (n === this._concurrency) return;
+
+        if (n > this._concurrency) {
+            // Scale up: spawn additional workers.
+            const startIdx = this._workers.length;
+            const toAdd = n - this._concurrency;
+            this._concurrency = n;
+            for (let i = 0; i < toAdd; i++) {
+                this._workers.push(this._spawnWorker(startIdx + i));
+            }
+        } else {
+            // Scale down: drain the highest-indexed workers.
+            const toRemove = this._concurrency - n;
+            this._concurrency = n;
+            for (let i = 0; i < toRemove; i++) {
+                const workerIdx = this._workers.length - 1 - i;
+                const freeIdx = this._freePool.indexOf(workerIdx);
+                if (freeIdx !== -1) {
+                    // Worker is currently idle — terminate it immediately.
+                    this._freePool.splice(freeIdx, 1);
+                    this._workers[workerIdx].terminate();
+                } else {
+                    // Worker is busy — mark for termination after its task.
+                    this._drainSet.add(workerIdx);
+                }
+            }
+        }
     }
 
     // Returns Promise<Uint8ClampedArray> — the raw RGBA output without writing
@@ -419,8 +504,10 @@ function refreshActions() {
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.fileInput.disabled = notReady;
-    elements.workerThreadsInput.disabled = notReady;
-    elements.workerThreadsManual.disabled = notReady;
+    // Worker controls stay enabled during processing so the user can adjust
+    // concurrency dynamically mid-render without a full pool rebuild.
+    elements.workerThreadsInput.disabled = !state.cvReady;
+    elements.workerThreadsManual.disabled = !state.cvReady;
     elements.dropZone.classList.toggle('is-loading', !state.cvReady);
 }
 
@@ -854,6 +941,7 @@ async function loadFFmpeg() {
 class VideoDecodePool {
     constructor(size, srcVideo) {
         this._size = size;
+        this._srcVideo = srcVideo;
         this._free = [];
         this._waiting = [];
 
@@ -895,6 +983,34 @@ class VideoDecodePool {
         });
         this._free = [];
     }
+
+    // Dynamically add or remove video elements from the pool.
+    // Scale-up adds immediately-usable elements.
+    // Scale-down removes idle elements; busy elements are left running
+    // (they will simply not be returned to the pool if the pool is destroyed).
+    resize(n) {
+        n = Math.max(1, n);
+        if (n === this._size) return;
+        if (n > this._size) {
+            const toAdd = n - this._size;
+            for (let i = 0; i < toAdd; i++) {
+                const v = document.createElement('video');
+                v.preload = 'auto';
+                v.muted = true;
+                v.playsInline = true;
+                v.src = this._srcVideo.src;
+                this._free.push(v);
+            }
+        } else {
+            const toRemove = this._size - n;
+            for (let i = 0; i < toRemove && this._free.length > 0; i++) {
+                const v = this._free.pop();
+                v.src = '';
+                v.load();
+            }
+        }
+        this._size = n;
+    }
 }
 
 async function readSelectedFile(file) {
@@ -911,6 +1027,8 @@ async function readSelectedFile(file) {
         image.src = state.sourceUrl;
         await waitForMediaEvent(image, 'load');
         state.sourceImage = image;
+        state.mediaWidth = image.naturalWidth;
+        state.mediaHeight = image.naturalHeight;
         updateFileMeta(`${file.name} · ${image.naturalWidth}×${image.naturalHeight} image`);
         summarizeWorkload();
         return;
@@ -924,6 +1042,8 @@ async function readSelectedFile(file) {
         video.src = state.sourceUrl;
         await waitForMediaEvent(video, 'loadedmetadata');
         state.sourceVideo = video;
+        state.mediaWidth = video.videoWidth;
+        state.mediaHeight = video.videoHeight;
         updateFileMeta(
             `${file.name} · ${video.videoWidth}×${video.videoHeight} video · ${video.duration.toFixed(1)}s`
         );
@@ -1041,6 +1161,7 @@ async function renderVideoExport() {
         // -------------------------------------------------------------------------------
         const decodePoolSize = processor.concurrency;
         const decodePool = new VideoDecodePool(decodePoolSize, video);
+        state.activeDecodePool = decodePool;
 
         let completedFrames = 0;
         let latestShownFrame = -1;
@@ -1155,6 +1276,7 @@ async function renderVideoExport() {
         // promises after a cancellation or partial failure).
         const results = await Promise.allSettled(framePromises);
         decodePool.destroy();
+        state.activeDecodePool = null;
         const firstFailure = results.find((r) => r.status === 'rejected');
         if (firstFailure) {
             throw firstFailure.reason;
@@ -1195,6 +1317,7 @@ async function renderVideoExport() {
         setProgress(100, 'MP4 export ready.');
         console.log('Video render complete. Download or review the MP4.', 'success');
     } finally {
+        state.activeDecodePool = null;
         await cleanupFfmpegJob(ffmpeg, jobId, totalFrames, inputPath, outputPath);
         state.activeJobId = '';
     }
@@ -1239,6 +1362,8 @@ function resetWorkspace() {
     state.fileKind = null;
     state.sourceImage = null;
     state.sourceVideo = null;
+    state.mediaWidth = null;
+    state.mediaHeight = null;
     revokeUrl('sourceUrl');
     clearRenderedOutput();
     setResultGlow(false);
@@ -1262,7 +1387,13 @@ function resetWorkspace() {
 function updateWorkerThreadsHint(currentWorkers) {
     const { auto, cores, memoryGB } = workerConfig;
     const memStr = memoryGB !== null ? `${memoryGB} GB RAM` : 'RAM unknown';
-    const baseInfo = `Auto: ${auto} (${cores} cores, ${memStr})`;
+    let baseInfo = `Auto: ${auto} (${cores} cores, ${memStr})`;
+
+    // Append a resolution-aware recommendation when media dimensions are known.
+    if (state.mediaWidth && state.mediaHeight) {
+        const resInfo = computeWorkersForResolution(state.mediaWidth, state.mediaHeight);
+        baseInfo += ` · ${state.mediaWidth}×${state.mediaHeight}: ≤${resInfo.max} workers (~${resInfo.perWorkerMB} MB each)`;
+    }
 
     if (currentWorkers > auto) {
         const extraNote = currentWorkers > Number(elements.workerThreadsInput.max)
@@ -1575,9 +1706,13 @@ elements.workerThreadsInput.addEventListener('input', () => {
 });
 
 elements.workerThreadsInput.addEventListener('change', () => {
-    if (state.processing) return;
     const n = Number(elements.workerThreadsInput.value);
-    rebuildProcessor(n);
+    if (state.processing) {
+        processor.resize(n);
+        if (state.activeDecodePool) state.activeDecodePool.resize(n);
+    } else {
+        rebuildProcessor(n);
+    }
 });
 
 // Manual number input — lets users type any value up to WORKER_THREADS_ABSOLUTE_MAX.
@@ -1594,7 +1729,6 @@ elements.workerThreadsManual.addEventListener('input', () => {
 });
 
 elements.workerThreadsManual.addEventListener('change', () => {
-    if (state.processing) return;
     const raw = Number(elements.workerThreadsManual.value);
     if (!Number.isFinite(raw) || raw < 1) {
         // Restore to the current processor count on invalid input.
@@ -1605,7 +1739,12 @@ elements.workerThreadsManual.addEventListener('change', () => {
     elements.workerThreadsManual.value = n;
     elements.workerThreadsInput.value = Math.min(n, Number(elements.workerThreadsInput.max));
     elements.workerThreadsVal.textContent = n;
-    rebuildProcessor(n);
+    if (state.processing) {
+        processor.resize(n);
+        if (state.activeDecodePool) state.activeDecodePool.resize(n);
+    } else {
+        rebuildProcessor(n);
+    }
 });
 
 attachDropZone();
