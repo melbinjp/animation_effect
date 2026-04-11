@@ -1165,6 +1165,7 @@ async function renderVideoExport() {
 
         let completedFrames = 0;
         let latestShownFrame = -1;
+        let latestOutputFrame = -1;
         const framePromises = [];
 
         for (let fi = 0; fi < totalFrames; fi++) {
@@ -1259,8 +1260,8 @@ async function renderVideoExport() {
                 );
 
                 // Show the latest line-art frame on the output canvas.
-                if (capturedFi > latestShownFrame) {
-                    latestShownFrame = capturedFi;
+                if (capturedFi > latestOutputFrame) {
+                    latestOutputFrame = capturedFi;
                     elements.outputCanvas.width = capturedW;
                     elements.outputCanvas.height = capturedH;
                     elements.outputCanvas.getContext('2d').putImageData(
@@ -1314,7 +1315,7 @@ async function renderVideoExport() {
 
         throwIfCancelled();
         const outputData = await ffmpeg.readFile(outputPath);
-        const videoBlob = new Blob([outputData.buffer], { type: 'video/mp4' });
+        const videoBlob = new Blob([outputData], { type: 'video/mp4' });
         setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
         elements.outputVideo.src = state.outputUrl;
         elements.videoResult.hidden = false;
