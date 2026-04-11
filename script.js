@@ -1249,9 +1249,9 @@ function resetWorkspace() {
     drawEmptyCanvas(elements.sourceCanvas, 'Source preview');
     drawEmptyCanvas(elements.outputCanvas, 'Line-art preview');
     if (!state.cvReady) {
-        console.log('Loading processing engine... This may take 10-30 seconds on first load.', 'info');
+        setAdvisory('Loading processing engine… This may take 10–30 seconds on first load.', 'info');
     } else {
-        console.log('Ready. Drop a photo or video clip to get started.', 'success');
+        setAdvisory('Ready. Drop a photo or video clip to get started.', 'success');
     }
     refreshActions();
     updateUnloadProtection();
