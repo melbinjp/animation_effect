@@ -218,7 +218,10 @@
 
                 <div class="control-group" id="workerThreadsGroup">
                     <label for="workerThreads">Worker threads <span id="workerThreadsVal">…</span></label>
-                    <input type="range" id="workerThreads" min="1" max="16" value="1">
+                    <div class="worker-threads-row">
+                        <input type="range" id="workerThreads" min="1" max="16" value="1">
+                        <input type="number" id="workerThreadsManual" class="worker-threads-manual" min="1" max="64" value="1" aria-label="Worker threads — manual entry">
+                    </div>
                     <div class="range-scale">
                         <span>1</span>
                         <span id="workerThreadsMax">16</span>
