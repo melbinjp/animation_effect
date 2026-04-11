@@ -231,7 +231,7 @@ class LineArtProcessor {
     get concurrency() { return this._concurrency; }
 
     _spawnWorker(index) {
-        const worker = new Worker('worker.js');
+        const worker = new Worker('gpu-worker.js');
 
         worker.onmessage = (event) => {
             const msg = event && event.data;
