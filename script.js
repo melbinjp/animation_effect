@@ -1121,49 +1121,16 @@ async function renderImageExport() {
     console.log('Image render complete. Download your PNG.', 'success');
 }
 
-// ── BMP encoder ──────────────────────────────────────────────────────────────
-// Encode a Uint8ClampedArray of RGBA pixels to an uncompressed 24-bit BMP.
-// BMP has zero deflate overhead, making it ~100× faster to produce than PNG
-// for the intermediate frame files.  FFmpeg reads BMP natively.
-// A negative biHeight in the header signals top-down row order so we never
-// need to flip rows before writing.
-function rgbaToBmp(rgba, width, height) {
-    const rowBytes = Math.ceil(width * 3 / 4) * 4; // rows padded to 4 bytes
-    const pixelBytes = rowBytes * height;
-    const fileSize = 54 + pixelBytes;
-    const buf = new Uint8Array(fileSize);
-    const v = new DataView(buf.buffer);
-    // BITMAPFILEHEADER
-    buf[0] = 0x42; buf[1] = 0x4D;         // 'BM'
-    v.setUint32(2,  fileSize,      true);  // bfSize
-    v.setUint32(6,  0,             true);  // bfReserved
-    v.setUint32(10, 54,            true);  // bfOffBits
-    // BITMAPINFOHEADER
-    v.setUint32(14, 40,            true);  // biSize
-    v.setInt32 (18, width,         true);  // biWidth
-    v.setInt32 (22, -height,       true);  // biHeight (negative = top-down)
-    v.setUint16(26, 1,             true);  // biPlanes
-    v.setUint16(28, 24,            true);  // biBitCount
-    v.setUint32(30, 0,             true);  // biCompression (BI_RGB)
-    v.setUint32(34, pixelBytes,    true);  // biSizeImage
-    v.setUint32(38, 2835,          true);  // biXPelsPerMeter (~72 dpi)
-    v.setUint32(42, 2835,          true);  // biYPelsPerMeter
-    v.setUint32(46, 0,             true);  // biClrUsed
-    v.setUint32(50, 0,             true);  // biClrImportant
-    // Pixel data: RGBA → BGR, row by row (top-to-bottom matches negative biHeight)
-    for (let y = 0; y < height; y++) {
-        const rowBase = 54 + y * rowBytes;
-        const srcBase = y * width * 4;
-        for (let x = 0; x < width; x++) {
-            const s = srcBase + x * 4;
-            const d = rowBase + x * 3;
-            buf[d]     = rgba[s + 2]; // B
-            buf[d + 1] = rgba[s + 1]; // G
-            buf[d + 2] = rgba[s];     // R
-        }
-    }
-    return buf;
-}
+// ── PNG frame helper ─────────────────────────────────────────────────────────
+// PNG is used for intermediate frame files written to the FFmpeg WASM FS.
+// For the near-binary line-art frames this app produces, PNG deflate compresses
+// 10–50× smaller than an equivalent uncompressed BMP (~6 MB per 1080p frame).
+// Keeping the per-frame file small is critical: all frames of a segment are
+// written to the FFmpeg WASM filesystem before encoding begins.  Using BMP
+// fills the WASM heap for any video longer than a few seconds, triggering
+// RangeError OOM crashes.  PNG keeps the same segment at ~150–300 MB total,
+// well within the WASM address space.  The browser's native PNG encoder runs
+// efficiently using canvasToBlob — OpenCV processing dominates per-frame time.
 
 // Load and return a fresh FFmpeg instance independent of state.ffmpeg.
 // Each instance gets its own WASM heap, allowing true parallel encoding.
@@ -1312,11 +1279,11 @@ async function renderVideoExport() {
         );
 
         // ---- Parallel frame pipeline ------------------------------------------------
-        // Each frame is processed concurrently (seek → OpenCV → BMP encode → write)
+        // Each frame is processed concurrently (seek → OpenCV → PNG encode → write)
         // and written to its assigned segment's FFmpeg FS.
         //
         // A pipeline-wide Semaphore caps the number of frames simultaneously alive
-        // in the seek→process→BMP→write pipeline.  Without this cap, all frames
+        // in the seek→process→PNG→write pipeline.  Without this cap, all frames
         // are queued upfront; each holds ~8 MB of canvas/pixel data, totalling
         // several GB for long/hi-res videos and causing RangeError OOM crashes.
         //
@@ -1398,7 +1365,7 @@ async function renderVideoExport() {
                             }
                         }
 
-                        // Phase 2: OpenCV/GPU processing → BMP encode → write to
+                        // Phase 2: OpenCV/GPU processing → PNG encode → write to
                         // the assigned segment's FFmpeg WASM filesystem.
                         throwIfCancelled();
                         let rawData = await processor.renderToData(offCanvas, settings);
@@ -1406,25 +1373,35 @@ async function renderVideoExport() {
 
                         throwIfCancelled();
 
+                        // Draw processed pixels to a temporary canvas once.
+                        // This canvas is used for both the live preview and PNG
+                        // encoding, avoiding a second ImageData allocation.
+                        const tmpCanvas = document.createElement('canvas');
+                        tmpCanvas.width  = capturedW;
+                        tmpCanvas.height = capturedH;
+                        tmpCanvas.getContext('2d').putImageData(
+                            new ImageData(rawData, capturedW, capturedH), 0, 0
+                        );
+                        rawData = null; // GC: pixels now live on tmpCanvas
+
                         // Live output preview (forward-progress only).
                         if (capturedFi > latestOutputFrame) {
                             latestOutputFrame = capturedFi;
                             elements.outputCanvas.width  = capturedW;
                             elements.outputCanvas.height = capturedH;
-                            elements.outputCanvas.getContext('2d').putImageData(
-                                new ImageData(rawData, capturedW, capturedH), 0, 0
-                            );
+                            elements.outputCanvas.getContext('2d').drawImage(tmpCanvas, 0, 0);
                         }
 
-                        // BMP has zero deflate overhead (~100× faster than PNG).
-                        // The raw bytes are larger but the Semaphore ensures only
-                        // O(concurrency) frames reside in the WASM heap at once.
-                        let frameBytes = rgbaToBmp(rawData, capturedW, capturedH);
-                        rawData = null; // GC: preview done, BMP encoded
+                        // PNG compresses near-binary line-art 10–50× smaller than
+                        // BMP, keeping the total WASM FS usage well within the
+                        // ~2–4 GB WASM address space limit for long/hi-res videos.
+                        let frameBlob = await canvasToBlob(tmpCanvas, 'image/png');
+                        let frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
+                        frameBlob = null;
 
                         throwIfCancelled();
                         await segFfmpeg.writeFile(
-                            `seg${segIdx}/frame-${String(localIdx).padStart(5, '0')}.bmp`,
+                            `seg${segIdx}/frame-${String(localIdx).padStart(5, '0')}.png`,
                             frameBytes
                         );
                         frameBytes = null; // GC: written to WASM FS
@@ -1483,7 +1460,7 @@ async function renderVideoExport() {
         state.encodePhaseOffset = 90;
         state.encodePhaseScale  = 0.06;
 
-        // encodeOneSegment: encode all BMP frames in seg${s}/ to seg${s}/out.mp4
+        // encodeOneSegment: encode all PNG frames in seg${s}/ to seg${s}/out.mp4
         // (video-only), read the result, then immediately delete frame files from
         // the WASM heap to free memory before the concat step.
         const encodeOneSegment = async (segFfmpeg, s) => {
@@ -1494,7 +1471,7 @@ async function renderVideoExport() {
                 '-y',
                 '-framerate', String(fps),
                 '-start_number', '0',
-                '-i', `seg${s}/frame-%05d.bmp`,
+                '-i', `seg${s}/frame-%05d.png`,
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'animation',
@@ -1533,13 +1510,13 @@ async function renderVideoExport() {
             // Read the encoded segment before freeing WASM heap.
             const mp4Data = await segFfmpeg.readFile(`seg${s}/out.mp4`);
 
-            // Delete frame BMPs and the encoded segment from this instance's WASM
+            // Delete frame PNGs and the encoded segment from this instance's WASM
             // heap immediately — critical for long videos where frames linger until
             // the outer finally block and exhaust the WASM address space.
             const frameDels = Array.from({ length: segFrameCount }, (_, i) =>
                 safeDeleteFile(
                     segFfmpeg,
-                    `seg${s}/frame-${String(i).padStart(5, '0')}.bmp`
+                    `seg${s}/frame-${String(i).padStart(5, '0')}.png`
                 )
             );
             await Promise.all(frameDels);
@@ -1651,7 +1628,7 @@ async function renderVideoExport() {
         }
         state.activeDecodePool = null;
 
-        // Best-effort cleanup of any BMP frames / segment outputs that may still
+        // Best-effort cleanup of any PNG frames / segment outputs that may still
         // reside in a segment instance's WASM heap (handles cancel + mid-render
         // errors).  encodeOneSegment already deletes on success, so these
         // safeDeleteFile calls are harmless no-ops for already-deleted files.
@@ -1660,7 +1637,7 @@ async function renderVideoExport() {
             const frameDels = Array.from({ length: n }, (_, i) =>
                 safeDeleteFile(
                     segFfmpeg,
-                    `seg${s}/frame-${String(i).padStart(5, '0')}.bmp`
+                    `seg${s}/frame-${String(i).padStart(5, '0')}.png`
                 )
             );
             await Promise.allSettled(frameDels);
