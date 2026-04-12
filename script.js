@@ -651,7 +651,9 @@ function getSettings() {
         medianPasses: Number(document.getElementById('customMedianPasses').value),
         cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked,
         cleanSpecklesIntensity: Number(document.getElementById('customCleanSpecklesIntensity').value),
+        autoNormalize: presetKey !== 'custom' || document.getElementById('customAutoNormalize').checked,
         darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
+        darkBoostClip: Number(document.getElementById('customDarkBoostClip').value),
         mergeDoubleEdge: presetKey === 'custom' && document.getElementById('customMergeDoubleEdge').checked,
         mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value)
     };
@@ -1930,7 +1932,7 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customDarkBoost', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customAutoNormalize', 'customDarkBoost', 'customDarkBoostClip', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
@@ -1940,6 +1942,7 @@ const customValueSpans = {
     customGaussianPasses: document.getElementById('customGaussianPassesVal'),
     customMedianPasses: document.getElementById('customMedianPassesVal'),
     customCleanSpecklesIntensity: document.getElementById('customCleanSpecklesIntensityVal'),
+    customDarkBoostClip: document.getElementById('customDarkBoostClipVal'),
     customMergeDoubleEdgeIntensity: document.getElementById('customMergeDoubleEdgeIntensityVal')
 };
 
@@ -1981,6 +1984,12 @@ function syncMergeDoubleEdgeRow() {
     document.getElementById('mergeDoubleEdgeIntensityRow').hidden = !enabled;
 }
 
+// Show/hide the CLAHE clip-limit slider when the extra shadow boost is toggled.
+function syncDarkBoostRow() {
+    const enabled = document.getElementById('customDarkBoost').checked;
+    document.getElementById('darkBoostClipRow').hidden = !enabled;
+}
+
 customInputIds.forEach((id) => {
     document.getElementById(id).addEventListener('input', () => {
         if (customValueSpans[id]) {
@@ -1999,6 +2008,7 @@ customInputIds.forEach((id) => {
         if (id === 'customUseGaussian') { syncGaussianPassesRow(); }
         if (id === 'customUseMedian') { syncMedianPassesRow(); }
         if (id === 'customCleanSpeckles') { syncCleanSpecklesRow(); }
+        if (id === 'customDarkBoost') { syncDarkBoostRow(); }
         if (id === 'customMergeDoubleEdge') { syncMergeDoubleEdgeRow(); }
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
             return;

@@ -129,24 +129,84 @@ class WorkerProcessor {
             }
         }
 
+        // Per-frame adaptive normalization — enabled for all standard presets and
+        // controllable in Custom / Experiment mode via the "Auto-normalize frames"
+        // checkbox.
+        //
+        // The goal is to transform whatever the camera captured into a tonal
+        // distribution that maximises contrast at actual edges, regardless of scene
+        // exposure, lighting, or the number of scene changes in the video.
+        //
+        // Three cascading stages:
+        //
+        //   Stage 1 — Gamma lift (dark frames, mean < 80)
+        //     Applies a power-law brightness boost via a 256-entry LUT so that
+        //     mid-tones are raised without touching pure black/white.  Gamma 1.5
+        //     gives a mild lift; gamma 3.0 is used for near-black frames.
+        //
+        //   Stage 2 — Histogram stretch (low-contrast/flat frames, std dev < 45)
+        //     cv.normalize(NORM_MINMAX) remaps the darkest pixel to 0 and the
+        //     brightest to 255, spreading the full dynamic range.  This recovers
+        //     edges buried in a narrow tonal band — foggy scenes, overcast outdoor
+        //     shots, monitor-lit subjects, etc.
+        //
+        //   Stage 3 — Adaptive CLAHE (all frames)
+        //     Boosts local contrast in every 8×8 tile.  The clip limit scales
+        //     inversely with mean brightness: dark frames need stronger lift (higher
+        //     clip); bright/well-lit frames get a conservative clip to avoid
+        //     amplifying noise.  clip = clamp(150 / mean, 1.5, 4.5).
+        //
+        // The three stages cascade: a very dark AND flat frame gets gamma lift first,
+        // then histogram stretch, then CLAHE — all compounding to fully restore edges.
+        if (settings.autoNormalize) {
+            const meanMat = new cv.Mat();
+            const stdMat = new cv.Mat();
+            cv.meanStdDev(this.gray, meanMat, stdMat);
+            const mean = meanMat.data64F[0];
+            const std = stdMat.data64F[0];
+            meanMat.delete();
+            stdMat.delete();
+
+            // Stage 1: gamma lift for under-exposed frames.
+            if (mean < 80) {
+                // gamma > 1 brightens: output = 255 * (input/255)^(1/gamma)
+                // Threshold 80: frames below this are considered under-exposed.
+                // Formula: mean 80 → gamma 1.5 (mild lift); mean 0 → gamma 3.0 (strong lift).
+                // Divisor 40 = (80 - 0) / (3.0 - 1.0 - 1.0) maps [0,80] onto [3.0,1.5].
+                const gamma = Math.max(1.5, Math.min(3.0, 1.0 + (80 - mean) / 40));
+                const lut = new cv.Mat(1, 256, cv.CV_8U);
+                for (let i = 0; i < 256; i++) {
+                    lut.data[i] = Math.round(Math.pow(i / 255, 1 / gamma) * 255);
+                }
+                cv.LUT(this.gray, lut, this.gray);
+                lut.delete();
+            }
+
+            // Stage 2: histogram stretch for low-contrast / flat scenes.
+            if (std < 45) {
+                cv.normalize(this.gray, this.gray, 0, 255, cv.NORM_MINMAX, cv.CV_8U);
+            }
+
+            // Stage 3: adaptive CLAHE — clip limit inversely proportional to mean.
+            const adaptiveClip = Math.max(1.5, Math.min(4.5, 150 / Math.max(mean, 1)));
+            const adaptiveClahe = new cv.CLAHE(adaptiveClip, new cv.Size(8, 8));
+            adaptiveClahe.apply(this.gray, this.gray);
+            adaptiveClahe.delete();
+        }
+
         // Light Gaussian blur on the grayscale image to suppress high-frequency
         // noise that would otherwise generate spurious thin Canny edges.
         cv.GaussianBlur(this.gray, this.gray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
 
-        // Optional: CLAHE (Contrast Limited Adaptive Histogram Equalisation) lifts
-        // the local contrast in dark regions so that Canny can see edges that would
-        // otherwise be buried in shadow — bringing out subject detail that is lost
-        // when the clip is underexposed or back-lit.  The clip limit and tile grid
-        // size are held constant; the intensity slider controls only the edge-merge
-        // step below.
+        // Optional: manual CLAHE boost (Custom / Experiment mode only).
+        // Applies an additional round of Contrast Limited Adaptive Histogram
+        // Equalisation on top of the auto-normalize stage (or alone when
+        // autoNormalize is off).  The clip limit is user-tunable via the
+        // "CLAHE clip limit" slider (1–6, default 2.5): a higher value lifts
+        // shadow contrast more aggressively at the cost of amplifying noise.
         if (settings.darkBoost) {
-            // clipLimit 2.5 is a well-tested mid-range value: it suppresses noise
-            // amplification (clip limit prevents the histogram redistribution from
-            // running away in flat regions) while still noticeably lifting contrast
-            // in dark areas.  The 8×8 tile grid matches the OpenCV default and gives
-            // good locality without creating visible tile boundaries at typical
-            // video resolutions.
-            const clahe = new cv.CLAHE(2.5, new cv.Size(8, 8));
+            const clipLimit = Math.max(1.0, Math.min(6.0, settings.darkBoostClip || 2.5));
+            const clahe = new cv.CLAHE(clipLimit, new cv.Size(8, 8));
             clahe.apply(this.gray, this.gray);
             clahe.delete();
         }
@@ -159,18 +219,53 @@ class WorkerProcessor {
         cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
         closeKernel.delete();
 
-        // Optional: morphological opening with a cross-shaped kernel removes isolated
-        // edge fragments (single pixels, tiny specks from skin pores, fabric grain,
-        // etc.).  Only enabled in Custom/Experiment mode via the "Clean speckles"
-        // checkbox because the cross erosion can destroy thin continuous Canny edges
-        // that are essential for subject visibility in standard modes.
-        // Intensity controls the kernel size: 1 → 3×3, 2 → 5×5, 3 → 7×7.
+        // Optional: connected-component dot removal — removes isolated edge fragments
+        // (single pixels, tiny specks from skin pores, fabric grain, etc.) without
+        // harming thin continuous Canny edges.  Only enabled in Custom/Experiment mode.
+        //
+        // Why connected components instead of morphological OPEN?
+        // Morphological OPEN with a cross-shaped kernel erodes in 4 directions, which
+        // destroys thin diagonal lines along with the dots it targets.  Connected
+        // component analysis works differently: it labels every contiguous group of
+        // white pixels, then discards only the groups whose total pixel count falls
+        // below a minimum area threshold.  A continuous line — however thin — always
+        // accumulates enough pixels to survive; an isolated dot or tiny speckle does
+        // not.  The result is a strictly cleaner removal of dot-art artefacts with no
+        // collateral loss of subject lines.
+        //
+        // Intensity → minimum component area (pixel count):
+        //   1 (fine)   →  4 px  — removes single pixels and 2–3-pixel blobs
+        //   2 (medium) → 12 px  — removes clusters up to roughly 3 × 4 pixels
+        //   3 (coarse) → 30 px  — removes larger speckle patches
         if (settings.cleanSpeckles) {
             const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
-            const openSize = 1 + speckleIntensity * 2;
-            const openKernel = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(openSize, openSize));
-            cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
-            openKernel.delete();
+            // Minimum connected-component area to survive (pixels).
+            const MIN_AREA = { 1: 4, 2: 12, 3: 30 };
+            const minArea = MIN_AREA[speckleIntensity];
+            const labels = new cv.Mat();
+            const stats = new cv.Mat();
+            const centroids = new cv.Mat();
+            const numLabels = cv.connectedComponentsWithStats(
+                this.edges, labels, stats, centroids, 8, cv.CV_32S
+            );
+            const statsData = stats.data32S;
+            const labelsData = labels.data32S;
+            const edgeData = this.edges.data;
+            // CC_STAT_AREA is the 5th column (index 4) in the stats matrix.
+            // Each row in the stats matrix has CC_STATS_COLS = 5 entries:
+            // [left, top, width, height, area].
+            // Label 0 is the background; skip it.
+            const CC_STATS_COLS = 5;
+            const CC_STAT_AREA = 4;
+            for (let i = 0, len = labelsData.length; i < len; i++) {
+                const label = labelsData[i];
+                if (label !== 0 && statsData[label * CC_STATS_COLS + CC_STAT_AREA] < minArea) {
+                    edgeData[i] = 0;
+                }
+            }
+            labels.delete();
+            stats.delete();
+            centroids.delete();
         }
 
         // Optional: Merge double-edges — bridges the closely-spaced parallel edges
