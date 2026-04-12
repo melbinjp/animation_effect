@@ -153,10 +153,24 @@
                         </div>
                     </div>
                     <div class="custom-toggle-row">
+                        <label for="customAutoNormalize" class="toggle-label">
+                            <input type="checkbox" id="customAutoNormalize" checked>
+                            Auto-normalize frames <span class="toggle-hint">(per-frame adaptive pipeline: gamma lift for dark frames → histogram stretch for flat/foggy scenes → adaptive CLAHE — handles changing lighting across scenes automatically)</span>
+                        </label>
+                    </div>
+                    <div class="custom-toggle-row">
                         <label for="customDarkBoost" class="toggle-label">
                             <input type="checkbox" id="customDarkBoost">
-                            Boost dark areas <span class="toggle-hint">(CLAHE contrast lift in shadows — recovers edges lost in underexposed regions)</span>
+                            Extra shadow boost <span class="toggle-hint">(additional CLAHE pass on top of auto-normalize — for extreme underexposure; tune the clip limit below)</span>
                         </label>
+                    </div>
+                    <div class="custom-slider-row" id="darkBoostClipRow" hidden>
+                        <label for="customDarkBoostClip">CLAHE clip limit <span id="customDarkBoostClipVal">2.5</span></label>
+                        <input type="range" id="customDarkBoostClip" min="1" max="6" step="0.5" value="2.5">
+                        <div class="range-scale">
+                            <span>Subtle (1)</span>
+                            <span>Aggressive (6)</span>
+                        </div>
                     </div>
                     <div class="custom-toggle-row">
                         <label for="customMergeDoubleEdge" class="toggle-label">
