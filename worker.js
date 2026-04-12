@@ -170,7 +170,9 @@ class WorkerProcessor {
             // Stage 1: gamma lift for under-exposed frames.
             if (mean < 80) {
                 // gamma > 1 brightens: output = 255 * (input/255)^(1/gamma)
-                // Clamped to [1.5, 3.0] — 1.5 is a mild lift; 3.0 is for near-black.
+                // Threshold 80: frames below this are considered under-exposed.
+                // Formula: mean 80 → gamma 1.5 (mild lift); mean 0 → gamma 3.0 (strong lift).
+                // Divisor 40 = (80 - 0) / (3.0 - 1.0 - 1.0) maps [0,80] onto [3.0,1.5].
                 const gamma = Math.max(1.5, Math.min(3.0, 1.0 + (80 - mean) / 40));
                 const lut = new cv.Mat(1, 256, cv.CV_8U);
                 for (let i = 0; i < 256; i++) {
@@ -237,7 +239,9 @@ class WorkerProcessor {
         //   3 (coarse) → 30 px  — removes larger speckle patches
         if (settings.cleanSpeckles) {
             const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
-            const minArea = [4, 12, 30][speckleIntensity - 1];
+            // Minimum connected-component area to survive (pixels).
+            const MIN_AREA = { 1: 4, 2: 12, 3: 30 };
+            const minArea = MIN_AREA[speckleIntensity];
             const labels = new cv.Mat();
             const stats = new cv.Mat();
             const centroids = new cv.Mat();
