@@ -19,6 +19,8 @@ const elements = {
     resetBtn: document.getElementById('resetBtn'),
     downloadLink: document.getElementById('download'),
     downloadCard: document.getElementById('downloadCard'),
+    audioDownloadLink: document.getElementById('audioDownload'),
+    audioDownloadCard: document.getElementById('audioDownloadCard'),
     sourceCanvas: document.getElementById('sourceCanvas'),
     outputCanvas: document.getElementById('canvasOutput'),
     outputCard: document.querySelector('.emphasis-card'),
@@ -117,6 +119,7 @@ const state = {
     sourceUrl: '',
     outputUrl: '',
     videoPreviewUrl: '',
+    audioUrl: '',
     processing: false,
     cancelRequested: false,
     pauseRequested: false,
@@ -139,7 +142,7 @@ const state = {
 const PRODUCTION_LIMITS = {
     recommendedVideoDurationSeconds: 60,    // suggest lower FPS above 1 min
     hardVideoDurationSeconds: 7200,         // extra-heavy advisory above 2 hours
-    recommendedVideoFrames: 1800,           // ~1 min at 30 fps
+    recommendedVideoFrames: 1800,           // 60 s × 30 fps (matches recommendedVideoDurationSeconds)
     hardVideoFrames: 216000,                // ~2 hours at 30 fps
     recommendedImageMegaPixels: 8,
     recommendedVideoMegaPixels: 8,          // 4K native is fine
@@ -560,9 +563,13 @@ function setResultGlow(active) {
 function clearRenderedOutput() {
     revokeUrl('outputUrl');
     revokeUrl('videoPreviewUrl');
+    revokeUrl('audioUrl');
     elements.downloadCard.hidden = true;
     elements.downloadLink.removeAttribute('href');
     elements.downloadLink.removeAttribute('download');
+    elements.audioDownloadCard.hidden = true;
+    elements.audioDownloadLink.removeAttribute('href');
+    elements.audioDownloadLink.removeAttribute('download');
     elements.videoResult.hidden = true;
     elements.outputVideo.removeAttribute('src');
     elements.outputVideo.load();
@@ -1185,20 +1192,23 @@ function computeEncodeWorkers(totalFrames) {
 // peak WASM FS usage to one chunk's worth of PNG data regardless of total video
 // length, preventing RangeError OOM on multi-hour or 4K/8K videos.
 //
-// Chunk size is chosen so the accumulated PNG data stays under ~400 MB:
+// Chunk size is chosen so the accumulated PNG data stays under TARGET_CHUNK_WASM_MB:
 //   • Estimated PNG size per frame ≈ 0.05 bytes/pixel (near-binary line-art
 //     compresses very aggressively with PNG deflate).
 //   • Minimum 60 frames (≈2 s at 30 fps) to avoid excessive FFmpeg invocations.
 //   • Maximum 600 frames (≈20 s at 30 fps) to keep encode-round latency low.
+// Peak WASM FS budget per streaming chunk (MB).
+const TARGET_CHUNK_WASM_MB = 400;
+// Floor for the per-frame PNG size estimate — prevents degenerate (1×1) frames
+// from producing an astronomical chunk count (any real frame is larger than this).
+const MIN_BYTES_PER_FRAME_EST = 1024;
 function computeEncodeChunkSize(width, height) {
-    // ~0.05 bytes/px is an empirical floor for near-binary line-art encoded with
-    // PNG deflate (mostly white background + thin black lines → very high redundancy).
+    // ~0.05 bytes/px is an empirical estimate for near-binary line-art encoded
+    // with PNG deflate (white background + thin black lines → very high redundancy).
     // Real-world measurements range from 0.03 to 0.08 bytes/px depending on detail.
     const bytesPerFrameEst = width * height * 0.05;
-    const targetBytes      = 400 * 1024 * 1024;    // 400 MB target WASM FS usage per chunk
-    // Floor at 1024 bytes so tiny/degenerate resolutions (e.g. 1×1 test frames)
-    // don't produce an astronomically large chunk count.
-    const frames = Math.floor(targetBytes / Math.max(bytesPerFrameEst, 1024));
+    const targetBytes      = TARGET_CHUNK_WASM_MB * 1024 * 1024;
+    const frames = Math.floor(targetBytes / Math.max(bytesPerFrameEst, MIN_BYTES_PER_FRAME_EST));
     return Math.max(60, Math.min(600, frames));
 }
 
@@ -1210,7 +1220,12 @@ function computeEncodeChunkSize(width, height) {
 // call, executed as soon as its last frame has been written to WASM FS.
 // Serialised per-segment via Promise chaining so two chunks for the same
 // segment never encode concurrently (each FFmpeg instance is single-threaded).
-async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, inputKbps, threadsPerSeg) {
+//
+// CRF-only encoding: no -maxrate/-bufsize cap.  CRF 28 lets libx264 spend
+// exactly the bits the content requires — near-binary line-art compresses to
+// far less than the source, so the output is always smaller in practice.
+// A hard bitrate ceiling would only hurt quality without saving space.
+async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, threadsPerSeg) {
     const chunkDir = `seg${segIdx}/c${chunkIdx}`;
     const outPath  = `${chunkDir}/out.mp4`;
     const segArgs  = [
@@ -1221,7 +1236,8 @@ async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, inpu
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'animation',
-        // CRF 28: perceptually lossless for binary line art.
+        // CRF 28: perceptually lossless for binary line art.  No -maxrate so the
+        // encoder can use as many bits as the content needs (always tiny for 2-colour art).
         '-crf', '28',
         // GOP = 1 second: each chunk starts with an I-frame, making stream-copy
         // concatenation of chunks correct without re-encoding.
@@ -1230,8 +1246,6 @@ async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, inpu
         '-pix_fmt', 'yuv420p',
         // Ensure even dimensions required by yuv420p.
         '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-maxrate', `${inputKbps}k`,
-        '-bufsize', `${inputKbps * 2}k`,
         outPath,
     ];
     const segLog  = [];
@@ -1431,18 +1445,6 @@ async function renderVideoExport() {
             }
         }
 
-        // ── Max-bitrate guard — output file will never exceed input size ───────
-        // Line-art compresses far better than the source video, so in practice
-        // the output is always smaller.  This cap is a safety net for edge cases
-        // (e.g. already-compressed input, very short clips).
-        // Floor at MIN_OUTPUT_BITRATE_KBPS so the encoder never gets an impossibly
-        // tight budget (e.g. for very short clips where the arithmetic gives <100).
-        const MIN_OUTPUT_BITRATE_KBPS = 200;
-        const inputKbps = Math.max(
-            MIN_OUTPUT_BITRATE_KBPS,
-            Math.ceil((state.selectedFile.size * 8) / (video.duration * 1000))
-        );
-
         // ---- Parallel frame pipeline ------------------------------------------------
         // Each frame is processed concurrently (seek → OpenCV → PNG encode → write)
         // and written to its assigned segment/chunk directory.
@@ -1604,7 +1606,7 @@ async function renderVideoExport() {
                             segEncodeChain[segIdx].then(() =>
                                 encodeOneChunk(
                                     segFfmpeg, segIdx, chunkIdx, expectedInChunk,
-                                    fps, inputKbps, threadsPerSeg
+                                    fps, threadsPerSeg
                                 ).then(mp4 => {
                                     chunkMp4Maps[segIdx][chunkIdx] = mp4;
                                     // Mark as cleaned; key format: 'seg${s}-${c}'.
@@ -1735,7 +1737,10 @@ async function renderVideoExport() {
         if (segCount === 1) {
             if (sourceWritten) {
                 // Single segment + audio: mux audio onto the encoded video.
-                // -c:v copy avoids a re-encode; -c:a aac re-encodes audio to AAC.
+                // -c:v copy avoids a re-encode.
+                // -c:a aac -q:a 1: VBR AAC quality level 1 (highest), ensuring
+                // the audio track is fully transparent with no bitrate ceiling
+                // that could degrade quality vs. the source.
                 finalArgs = [
                     '-y',
                     '-i', `${jobId}/seg0.mp4`,
@@ -1743,7 +1748,7 @@ async function renderVideoExport() {
                     '-map', '0:v:0',
                     '-map', '1:a?',
                     '-c:v', 'copy',
-                    '-c:a', 'aac',
+                    '-c:a', 'aac', '-q:a', '1',
                     '-shortest',
                     '-movflags', '+faststart',
                     outputPath,
@@ -1776,7 +1781,7 @@ async function renderVideoExport() {
                     '-map', '0:v:0',
                     '-map', '1:a?',
                     '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
-                    '-c:a', 'aac',
+                    '-c:a', 'aac', '-q:a', '1',
                     '-shortest',
                     '-movflags', '+faststart',
                     outputPath,
@@ -1826,6 +1831,55 @@ async function renderVideoExport() {
         elements.videoResult.hidden = false;
         setProgress(100, 'MP4 export ready.');
         console.log('Video render complete. Download or review the MP4.', 'success');
+
+        // ── Audio-only extract — always offer when source is available ─────────
+        // Extract the audio track separately so the user can re-mux manually
+        // if needed (e.g. if audio mux ever fails for edge-case input files).
+        // This runs after the main MP4 is ready so it never blocks the result.
+        if (sourceWritten) {
+            const audioPath = `${jobId}/audio.m4a`;
+            try {
+                const audioLog  = [];
+                const audioLogH = ({ message }) => audioLog.push(message);
+                ffmpeg.on('log', audioLogH);
+                let audioCode;
+                try {
+                    audioCode = await ffmpeg.exec([
+                        '-y',
+                        '-i', inputPath,
+                        '-vn',              // drop video
+                        '-c:a', 'aac', '-q:a', '1',
+                        '-movflags', '+faststart',
+                        audioPath,
+                    ]);
+                } finally {
+                    ffmpeg.off('log', audioLogH);
+                }
+                if (audioCode === 0) {
+                    const audioData = await ffmpeg.readFile(audioPath);
+                    await safeDeleteFile(ffmpeg, audioPath);
+                    if (audioData && audioData.byteLength > 0) {
+                        const audioBlob = new Blob([audioData], { type: 'audio/mp4' });
+                        revokeUrl('audioUrl');
+                        state.audioUrl = URL.createObjectURL(audioBlob);
+                        elements.audioDownloadLink.href     = state.audioUrl;
+                        elements.audioDownloadLink.download = `${safeBaseName}-audio.m4a`;
+                        elements.audioDownloadCard.hidden   = false;
+                        console.log('Audio track extracted separately. Download if needed.', 'success');
+                    }
+                } else {
+                    // No audio stream in the source — silently skip the download card.
+                    console.warn(
+                        'Audio extraction produced no output (source may have no audio). ' +
+                        audioLog.slice(-5).join(' ')
+                    );
+                    await safeDeleteFile(ffmpeg, audioPath);
+                }
+            } catch (audioErr) {
+                // Best-effort: audio extraction failing never blocks the main download.
+                console.warn('Could not extract audio track:', audioErr.message);
+            }
+        }
 
     } finally {
         // Always destroy the decode pool even if the render was cancelled or threw.
