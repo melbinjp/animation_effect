@@ -132,14 +132,17 @@ const state = {
     encodePhaseScale: 0.1
 };
 
+// All thresholds are advisory only — the app never blocks processing based on
+// file size or duration.  Large files are handled through streaming encode and
+// graceful fallback (video-only output when the source is too large for audio
+// mux).
 const PRODUCTION_LIMITS = {
-    recommendedVideoDurationSeconds: 20,
-    hardVideoDurationSeconds: 90,
-    recommendedVideoFrames: 540,
-    hardVideoFrames: 1800,
+    recommendedVideoDurationSeconds: 60,    // suggest lower FPS above 1 min
+    hardVideoDurationSeconds: 7200,         // extra-heavy advisory above 2 hours
+    recommendedVideoFrames: 1800,           // ~1 min at 30 fps
+    hardVideoFrames: 216000,                // ~2 hours at 30 fps
     recommendedImageMegaPixels: 8,
-    recommendedVideoMegaPixels: 3,
-    hardFileSizeBytes: 250 * 1024 * 1024
+    recommendedVideoMegaPixels: 8,          // 4K native is fine
 };
 
 // Safe default cap on worker count.  Even on a 16-core machine spawning 16
@@ -661,7 +664,10 @@ function getSettings() {
 
 function computeScaledSize(width, height, scale, noCap = false) {
     const largestSide = Math.max(width, height);
-    const dimensionCap = 1600;
+    // Cap at 4096 px (largest side) so 4K videos render at full native quality
+    // while true 8K is safely downscaled to ~4K equivalent in standard presets.
+    // Custom mode (noCap = true) bypasses the cap for unrestricted processing.
+    const dimensionCap = 4096;
     const capRatio = (!noCap && largestSide > dimensionCap) ? dimensionCap / largestSide : 1;
     const ratio = Math.min(1, scale * capRatio);
 
@@ -717,16 +723,15 @@ function summarizeWorkload() {
             frameMegaPixels > PRODUCTION_LIMITS.recommendedVideoMegaPixels
         ) {
             tone = 'warn';
-            guidance = 'Heavy render. Use lower FPS or render size for better reliability.';
+            guidance = 'Heavy render. Lower FPS or render size will speed things up.';
         }
 
         if (
             state.sourceVideo.duration > PRODUCTION_LIMITS.hardVideoDurationSeconds ||
-            totalFrames > PRODUCTION_LIMITS.hardVideoFrames ||
-            state.selectedFile.size > PRODUCTION_LIMITS.hardFileSizeBytes
+            totalFrames > PRODUCTION_LIMITS.hardVideoFrames
         ) {
             tone = 'warn';
-            guidance = 'This clip is near the practical browser limit. Expect long processing time and high memory use.';
+            guidance = 'Very long video. Processing will take a while — the streaming encode pipeline handles it safely.';
         }
 
         setAdvisory(
@@ -739,11 +744,10 @@ function summarizeWorkload() {
     setAdvisory('Select a supported image or video file.', 'warn');
 }
 
-function assertWithinOperationalLimits(file) {
-    const isCustomMode = elements.preset.value === 'custom';
-    if (!isCustomMode && file.size > PRODUCTION_LIMITS.hardFileSizeBytes) {
-        throw new Error('File is too large for reliable browser-side processing. Keep uploads under 250 MB. Switch to the "Custom / Experiment" preset to bypass this limit.');
-    }
+function assertWithinOperationalLimits(_file) {
+    // No hard blocks — large files and long videos are handled gracefully.
+    // Very large source files fall back to video-only output (no audio mux)
+    // if they cannot be loaded into the WASM filesystem.
 }
 
 function drawEmptyCanvas(canvas, label) {
@@ -1174,6 +1178,92 @@ function computeEncodeWorkers(totalFrames) {
     return Math.min(MAX_ENCODE_WORKERS, maxByMem, maxByCores, maxByFrames);
 }
 
+// Determine how many frames to encode per streaming chunk.
+//
+// Streaming encode writes frames to the FFmpeg WASM filesystem one chunk at a
+// time and encodes+deletes each chunk before writing the next one.  This caps
+// peak WASM FS usage to one chunk's worth of PNG data regardless of total video
+// length, preventing RangeError OOM on multi-hour or 4K/8K videos.
+//
+// Chunk size is chosen so the accumulated PNG data stays under ~400 MB:
+//   • Estimated PNG size per frame ≈ 0.05 bytes/pixel (near-binary line-art
+//     compresses very aggressively with PNG deflate).
+//   • Minimum 60 frames (≈2 s at 30 fps) to avoid excessive FFmpeg invocations.
+//   • Maximum 600 frames (≈20 s at 30 fps) to keep encode-round latency low.
+function computeEncodeChunkSize(width, height) {
+    // ~0.05 bytes/px is an empirical floor for near-binary line-art encoded with
+    // PNG deflate (mostly white background + thin black lines → very high redundancy).
+    // Real-world measurements range from 0.03 to 0.08 bytes/px depending on detail.
+    const bytesPerFrameEst = width * height * 0.05;
+    const targetBytes      = 400 * 1024 * 1024;    // 400 MB target WASM FS usage per chunk
+    // Floor at 1024 bytes so tiny/degenerate resolutions (e.g. 1×1 test frames)
+    // don't produce an astronomically large chunk count.
+    const frames = Math.floor(targetBytes / Math.max(bytesPerFrameEst, 1024));
+    return Math.max(60, Math.min(600, frames));
+}
+
+// Encode all PNG frames in chunkDir to a mini-segment MP4 (video-only), read
+// the result, delete every frame file and the output from the WASM heap, then
+// return the encoded MP4 as a Uint8Array.
+//
+// Called by the streaming encode pipeline in renderVideoExport: one chunk per
+// call, executed as soon as its last frame has been written to WASM FS.
+// Serialised per-segment via Promise chaining so two chunks for the same
+// segment never encode concurrently (each FFmpeg instance is single-threaded).
+async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, inputKbps, threadsPerSeg) {
+    const chunkDir = `seg${segIdx}/c${chunkIdx}`;
+    const outPath  = `${chunkDir}/out.mp4`;
+    const segArgs  = [
+        '-y',
+        '-framerate', String(fps),
+        '-start_number', '0',
+        '-i', `${chunkDir}/frame-%05d.png`,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'animation',
+        // CRF 28: perceptually lossless for binary line art.
+        '-crf', '28',
+        // GOP = 1 second: each chunk starts with an I-frame, making stream-copy
+        // concatenation of chunks correct without re-encoding.
+        '-g', String(Math.max(1, Math.round(fps))),
+        '-threads', String(threadsPerSeg),
+        '-pix_fmt', 'yuv420p',
+        // Ensure even dimensions required by yuv420p.
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-maxrate', `${inputKbps}k`,
+        '-bufsize', `${inputKbps * 2}k`,
+        outPath,
+    ];
+    const segLog  = [];
+    const segLogH = ({ message }) => segLog.push(message);
+    segFfmpeg.on('log', segLogH);
+    let exitCode;
+    try {
+        exitCode = await segFfmpeg.exec(segArgs);
+    } finally {
+        segFfmpeg.off('log', segLogH);
+    }
+    if (exitCode !== 0) {
+        throw new Error(
+            `Chunk ${segIdx}:${chunkIdx} encode failed (exit ${exitCode}).\n` +
+            segLog.slice(-20).join('\n')
+        );
+    }
+
+    const mp4Data = await segFfmpeg.readFile(outPath);
+
+    // Delete frame PNGs and the output immediately — critical for keeping the
+    // WASM FS footprint bounded regardless of total video length.
+    const frameDels = Array.from({ length: frameCount }, (_, i) =>
+        safeDeleteFile(segFfmpeg, `${chunkDir}/frame-${String(i).padStart(5, '0')}.png`)
+    );
+    await Promise.all(frameDels);
+    await safeDeleteFile(segFfmpeg, outPath);
+    try { await segFfmpeg.deleteDir(chunkDir); } catch (_) {}
+
+    return mp4Data;
+}
+
 async function renderVideoExport() {
     const ffmpeg = await loadFFmpeg();
     const settings = getSettings();
@@ -1189,37 +1279,81 @@ async function renderVideoExport() {
     state.activeJobId = jobId;
 
     // Declared at function scope so the finally block can always read them.
-    let totalFrames      = 1;
-    let segCount         = 1;
-    let framesPerSegment = 1;
-    let decodePool       = null;
+    let totalFrames       = 1;
+    let segCount          = 1;
+    let framesPerSegment  = 1;
+    // ENCODE_CHUNK_FRAMES is computed after frame dimensions are known; 300 is a
+    // safe default that is replaced before it is first used.
+    let ENCODE_CHUNK_FRAMES = 300;
+    let threadsPerSeg     = 1;
+    // sourceWritten: true when the source file was successfully loaded into the
+    // main FFmpeg WASM FS.  False for very large files (multi-GB) that exceed
+    // the WASM address space — in that case FPS detection and audio mux are
+    // skipped and the output is video-only.
+    let sourceWritten     = false;
+    let decodePool        = null;
     // segInstances[0] is always state.ffmpeg (main); [1..N-1] are fresh workers.
-    const segInstances = [];
+    const segInstances    = [];
+    // Per-segment Promise chains that serialise chunk encodes within each segment.
+    let segEncodeChain    = null;
+    // Per-segment per-chunk MP4 Uint8Arrays (populated by encodeOneChunk).
+    let chunkMp4Maps      = null;
+    // Per-segment per-chunk frame-written counters (keyed by chunkIdx).
+    let chunkFrameCounts  = null;
+    // Set of 'seg${s}-${c}' keys for chunks that were fully encoded and cleaned.
+    let cleanedChunks     = null;
+    // All pending chunk-encode promises (awaited after the frame loop).
+    const allEncodePs     = [];
 
     try {
         await ffmpeg.createDir(jobId);
-        await ffmpeg.writeFile(
-            inputPath,
-            new Uint8Array(await state.selectedFile.arrayBuffer())
-        );
+
+        // Write the source file to the main FFmpeg WASM filesystem for FPS
+        // detection and audio mux.  Very large files (multi-GB) may exceed the
+        // WASM address space (~2–4 GB); catch any failure and fall back to
+        // video-only output rather than aborting the render entirely.
+        setProgress(1, 'Loading source into processing engine...');
+        try {
+            const sourceBuf = await state.selectedFile.arrayBuffer();
+            await ffmpeg.writeFile(inputPath, new Uint8Array(sourceBuf));
+            sourceWritten = true;
+        } catch (writeErr) {
+            console.warn(
+                `Source file (${formatFileSize(state.selectedFile.size)}) could not be ` +
+                `loaded into the video engine: ${writeErr.message}. ` +
+                `FPS detection and audio mux will be skipped — output will be video-only.`
+            );
+            setAdvisory(
+                `Source file is too large for audio mux — output will be video-only. ` +
+                `File size: ${formatFileSize(state.selectedFile.size)}.`,
+                'warn'
+            );
+        }
 
         // ── FPS detection ──────────────────────────────────────────────────────
         if (settings.isOriginalFps) {
-            setProgress(2, 'Detecting original framerate...');
-            let detectedFps = null;
-            const logHandler = ({ message }) => {
-                const m = message.match(/(\d+(?:\.\d+)?) fps/);
-                if (m) detectedFps = parseFloat(m[1]);
-            };
-            ffmpeg.on('log', logHandler);
-            try { await ffmpeg.exec(['-i', inputPath]); } catch (_) { /* expected */ }
-            ffmpeg.off('log', logHandler);
-            if (detectedFps && detectedFps > 0) {
-                fps = detectedFps;
-                console.log(`Detected original FPS: ${fps}`);
+            if (sourceWritten) {
+                setProgress(2, 'Detecting original framerate...');
+                let detectedFps = null;
+                const logHandler = ({ message }) => {
+                    const m = message.match(/(\d+(?:\.\d+)?) fps/);
+                    if (m) detectedFps = parseFloat(m[1]);
+                };
+                ffmpeg.on('log', logHandler);
+                try { await ffmpeg.exec(['-i', inputPath]); } catch (_) { /* expected */ }
+                ffmpeg.off('log', logHandler);
+                if (detectedFps && detectedFps > 0) {
+                    fps = detectedFps;
+                    console.log(`Detected original FPS: ${fps}`);
+                } else {
+                    console.warn('Could not detect original FPS, falling back to 30');
+                    fps = 30;
+                }
             } else {
-                console.warn('Could not detect original FPS, falling back to 30');
-                fps = 30;
+                // Source file was not written (too large for WASM FS).  Use the
+                // user-specified FPS setting — we cannot probe without the file.
+                setProgress(2, 'Using specified framerate (source too large to probe)...');
+                console.warn('Cannot detect original FPS for oversized source; using user-specified FPS.');
             }
         }
 
@@ -1266,6 +1400,37 @@ async function renderVideoExport() {
             await segInstances[s].createDir(`seg${s}`);
         }
 
+        // ── Streaming encode setup ─────────────────────────────────────────────
+        // Compute encode chunk size from the estimated output frame resolution.
+        // This bounds WASM FS PNG usage to ~400 MB per chunk regardless of the
+        // total video length, preventing OOM for multi-hour or 4K/8K videos.
+        const estDims = computeScaledSize(
+            video.videoWidth, video.videoHeight, settings.scale, settings.customMode
+        );
+        ENCODE_CHUNK_FRAMES = computeEncodeChunkSize(estDims.width, estDims.height);
+
+        // Thread budget: split cores evenly across segment encode workers so all
+        // segments encode in parallel without excessive thread contention.
+        threadsPerSeg = Math.max(
+            1, Math.floor((navigator.hardwareConcurrency || 2) / segCount)
+        );
+
+        // Initialise per-segment state for the streaming encode pipeline.
+        segEncodeChain   = segInstances.map(() => Promise.resolve());
+        chunkMp4Maps     = segInstances.map(() => ({}));
+        chunkFrameCounts = segInstances.map(() => ({}));
+        cleanedChunks    = new Set();
+
+        // Pre-create all chunk sub-directories so frame writes never race with
+        // directory creation.  The number of chunks is small (typically <100 per
+        // segment for hour-long 4K video) so this is fast.
+        const chunksPerSeg = Math.ceil(framesPerSegment / ENCODE_CHUNK_FRAMES);
+        for (let s = 0; s < segCount; s++) {
+            for (let c = 0; c < chunksPerSeg; c++) {
+                await segInstances[s].createDir(`seg${s}/c${c}`);
+            }
+        }
+
         // ── Max-bitrate guard — output file will never exceed input size ───────
         // Line-art compresses far better than the source video, so in practice
         // the output is always smaller.  This cap is a safety net for edge cases
@@ -1280,28 +1445,22 @@ async function renderVideoExport() {
 
         // ---- Parallel frame pipeline ------------------------------------------------
         // Each frame is processed concurrently (seek → OpenCV → PNG encode → write)
-        // and written to its assigned segment's FFmpeg FS.
+        // and written to its assigned segment/chunk directory.
         //
-        // A pipeline-wide Semaphore caps the number of frames simultaneously alive
-        // in the seek→process→PNG→write pipeline.  Without this cap, all frames
-        // are queued upfront; each holds ~8 MB of canvas/pixel data, totalling
-        // several GB for long/hi-res videos and causing RangeError OOM crashes.
+        // Streaming encode: whenever all frames of an encode chunk are written to
+        // WASM FS, the chunk is immediately encoded to a mini-MP4 and its frame
+        // files are deleted.  This bounds peak WASM FS usage to one chunk's worth
+        // of PNG data (~400 MB) regardless of total video length.
         //
-        // Batching (BATCH_SIZE = 2 × concurrency) adds a GC checkpoint between
-        // batches so completed frame closures and their pixel buffers are reclaimed.
-        //
-        // STAGGER: frames 1…N-1 in the first pool-sized batch start with a small
-        // per-frame delay so GPU workers receive tasks at offset times, smoothing
-        // the sawtooth GPU utilisation pattern.
-        // Delay (ms) between consecutive frame-decode starts in the first batch.
-        // Large enough to break lock-step GPU submission; small enough to keep
-        // the pipeline full with no idle time between workers.
+        // A pipeline-wide Semaphore caps concurrently in-flight frames to prevent
+        // OOM on long/hi-res videos.  Batching adds a GC checkpoint so completed
+        // frame closures and pixel buffers are reclaimed between batches.
         const FRAME_STAGGER_MS = 30;
         const decodePoolSize   = processor.concurrency;
         decodePool = new VideoDecodePool(decodePoolSize, video);
         state.activeDecodePool = decodePool;
 
-        // +1 slot lets FFmpeg writeFile for frame N overlap with decoding of
+        // +1 slot lets WASM writeFile for frame N overlap with decoding of
         // frame N+concurrency, hiding I/O latency without extra memory cost.
         const inFlightSem = new Semaphore(processor.concurrency + 1);
         const BATCH_SIZE  = Math.max(1, processor.concurrency * 2);
@@ -1337,6 +1496,17 @@ async function renderVideoExport() {
 
                     // Bound total in-flight frames to prevent OOM on long/hi-res videos.
                     await inFlightSem.acquire();
+
+                    // Compute chunk routing for this frame.  localIdx is the
+                    // frame's position within its segment; chunkIdx and withinChunk
+                    // give its position within the streaming encode chunk.
+                    const chunkIdx     = Math.floor(localIdx / ENCODE_CHUNK_FRAMES);
+                    const withinChunk  = localIdx % ENCODE_CHUNK_FRAMES;
+                    const chunkStart   = chunkIdx * ENCODE_CHUNK_FRAMES;
+                    const chunkEnd     = Math.min(chunkStart + ENCODE_CHUNK_FRAMES, framesPerSegment);
+                    const expectedInChunk = chunkEnd - chunkStart;
+
+                    let shouldTriggerChunkEncode = false;
                     try {
                         // Phase 1: seek + draw to a private off-screen canvas so
                         // concurrent frames never overwrite each other's pixels.
@@ -1366,7 +1536,7 @@ async function renderVideoExport() {
                         }
 
                         // Phase 2: OpenCV/GPU processing → PNG encode → write to
-                        // the assigned segment's FFmpeg WASM filesystem.
+                        // the assigned segment/chunk directory.
                         throwIfCancelled();
                         let rawData = await processor.renderToData(offCanvas, settings);
                         offCanvas = null; // release canvas backing store immediately
@@ -1374,8 +1544,7 @@ async function renderVideoExport() {
                         throwIfCancelled();
 
                         // Draw processed pixels to a temporary canvas once.
-                        // This canvas is used for both the live preview and PNG
-                        // encoding, avoiding a second ImageData allocation.
+                        // This canvas serves both the live preview and PNG encoding.
                         const tmpCanvas = document.createElement('canvas');
                         tmpCanvas.width  = capturedW;
                         tmpCanvas.height = capturedH;
@@ -1392,27 +1561,58 @@ async function renderVideoExport() {
                             elements.outputCanvas.getContext('2d').drawImage(tmpCanvas, 0, 0);
                         }
 
-                        // PNG compresses near-binary line-art 10–50× smaller than
-                        // BMP, keeping the total WASM FS usage well within the
-                        // ~2–4 GB WASM address space limit for long/hi-res videos.
-                        let frameBlob = await canvasToBlob(tmpCanvas, 'image/png');
+                        // PNG compresses near-binary line-art 10–50× vs BMP.
+                        // The streaming chunk architecture bounds total WASM FS
+                        // usage to ~400 MB regardless of video length.
+                        let frameBlob  = await canvasToBlob(tmpCanvas, 'image/png');
                         let frameBytes = new Uint8Array(await frameBlob.arrayBuffer());
                         frameBlob = null;
 
                         throwIfCancelled();
                         await segFfmpeg.writeFile(
-                            `seg${segIdx}/frame-${String(localIdx).padStart(5, '0')}.png`,
+                            `seg${segIdx}/c${chunkIdx}/frame-${String(withinChunk).padStart(5, '0')}.png`,
                             frameBytes
                         );
                         frameBytes = null; // GC: written to WASM FS
 
+                        // Increment chunk counter (synchronous — JS single-threaded,
+                        // no race between interleaved async functions at this point).
+                        // Only the one frame that pushes the count exactly to
+                        // expectedInChunk sets shouldTriggerChunkEncode = true.
+                        chunkFrameCounts[segIdx][chunkIdx] =
+                            (chunkFrameCounts[segIdx][chunkIdx] || 0) + 1;
+                        const newCount = chunkFrameCounts[segIdx][chunkIdx];
+                        shouldTriggerChunkEncode = (newCount === expectedInChunk);
+
                         completedFrames++;
                         setProgress(
-                            5 + (completedFrames / totalFrames) * 85,
+                            5 + (completedFrames / totalFrames) * 83,
                             `Processed frame ${completedFrames} of ${totalFrames}...`
                         );
                     } finally {
                         inFlightSem.release();
+                    }
+
+                    // Trigger chunk encode OUTSIDE the semaphore so encoding
+                    // runs concurrently with subsequent frame processing and does
+                    // not hold a processing slot.
+                    if (shouldTriggerChunkEncode) {
+                        // Chain encode for this segment so two chunks for the same
+                        // segment never encode simultaneously (each FFmpeg instance
+                        // is single-threaded; concurrent execs would deadlock).
+                        const encP = segEncodeChain[segIdx] =
+                            segEncodeChain[segIdx].then(() =>
+                                encodeOneChunk(
+                                    segFfmpeg, segIdx, chunkIdx, expectedInChunk,
+                                    fps, inputKbps, threadsPerSeg
+                                ).then(mp4 => {
+                                    chunkMp4Maps[segIdx][chunkIdx] = mp4;
+                                    // Mark as cleaned; key format: 'seg${s}-${c}'.
+                                    // The finally block skips chunks in this set.
+                                    cleanedChunks.add(`${segIdx}-${chunkIdx}`);
+                                })
+                            );
+                        allEncodePs.push(encP);
                     }
                 })();
 
@@ -1420,9 +1620,9 @@ async function renderVideoExport() {
             }
 
             // Await the full batch before scheduling the next one.
-            // This gives the JS garbage collector a definite checkpoint to reclaim
-            // completed frame closures and their large pixel buffers — essential
-            // for long, high-resolution videos that would otherwise accumulate GBs.
+            // This gives the JS GC a definite checkpoint to reclaim completed
+            // frame closures and large pixel buffers — essential for multi-hour
+            // videos that would otherwise accumulate GBs of retained closures.
             const batchResults = await Promise.allSettled(batchPromises);
             const firstFailure = batchResults.find(r => r.status === 'rejected');
             if (firstFailure) throw firstFailure.reason;
@@ -1435,105 +1635,90 @@ async function renderVideoExport() {
 
         throwIfCancelled();
 
-        // ── Parallel encode ────────────────────────────────────────────────────
-        // All N segment instances encode their frames simultaneously.
-        // Thread budget: floor(total-cores / segCount) per segment keeps all
-        // segments encoding in parallel without excessive thread contention.
-        const threadsPerSeg = Math.max(
-            1, Math.floor((navigator.hardwareConcurrency || 2) / segCount)
-        );
+        // ── Await all pending chunk encodes ────────────────────────────────────
+        // Chunk encodes run concurrently with frame processing.  By the time all
+        // frames are written, most chunks are already encoded.  Wait for any that
+        // are still in progress before moving to assembly.
+        setProgress(88, 'Finishing pending chunk encodes...');
+        state.encodePhaseOffset = 88;
+        state.encodePhaseScale  = 0.04;
+        if (allEncodePs.length > 0) {
+            const encResults = await Promise.allSettled(allEncodePs);
+            const encFailure = encResults.find(r => r.status === 'rejected');
+            if (encFailure) throw encFailure.reason;
+        }
 
-        setProgress(
-            90,
-            segCount > 1
-                ? `Encoding ${segCount} video segments in parallel...`
-                : 'Encoding video...'
-        );
-        console.log(
-            segCount > 1
-                ? `Parallel encode: ${segCount} segments × ${threadsPerSeg} threads`
-                : `Encoding video (${threadsPerSeg} threads)...`,
-            'info'
-        );
+        throwIfCancelled();
 
-        // Map state.ffmpeg progress events (fired for segment 0) to 90–96 %.
-        state.encodePhaseOffset = 90;
-        state.encodePhaseScale  = 0.06;
+        // ── Segment assembly: concat each segment's chunk MP4s ─────────────────
+        // Each segment has one or more chunk mini-MP4s stored in chunkMp4Maps.
+        // Concatenate them (stream-copy) within the owning segment instance so
+        // we never need to move large MP4 data between instances.
+        setProgress(92, 'Assembling video segments...');
+        state.encodePhaseOffset = 92;
+        state.encodePhaseScale  = 0.04;
 
-        // encodeOneSegment: encode all PNG frames in seg${s}/ to seg${s}/out.mp4
-        // (video-only), read the result, then immediately delete frame files from
-        // the WASM heap to free memory before the concat step.
-        const encodeOneSegment = async (segFfmpeg, s) => {
-            const segFrameCount = Math.min(
-                framesPerSegment, totalFrames - s * framesPerSegment
-            );
-            const segArgs = [
-                '-y',
-                '-framerate', String(fps),
-                '-start_number', '0',
-                '-i', `seg${s}/frame-%05d.png`,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'animation',
-                // CRF 28: perceptually lossless for binary line art, ~30 % faster
-                // than the default CRF 23 with no visible quality loss.
-                '-crf', '28',
-                // GOP = 1 second: cheap I-frames for 2-colour content; enables
-                // clean seeking.
-                '-g', String(Math.max(1, Math.round(fps))),
-                '-threads', String(threadsPerSeg),
-                '-pix_fmt', 'yuv420p',
-                // Ensure even dimensions required by yuv420p.
-                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-                // Hard bitrate cap so the output segment never exceeds the input
-                // bitrate — guarantees the final file is no larger than the source.
-                '-maxrate', `${inputKbps}k`,
-                '-bufsize', `${inputKbps * 2}k`,
-                `seg${s}/out.mp4`,
-            ];
-            const segLog  = [];
-            const segLogH = ({ message }) => segLog.push(message);
-            segFfmpeg.on('log', segLogH);
-            let exitCode;
-            try {
-                exitCode = await segFfmpeg.exec(segArgs);
-            } finally {
-                segFfmpeg.off('log', segLogH);
+        const segMp4Bufs = await Promise.all(segInstances.map(async (segFfmpeg, s) => {
+            const chunkKeys = Object.keys(chunkMp4Maps[s])
+                .map(Number)
+                .sort((a, b) => a - b);
+
+            if (chunkKeys.length === 0) {
+                throw new Error(`Segment ${s} has no encoded chunks.`);
             }
-            if (exitCode !== 0) {
+            if (chunkKeys.length === 1) {
+                // Single chunk — no concat needed, already a valid MP4.
+                return chunkMp4Maps[s][chunkKeys[0]];
+            }
+
+            // Write each chunk MP4 to the segment instance's WASM FS, concat via
+            // stream copy, read the result, then delete temporaries.
+            for (const c of chunkKeys) {
+                await segFfmpeg.writeFile(`seg${s}/chunk${c}.mp4`, chunkMp4Maps[s][c]);
+                chunkMp4Maps[s][c] = null; // GC: written to WASM FS
+            }
+            const concatLines = chunkKeys
+                .map(c => `file 'seg${s}/chunk${c}.mp4'`)
+                .join('\n');
+            await segFfmpeg.writeFile(
+                `seg${s}/concat_chunks.txt`,
+                new TextEncoder().encode(concatLines)
+            );
+            const concatLog  = [];
+            const concatLogH = ({ message }) => concatLog.push(message);
+            segFfmpeg.on('log', concatLogH);
+            let concatCode;
+            try {
+                concatCode = await segFfmpeg.exec([
+                    '-y', '-f', 'concat', '-safe', '0',
+                    '-i', `seg${s}/concat_chunks.txt`,
+                    '-c', 'copy',
+                    `seg${s}/out.mp4`,
+                ]);
+            } finally {
+                segFfmpeg.off('log', concatLogH);
+            }
+            if (concatCode !== 0) {
                 throw new Error(
-                    `Segment ${s} encode failed (exit ${exitCode}).\n` +
-                    segLog.slice(-20).join('\n')
+                    `Segment ${s} chunk concat failed (exit ${concatCode}).\n` +
+                    concatLog.slice(-20).join('\n')
                 );
             }
-
-            // Read the encoded segment before freeing WASM heap.
-            const mp4Data = await segFfmpeg.readFile(`seg${s}/out.mp4`);
-
-            // Delete frame PNGs and the encoded segment from this instance's WASM
-            // heap immediately — critical for long videos where frames linger until
-            // the outer finally block and exhaust the WASM address space.
-            const frameDels = Array.from({ length: segFrameCount }, (_, i) =>
-                safeDeleteFile(
-                    segFfmpeg,
-                    `seg${s}/frame-${String(i).padStart(5, '0')}.png`
-                )
-            );
-            await Promise.all(frameDels);
+            const mp4 = await segFfmpeg.readFile(`seg${s}/out.mp4`);
+            // Delete chunk MP4s and the concat result immediately.
+            await Promise.all(chunkKeys.map(c =>
+                safeDeleteFile(segFfmpeg, `seg${s}/chunk${c}.mp4`)
+            ));
+            await safeDeleteFile(segFfmpeg, `seg${s}/concat_chunks.txt`);
             await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
-            try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
-
-            return mp4Data;
-        };
-
-        const segMp4Bufs = await Promise.all(
-            segInstances.map((inst, s) => encodeOneSegment(inst, s))
-        );
+            return mp4;
+        }));
 
         throwIfCancelled();
 
         // ── Final assembly: merge all segments + mux original audio ───────────
-        setProgress(96, 'Assembling final video with audio...');
+        const assemblyLabel = sourceWritten ? 'Assembling final video with audio...' : 'Assembling final video (video-only)...';
+        setProgress(96, assemblyLabel);
         console.log('Assembling final video...', 'info');
 
         // Map progress events to the 96–100 % band during the final mux.
@@ -1548,23 +1733,33 @@ async function renderVideoExport() {
 
         let finalArgs;
         if (segCount === 1) {
-            // Single segment: mux audio onto the already-encoded video.
-            // -c:v copy avoids a re-encode; -c:a aac re-encodes audio to AAC.
-            finalArgs = [
-                '-y',
-                '-i', `${jobId}/seg0.mp4`,
-                '-i', inputPath,
-                '-map', '0:v:0',
-                '-map', '1:a?',
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-shortest',
-                '-movflags', '+faststart',
-                outputPath,
-            ];
+            if (sourceWritten) {
+                // Single segment + audio: mux audio onto the encoded video.
+                // -c:v copy avoids a re-encode; -c:a aac re-encodes audio to AAC.
+                finalArgs = [
+                    '-y',
+                    '-i', `${jobId}/seg0.mp4`,
+                    '-i', inputPath,
+                    '-map', '0:v:0',
+                    '-map', '1:a?',
+                    '-c:v', 'copy',
+                    '-c:a', 'aac',
+                    '-shortest',
+                    '-movflags', '+faststart',
+                    outputPath,
+                ];
+            } else {
+                // Source not written — no audio track available.
+                finalArgs = [
+                    '-y',
+                    '-i', `${jobId}/seg0.mp4`,
+                    '-c', 'copy',
+                    '-movflags', '+faststart',
+                    outputPath,
+                ];
+            }
         } else {
-            // Multiple segments: write a concat list, then stream-copy + mux audio.
-            // -safe 0 allows paths containing the jobId prefix.
+            // Multiple segments: write a concat list, then stream-copy.
             const concatContent = Array.from(
                 { length: segCount }, (_, s) => `file '${jobId}/seg${s}.mp4'`
             ).join('\n');
@@ -1572,19 +1767,30 @@ async function renderVideoExport() {
                 `${jobId}/concat.txt`,
                 new TextEncoder().encode(concatContent)
             );
-            finalArgs = [
-                '-y',
-                '-f', 'concat', '-safe', '0',
-                '-i', `${jobId}/concat.txt`,
-                '-i', inputPath,
-                '-map', '0:v:0',
-                '-map', '1:a?',
-                '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
-                '-c:a', 'aac',
-                '-shortest',
-                '-movflags', '+faststart',
-                outputPath,
-            ];
+            if (sourceWritten) {
+                finalArgs = [
+                    '-y',
+                    '-f', 'concat', '-safe', '0',
+                    '-i', `${jobId}/concat.txt`,
+                    '-i', inputPath,
+                    '-map', '0:v:0',
+                    '-map', '1:a?',
+                    '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
+                    '-c:a', 'aac',
+                    '-shortest',
+                    '-movflags', '+faststart',
+                    outputPath,
+                ];
+            } else {
+                finalArgs = [
+                    '-y',
+                    '-f', 'concat', '-safe', '0',
+                    '-i', `${jobId}/concat.txt`,
+                    '-c', 'copy',
+                    '-movflags', '+faststart',
+                    outputPath,
+                ];
+            }
         }
 
         const finalLog  = [];
@@ -1628,22 +1834,42 @@ async function renderVideoExport() {
         }
         state.activeDecodePool = null;
 
-        // Best-effort cleanup of any PNG frames / segment outputs that may still
-        // reside in a segment instance's WASM heap (handles cancel + mid-render
-        // errors).  encodeOneSegment already deletes on success, so these
-        // safeDeleteFile calls are harmless no-ops for already-deleted files.
-        await Promise.allSettled(segInstances.map(async (segFfmpeg, s) => {
-            const n = Math.max(1, framesPerSegment);
-            const frameDels = Array.from({ length: n }, (_, i) =>
-                safeDeleteFile(
-                    segFfmpeg,
-                    `seg${s}/frame-${String(i).padStart(5, '0')}.png`
-                )
+        // Best-effort cleanup of any unfinished chunk frame files / segment dirs
+        // that may still reside in segment WASM heaps (covers cancel + errors).
+        // Chunks successfully encoded by encodeOneChunk are already in cleanedChunks
+        // and skipped here, so cleanup cost is proportional to in-flight work at
+        // the time of cancellation — typically O(1) chunks, not O(totalFrames).
+        if (cleanedChunks && segInstances.length > 0) {
+            const safeChunksPerSeg = Math.max(
+                1, Math.ceil(Math.max(1, framesPerSegment) / Math.max(1, ENCODE_CHUNK_FRAMES))
             );
-            await Promise.allSettled(frameDels);
-            await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
-            try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
-        }));
+            await Promise.allSettled(segInstances.map(async (segFfmpeg, s) => {
+                const chunkCleans = [];
+                for (let c = 0; c < safeChunksPerSeg; c++) {
+                    if (cleanedChunks.has(`${s}-${c}`)) continue; // already done
+                    const chunkDir = `seg${s}/c${c}`;
+                    for (let fi = 0; fi < ENCODE_CHUNK_FRAMES; fi++) {
+                        chunkCleans.push(
+                            safeDeleteFile(segFfmpeg, `${chunkDir}/frame-${String(fi).padStart(5, '0')}.png`)
+                        );
+                    }
+                    chunkCleans.push(safeDeleteFile(segFfmpeg, `${chunkDir}/out.mp4`));
+                }
+                await Promise.allSettled(chunkCleans);
+                // Delete chunk sub-dirs and the segment dir.
+                for (let c = 0; c < safeChunksPerSeg; c++) {
+                    try { await segFfmpeg.deleteDir(`seg${s}/c${c}`); } catch (_) {}
+                }
+                // Clean up any chunk MP4s or concat files written during segment assembly.
+                const chunkKeys = chunkMp4Maps ? Object.keys(chunkMp4Maps[s] || {}).map(Number) : [];
+                for (const c of chunkKeys) {
+                    await safeDeleteFile(segFfmpeg, `seg${s}/chunk${c}.mp4`);
+                }
+                await safeDeleteFile(segFfmpeg, `seg${s}/concat_chunks.txt`);
+                await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
+                try { await segFfmpeg.deleteDir(`seg${s}`); } catch (_) {}
+            }));
+        }
 
         // Clean up the main instance's job directory (input, segment MP4s, concat list, output).
         await cleanupFfmpegJob(ffmpeg, jobId, segCount, inputPath, outputPath);
