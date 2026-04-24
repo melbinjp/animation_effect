@@ -782,15 +782,45 @@ class CpuProcessor {
             }
         }
 
-        cv.GaussianBlur(this.gray, this.gray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+        if (settings.autoNormalize) {
+            const meanMat = new cv.Mat();
+            const stdMat = new cv.Mat();
+            cv.meanStdDev(this.gray, meanMat, stdMat);
+            const mean = meanMat.data64F[0];
+            const std = stdMat.data64F[0];
+            meanMat.delete();
+            stdMat.delete();
+
+            if (mean < 80) {
+                const gamma = Math.max(1.5, Math.min(3.0, 1.0 + (80 - mean) / 40));
+                const lut = new cv.Mat(1, 256, cv.CV_8U);
+                for (let i = 0; i < 256; i++) {
+                    lut.data[i] = Math.round(Math.pow(i / 255, 1 / gamma) * 255);
+                }
+                cv.LUT(this.gray, lut, this.gray);
+                lut.delete();
+            }
+
+            if (std < 45) {
+                cv.normalize(this.gray, this.gray, 0, 255, cv.NORM_MINMAX, cv.CV_8U);
+            }
+
+            const adaptiveClip = Math.max(1.5, Math.min(4.5, 150 / Math.max(mean, 1)));
+            const adaptiveClahe = new cv.CLAHE(adaptiveClip, new cv.Size(8, 8));
+            adaptiveClahe.apply(this.gray, this.gray);
+            adaptiveClahe.delete();
+        }
+
+        cv.GaussianBlur(this.gray, this.gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
         if (settings.darkBoost) {
-            const clahe = new cv.CLAHE(2.5, new cv.Size(8, 8));
+            const clipLimit = Math.max(1.0, Math.min(6.0, settings.darkBoostClip || 2.5));
+            const clahe = new cv.CLAHE(clipLimit, new cv.Size(8, 8));
             clahe.apply(this.gray, this.gray);
             clahe.delete();
         }
 
-        cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
+        cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, true);
 
         const closeKernel = cv.Mat.ones(3, 3, cv.CV_8U);
         cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
@@ -798,10 +828,28 @@ class CpuProcessor {
 
         if (settings.cleanSpeckles) {
             const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
-            const openSize         = 1 + speckleIntensity * 2;
-            const openKernel       = cv.getStructuringElement(cv.MORPH_CROSS, new cv.Size(openSize, openSize));
-            cv.morphologyEx(this.edges, this.edges, cv.MORPH_OPEN, openKernel);
-            openKernel.delete();
+            const MIN_AREA = { 1: 4, 2: 12, 3: 30 };
+            const minArea = MIN_AREA[speckleIntensity];
+            const labels = new cv.Mat();
+            const stats = new cv.Mat();
+            const centroids = new cv.Mat();
+            const numLabels = cv.connectedComponentsWithStats(
+                this.edges, labels, stats, centroids, 8, cv.CV_32S
+            );
+            const statsData = stats.data32S;
+            const labelsData = labels.data32S;
+            const edgeData = this.edges.data;
+            const CC_STATS_COLS = 5;
+            const CC_STAT_AREA = 4;
+            for (let i = 0, len = labelsData.length; i < len; i++) {
+                const label = labelsData[i];
+                if (label !== 0 && statsData[label * CC_STATS_COLS + CC_STAT_AREA] < minArea) {
+                    edgeData[i] = 0;
+                }
+            }
+            labels.delete();
+            stats.delete();
+            centroids.delete();
         }
 
         if (settings.mergeDoubleEdge) {
@@ -816,9 +864,10 @@ class CpuProcessor {
         }
 
         if (settings.lineWeight > 1) {
-            const kernel = cv.Mat.ones(settings.lineWeight, settings.lineWeight, cv.CV_8U);
-            cv.dilate(this.edges, this.edges, kernel);
-            kernel.delete();
+            const lwSize = new cv.Size(settings.lineWeight + 1, settings.lineWeight + 1);
+            const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
+            cv.dilate(this.edges, this.edges, lwKernel);
+            lwKernel.delete();
         }
 
         cv.bitwise_not(this.edges, this.edges);
@@ -877,7 +926,17 @@ initGpu()
         gpuProcessor = proc;
         useGpu       = true;
         console.log('[gpu-worker] WebGPU pipeline ready');
-        self.postMessage({ type: 'cv-ready' });
+        try {
+            importScripts('vendor/opencv.js');
+            cv.onRuntimeInitialized = () => {
+                cpuProcessor = new CpuProcessor();
+                console.log('[gpu-worker] CPU fallback ready for advanced features');
+                self.postMessage({ type: 'cv-ready' });
+            };
+        } catch(e) {
+            console.warn('[gpu-worker] Failed to load OpenCV for CPU fallback:', e);
+            self.postMessage({ type: 'cv-ready' });
+        }
     })
     .catch((err) => {
         console.log('[gpu-worker] WebGPU unavailable (' + err.message + '), loading OpenCV...');
@@ -888,7 +947,19 @@ initGpu()
 
 self.onmessage = function ({ data: msg }) {
     if (msg.type === 'process') {
-        if (useGpu && gpuProcessor) {
+        const reqCpu = msg.settings.autoNormalize || msg.settings.darkBoost || msg.settings.cleanSpeckles;
+        if (reqCpu && cpuProcessor) {
+            try {
+                const result = cpuProcessor.process(msg.rgbaData, msg.width, msg.height, msg.settings);
+                self.postMessage({ type: 'result', id: msg.id, data: result }, [result.buffer]);
+            } catch (err) {
+                let errMsg = err?.message || String(err);
+                if (typeof err === 'number' && typeof cv !== 'undefined' && typeof cv.exceptionFromPtr === 'function') {
+                    errMsg = cv.exceptionFromPtr(err).msg;
+                }
+                self.postMessage({ type: 'error', id: msg.id, message: errMsg });
+            }
+        } else if (useGpu && gpuProcessor && !reqCpu) {
             gpuProcessor.process(msg.rgbaData, msg.width, msg.height, msg.settings)
                 .then((result) => {
                     self.postMessage({ type: 'result', id: msg.id, data: result }, [result.buffer]);
@@ -914,6 +985,5 @@ self.onmessage = function ({ data: msg }) {
         }
     } else if (msg.type === 'reset') {
         if (!useGpu && cpuProcessor) cpuProcessor.reset();
-        // GPU path: per-frame buffers are recreated as needed; no explicit reset required.
     }
 };

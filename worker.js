@@ -196,7 +196,7 @@ class WorkerProcessor {
 
         // Light Gaussian blur on the grayscale image to suppress high-frequency
         // noise that would otherwise generate spurious thin Canny edges.
-        cv.GaussianBlur(this.gray, this.gray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+        cv.GaussianBlur(this.gray, this.gray, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
         // Optional: manual CLAHE boost (Custom / Experiment mode only).
         // Applies an additional round of Contrast Limited Adaptive Histogram
@@ -211,7 +211,7 @@ class WorkerProcessor {
             clahe.delete();
         }
 
-        cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, false);
+        cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, true);
 
         // Morphological closing bridges tiny gaps between nearby edge segments,
         // producing closed, cartoon-style contours around subjects.
@@ -292,9 +292,10 @@ class WorkerProcessor {
         }
 
         if (settings.lineWeight > 1) {
-            const kernel = cv.Mat.ones(settings.lineWeight, settings.lineWeight, cv.CV_8U);
-            cv.dilate(this.edges, this.edges, kernel);
-            kernel.delete();
+            const lwSize = new cv.Size(settings.lineWeight + 1, settings.lineWeight + 1);
+            const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
+            cv.dilate(this.edges, this.edges, lwKernel);
+            lwKernel.delete();
         }
 
         cv.bitwise_not(this.edges, this.edges);

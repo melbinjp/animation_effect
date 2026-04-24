@@ -100,10 +100,10 @@ const STYLE_PRESETS = {
         label: 'Custom / Experiment',
         background: [255, 255, 255],
         ink: [0, 0, 0],
-        lowThreshold: 28,
-        highThreshold: 96,
-        bilateralDiameter: 9,
-        sigma: 72,
+        lowThreshold: 60,
+        highThreshold: 180,
+        bilateralDiameter: 13,
+        sigma: 90,
         smoothPasses: 2
     }
 };
@@ -1680,7 +1680,7 @@ async function renderVideoExport() {
                 chunkMp4Maps[s][c] = null; // GC: written to WASM FS
             }
             const concatLines = chunkKeys
-                .map(c => `file 'seg${s}/chunk${c}.mp4'`)
+                .map(c => `file 'chunk${c}.mp4'`)
                 .join('\n');
             await segFfmpeg.writeFile(
                 `seg${s}/concat_chunks.txt`,
@@ -1766,7 +1766,7 @@ async function renderVideoExport() {
         } else {
             // Multiple segments: write a concat list, then stream-copy.
             const concatContent = Array.from(
-                { length: segCount }, (_, s) => `file '${jobId}/seg${s}.mp4'`
+                { length: segCount }, (_, s) => `file 'seg${s}.mp4'`
             ).join('\n');
             await ffmpeg.writeFile(
                 `${jobId}/concat.txt`,
