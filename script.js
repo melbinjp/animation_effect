@@ -1505,7 +1505,10 @@ async function renderVideoExport() {
                     const chunkIdx     = Math.floor(localIdx / ENCODE_CHUNK_FRAMES);
                     const withinChunk  = localIdx % ENCODE_CHUNK_FRAMES;
                     const chunkStart   = chunkIdx * ENCODE_CHUNK_FRAMES;
-                    const chunkEnd     = Math.min(chunkStart + ENCODE_CHUNK_FRAMES, framesPerSegment);
+                    const segFrames    = (segIdx === segCount - 1)
+                        ? (totalFrames - segIdx * framesPerSegment)
+                        : framesPerSegment;
+                    const chunkEnd     = Math.min(chunkStart + ENCODE_CHUNK_FRAMES, segFrames);
                     const expectedInChunk = chunkEnd - chunkStart;
 
                     let shouldTriggerChunkEncode = false;
