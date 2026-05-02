@@ -100,6 +100,11 @@ video {
     align-items: start;
 }
 
+.preview-panel {
+    position: sticky;
+    top: 22px;
+}
+
 .panel {
     background: var(--surface);
     border: 1px solid rgba(255, 255, 255, 0.65);
@@ -418,6 +423,17 @@ video {
 @media (max-width: 960px) {
     .studio-shell {
         grid-template-columns: 1fr;
+    }
+
+    .preview-panel {
+        order: -1;
+        position: sticky;
+        top: 10px;
+        z-index: 10;
+        /* Prevent preview from taking too much space on mobile when sticky */
+        max-height: 50vh;
+        overflow-y: auto;
+        padding: 12px;
     }
 
     .canvas-grid {

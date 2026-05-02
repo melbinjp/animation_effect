@@ -303,6 +303,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mv: u32 = 0u;
     for (var dy = -r; dy <= r; dy++) {
         for (var dx = -r; dx <= r; dx++) {
+            if (dx*dx + dy*dy > r*r) { continue; } // Circular kernel
             mv = max(mv, mask_in[u32(clamp(cy+dy, 0, i32(p.height)-1))*p.width
                                 + u32(clamp(cx+dx, 0, i32(p.width) -1))]);
         }
@@ -325,6 +326,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mv: u32 = 255u;
     for (var dy = -r; dy <= r; dy++) {
         for (var dx = -r; dx <= r; dx++) {
+            if (dx*dx + dy*dy > r*r) { continue; } // Circular kernel
             mv = min(mv, mask_in[u32(clamp(cy+dy, 0, i32(p.height)-1))*p.width
                                 + u32(clamp(cx+dx, 0, i32(p.width) -1))]);
         }
@@ -335,16 +337,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Map binary edge mask (255 = edge, 0 = background) to packed RGBA output.
 // Edge pixels → ink colour; background pixels → bg colour.
+// If useColorEdges is enabled, color edges take original color.
 const WGSL_COLORIZE = `
-struct CParams { width: u32, height: u32, ink: u32, bg: u32 }
-@group(0) @binding(0) var<storage, read>       mask    : array<u32>;
-@group(0) @binding(1) var<storage, read_write> rgba_out: array<u32>;
-@group(0) @binding(2) var<uniform>             p       : CParams;
-@compute @workgroup_size(256)
+struct CParams { width: u32, height: u32, ink: u32, bg: u32, useColorEdges: u32, colorOpacity: f32, colorSoftness: u32 }
+@group(0) @binding(0) var<storage, read>       mask_ink  : array<u32>;
+@group(0) @binding(1) var<storage, read>       mask_color: array<u32>;
+@group(0) @binding(2) var<storage, read>       rgba_in   : array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba_out  : array<u32>;
+@group(0) @binding(4) var<uniform>             p         : CParams;
+
+fn unpack(c: u32) -> vec3<f32> {
+    return vec3<f32>(f32(c & 0xffu), f32((c >> 8u) & 0xffu), f32((c >> 16u) & 0xffu)) / 255.0;
+}
+fn pack(v: vec3<f32>) -> u32 {
+    let r = u32(round(v.x * 255.0));
+    let g = u32(round(v.y * 255.0));
+    let b = u32(round(v.z * 255.0));
+    return (255u << 24u) | (b << 16u) | (g << 8u) | r;
+}
+
+@compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx >= p.width * p.height) { return; }
-    rgba_out[idx] = select(p.bg, p.ink, mask[idx] > 127u);
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= p.width || y >= p.height) { return; }
+    let idx = y * p.width + x;
+    if (mask_ink[idx] > 127u) {
+        rgba_out[idx] = p.ink;
+    } else if (p.useColorEdges == 1u && mask_color[idx] > 127u) {
+        var paint_color = unpack(rgba_in[idx]);
+        
+        if (p.colorSoftness > 0u) {
+            var sum = vec3<f32>(0.0);
+            var count = 0.0;
+            let rad = i32(p.colorSoftness);
+            for (var dy = -rad; dy <= rad; dy++) {
+                for (var dx = -rad; dx <= rad; dx++) {
+                    let nx = u32(clamp(i32(x) + dx, 0, i32(p.width) - 1));
+                    let ny = u32(clamp(i32(y) + dy, 0, i32(p.height) - 1));
+                    sum += unpack(rgba_in[ny * p.width + nx]);
+                    count += 1.0;
+                }
+            }
+            paint_color = sum / count;
+        }
+
+        if (p.colorOpacity >= 1.0) {
+            rgba_out[idx] = pack(paint_color);
+        } else {
+            let bg_rgb = unpack(p.bg);
+            let mixed = mix(bg_rgb, paint_color, p.colorOpacity);
+            rgba_out[idx] = pack(mixed);
+        }
+    } else {
+        rgba_out[idx] = p.bg;
+    }
 }
 `;
 
@@ -406,9 +453,9 @@ class GpuProcessor {
         const mk = (usage) => this._device.createBuffer({ size: n4, usage });
         this._bufs = {
             rgbaIn    : mk(STORAGE | COPY_DST),
-            gray      : mk(STORAGE),
-            smooth1   : mk(STORAGE),
-            smooth2   : mk(STORAGE),
+            gray      : mk(STORAGE | COPY_DST),
+            smooth1   : mk(STORAGE | COPY_DST | COPY_SRC),
+            smooth2   : mk(STORAGE | COPY_DST | COPY_SRC),
             magnitude : mk(STORAGE),
             direction : mk(STORAGE),
             suppressed: mk(STORAGE),
@@ -416,6 +463,11 @@ class GpuProcessor {
             edgesB    : mk(STORAGE),
             maskA     : mk(STORAGE),
             maskB     : mk(STORAGE),
+            edgesColorA : mk(STORAGE),
+            edgesColorB : mk(STORAGE),
+            maskColorA  : mk(STORAGE),
+            maskColorB  : mk(STORAGE),
+            grayRaw   : mk(STORAGE | COPY_SRC),
             rgbaOut   : mk(STORAGE | COPY_SRC),
         };
     }
@@ -455,6 +507,12 @@ class GpuProcessor {
             settings.cleanSpecklesIntensity    || 0,
             settings.mergeDoubleEdge     ? 1 : 0,
             settings.mergeDoubleEdgeIntensity  || 0,
+            settings.colorEdges ? 1 : 0,
+            settings.colorLowThresh || 0,
+            settings.colorHighThresh || 0,
+            settings.colorLineWeight || 1,
+            settings.colorSoftness || 0,
+            settings.colorOpacity !== undefined ? settings.colorOpacity : 1.0
         ].join(':');
     }
 
@@ -497,7 +555,7 @@ class GpuProcessor {
             g5v : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:2},{type:'u32',value:0}]),
             thresh  : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'f32',value:gpuLow},{type:'f32',value:gpuHigh}]),
             morph1  : mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:1}]),
-            colorize: mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:inkPx},{type:'u32',value:bgPx}]),
+            colorize: mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:inkPx},{type:'u32',value:bgPx},{type:'u32',value:settings.colorEdges ? 1 : 0},{type:'f32',value:settings.colorOpacity !== undefined ? settings.colorOpacity : 1.0},{type:'u32',value:settings.colorSoftness || 0}]),
         };
 
         // Conditional uniforms — only allocated when the corresponding option is on.
@@ -514,6 +572,15 @@ class GpuProcessor {
         if (settings.lineWeight > 1) {
             const lwR = settings.lineWeight - 1;
             u.lw = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:lwR}]);
+        }
+        if (settings.colorEdges) {
+            const cLow = (settings.colorLowThresh || 20) / 255.0;
+            const cHigh = (settings.colorHighThresh || 60) / 255.0;
+            u.threshColor = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'f32',value:cLow},{type:'f32',value:cHigh}]);
+            if ((settings.colorLineWeight || 1) > 1) {
+                const cLwR = settings.colorLineWeight - 1;
+                u.colorLw = mk([{type:'u32',value:W},{type:'u32',value:H},{type:'u32',value:cLwR}]);
+            }
         }
         return u;
     }
@@ -576,7 +643,8 @@ class GpuProcessor {
         const getOther = (cur) => (cur === b.smooth1) ? b.smooth2 : b.smooth1;
 
         // ── Step 1: RGBA → greyscale ───────────────────────────────────────────
-        disp1d(pl.rgbaToGray, mkBg(pl.rgbaToGray, b.rgbaIn, b.gray, u.dims));
+        disp1d(pl.rgbaToGray, mkBg(pl.rgbaToGray, b.rgbaIn, b.grayRaw, u.dims));
+        enc.copyBufferToBuffer(b.grayRaw, 0, b.gray, 0, W * H * 4);
 
         // ── Step 2: Pre-smoothing ──────────────────────────────────────────────
         let curSmooth = b.gray;
@@ -658,8 +726,39 @@ class GpuProcessor {
             curMask = alt;
         }
 
+        // ── Step 12.5: Optional Color Edges ───────────────────────────────────
+        let curColorMask = b.maskColorA;
+        if (settings.colorEdges) {
+            let colorSrc = b.grayRaw;
+            if (settings.colorSoftness > 0) {
+                enc.copyBufferToBuffer(b.grayRaw, 0, b.smooth1, 0, W * H * 4);
+                colorSrc = b.smooth1;
+                for (let i = 0; i < settings.colorSoftness; i++) {
+                    disp1d(pl.gaussian, mkBg(pl.gaussian, colorSrc, b.smooth2, u.g3h));
+                    disp1d(pl.gaussian, mkBg(pl.gaussian, b.smooth2, colorSrc, u.g3v));
+                }
+            }
+            disp2d(pl.sobel,     mkBg(pl.sobel,     colorSrc,    b.magnitude, b.direction, u.dims));
+            disp2d(pl.nms,       mkBg(pl.nms,       b.magnitude, b.direction, b.suppressed, u.dims));
+            disp1d(pl.threshold, mkBg(pl.threshold, b.suppressed, b.edgesColorA, u.threshColor));
+
+            let eInC = b.edgesColorA, eOutC = b.edgesColorB;
+            for (let i = 0; i < 8; i++) {
+                disp2d(pl.hysteresis, mkBg(pl.hysteresis, eInC, eOutC, u.dims));
+                [eInC, eOutC] = [eOutC, eInC];
+            }
+            disp1d(pl.finalize, mkBg(pl.finalize, eInC, b.maskColorA, u.dims));
+            curColorMask = b.maskColorA;
+
+            if ((settings.colorLineWeight || 1) > 1) {
+                const alt = (curColorMask === b.maskColorA) ? b.maskColorB : b.maskColorA;
+                disp2d(pl.morphDilate, mkBg(pl.morphDilate, curColorMask, alt, u.colorLw));
+                curColorMask = alt;
+            }
+        }
+
         // ── Step 13: Colourize ─────────────────────────────────────────────────
-        disp1d(pl.colorize, mkBg(pl.colorize, curMask, b.rgbaOut, u.colorize));
+        disp2d(pl.colorize, mkBg(pl.colorize, curMask, curColorMask, b.rgbaIn, b.rgbaOut, u.colorize));
 
         // ── Copy output to the persistent staging buffer ───────────────────────
         // Reusing this._readBuf across frames avoids one GPU alloc/dealloc per

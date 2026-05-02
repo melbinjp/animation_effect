@@ -81,12 +81,12 @@
                         </div>
                     </div>
                     <div class="custom-slider-row">
-                        <label for="customLowThresh">Low threshold <span id="customLowThreshVal">60</span></label>
-                        <input type="range" id="customLowThresh" min="1" max="150" value="60">
+                        <label for="customLowThresh">Ink low threshold <span id="customLowThreshVal">40</span></label>
+                        <input type="range" id="customLowThresh" min="5" max="150" value="40">
                     </div>
                     <div class="custom-slider-row">
-                        <label for="customHighThresh">High threshold <span id="customHighThreshVal">180</span></label>
-                        <input type="range" id="customHighThresh" min="10" max="300" value="180">
+                        <label for="customHighThresh">Ink high threshold <span id="customHighThreshVal">100</span></label>
+                        <input type="range" id="customHighThresh" min="20" max="255" value="100">
                     </div>
                     <div class="custom-slider-row">
                         <label for="customBilateral">Bilateral diameter <span id="customBilateralVal">13</span></label>
@@ -186,6 +186,42 @@
                             <span>Strong</span>
                         </div>
                     </div>
+                    <p class="custom-controls-label" style="margin-top: 1.5rem;">Color Lines (Soft Edges)</p>
+                    <div class="custom-toggle-row">
+                        <label for="customColorEdges" class="toggle-label">
+                            <input type="checkbox" id="customColorEdges">
+                            Enable color lines <span class="toggle-hint">(soft colored lines for facial features and texture) [Demand: Low]</span>
+                        </label>
+                    </div>
+                    <div class="custom-slider-row" id="colorEdgesLowThreshRow" hidden>
+                        <label for="customColorLowThresh">Color low threshold <span id="customColorLowThreshVal">15</span></label>
+                        <input type="range" id="customColorLowThresh" min="1" max="150" value="15">
+                    </div>
+                    <div class="custom-slider-row" id="colorEdgesHighThreshRow" hidden>
+                        <label for="customColorHighThresh">Color high threshold <span id="customColorHighThreshVal">45</span></label>
+                        <input type="range" id="customColorHighThresh" min="10" max="300" value="45">
+                    </div>
+                    <div class="custom-slider-row" id="colorEdgesWeightRow" hidden>
+                        <label for="customColorLineWeight">Color line weight <span id="customColorLineWeightVal">1</span></label>
+                        <input type="range" id="customColorLineWeight" min="1" max="5" value="1">
+                        <div class="range-scale">
+                            <span>Fine</span>
+                            <span>Heavy</span>
+                        </div>
+                    </div>
+                    <div class="custom-slider-row" id="colorEdgesSoftnessRow" hidden>
+                        <label for="customColorSoftness">Color softness <span id="customColorSoftnessVal">0</span></label>
+                        <input type="range" id="customColorSoftness" min="0" max="10" value="0">
+                        <div class="range-scale">
+                            <span>Raw Details</span>
+                            <span>Cartoon Blobs</span>
+                        </div>
+                        <p class="control-hint">Melt away micro-textures before drawing color lines.</p>
+                    </div>
+                    <div class="custom-slider-row" id="colorEdgesOpacityRow" hidden>
+                        <label for="customColorOpacity">Color opacity <span id="customColorOpacityVal">100</span>%</label>
+                        <input type="range" id="customColorOpacity" min="0" max="100" value="100">
+                    </div>
                 </div>
 
                 <div class="control-group">
@@ -281,6 +317,12 @@
                 <div class="info-card">
                     <p class="status-label">Current file</p>
                     <p id="fileMeta">No file selected.</p>
+                    <div id="videoSeekerRow" hidden style="margin-top: 1rem;">
+                        <label for="videoSeeker" class="status-label" style="display: flex; justify-content: space-between; align-items: center; text-transform: uppercase; font-size: 0.7rem; font-weight: 700; color: #a4b4c4; margin-bottom: 0.5rem; letter-spacing: 0.05em;">
+                            Preview Frame <span id="videoSeekerTime" style="color: white; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">0.0s</span>
+                        </label>
+                        <input type="range" id="videoSeeker" min="0" max="0" step="0.1" value="0" style="width: 100%;">
+                    </div>
                 </div>
             </aside>
 

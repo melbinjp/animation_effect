@@ -24,7 +24,9 @@ class WorkerProcessor {
         this.src = null;
         this.smoothed = null;
         this.gray = null;
+        this.grayRaw = null;
         this.edges = null;
+        this.colorEdges = null;
     }
 
     reset() {
@@ -37,7 +39,9 @@ class WorkerProcessor {
         this.rgb = null;
         this.smoothed = null;
         this.gray = null;
+        this.grayRaw = null;
         this.edges = null;
+        this.colorEdges = null;
         this.width = 0;
         this.height = 0;
     }
@@ -48,19 +52,26 @@ class WorkerProcessor {
         }
 
         this.reset();
+        this.gray = null;
+        this.grayRaw = null;
+        this.edges = null;
+        this.colorEdges = null;
         this.width = width;
         this.height = height;
         this.src = new cv.Mat(height, width, cv.CV_8UC4);
         this.rgb = new cv.Mat(height, width, cv.CV_8UC3);
         this.smoothed = new cv.Mat(height, width, cv.CV_8UC3);
         this.gray = new cv.Mat(height, width, cv.CV_8UC1);
+        this.grayRaw = new cv.Mat(height, width, cv.CV_8UC1);
         this.edges = new cv.Mat(height, width, cv.CV_8UC1);
+        this.colorEdges = new cv.Mat(height, width, cv.CV_8UC1);
     }
 
     process(rgbaData, width, height, settings) {
         this.ensureSize(width, height);
         this.src.data.set(rgbaData);
         cv.cvtColor(this.src, this.rgb, cv.COLOR_RGBA2RGB);
+        cv.cvtColor(this.rgb, this.grayRaw, cv.COLOR_RGB2GRAY);
 
         const detailFactor = settings.detail / 62;
         const lowThreshold = Math.max(12, Math.round(settings.preset.lowThreshold / detailFactor));
@@ -161,23 +172,22 @@ class WorkerProcessor {
         if (settings.autoNormalize) {
             const meanMat = new cv.Mat();
             const stdMat = new cv.Mat();
-            cv.meanStdDev(this.gray, meanMat, stdMat);
+            cv.meanStdDev(this.grayRaw, meanMat, stdMat);
             const mean = meanMat.data64F[0];
             const std = stdMat.data64F[0];
+            this._lastMean = mean; // save for paint color loop later
             meanMat.delete();
             stdMat.delete();
 
             // Stage 1: gamma lift for under-exposed frames.
             if (mean < 80) {
                 // gamma > 1 brightens: output = 255 * (input/255)^(1/gamma)
-                // Threshold 80: frames below this are considered under-exposed.
-                // Formula: mean 80 → gamma 1.5 (mild lift); mean 0 → gamma 3.0 (strong lift).
-                // Divisor 40 = (80 - 0) / (3.0 - 1.0 - 1.0) maps [0,80] onto [3.0,1.5].
                 const gamma = Math.max(1.5, Math.min(3.0, 1.0 + (80 - mean) / 40));
                 const lut = new cv.Mat(1, 256, cv.CV_8U);
                 for (let i = 0; i < 256; i++) {
                     lut.data[i] = Math.round(Math.pow(i / 255, 1 / gamma) * 255);
                 }
+                cv.LUT(this.grayRaw, lut, this.grayRaw);
                 cv.LUT(this.gray, lut, this.gray);
                 lut.delete();
             }
@@ -187,7 +197,8 @@ class WorkerProcessor {
                 cv.normalize(this.gray, this.gray, 0, 255, cv.NORM_MINMAX, cv.CV_8U);
             }
 
-            // Stage 3: adaptive CLAHE — clip limit inversely proportional to mean.
+            // Stage 3: adaptive CLAHE — apply to Ink lines (this.gray) ONLY!
+            // Color lines (grayRaw, rgb) are isolated from this harsh lineart filter.
             const adaptiveClip = Math.max(1.5, Math.min(4.5, 150 / Math.max(mean, 1)));
             const adaptiveClahe = new cv.CLAHE(adaptiveClip, new cv.Size(8, 8));
             adaptiveClahe.apply(this.gray, this.gray);
@@ -300,6 +311,26 @@ class WorkerProcessor {
 
         cv.bitwise_not(this.edges, this.edges);
 
+        if (settings.colorEdges) {
+            let colorSrc = this.grayRaw.clone();
+            if (settings.colorSoftness > 0) {
+                const ksize = settings.colorSoftness * 2 + 1;
+                cv.GaussianBlur(colorSrc, colorSrc, new cv.Size(ksize, ksize), 0, 0, cv.BORDER_DEFAULT);
+                cv.normalize(colorSrc, colorSrc, 0, 255, cv.NORM_MINMAX, cv.CV_8U); // Restore contrast after blur
+                // Blur the paint colors as well so the lines are filled with a smooth color!
+                cv.GaussianBlur(this.rgb, this.rgb, new cv.Size(ksize, ksize), 0, 0, cv.BORDER_DEFAULT);
+            }
+            cv.Canny(colorSrc, this.colorEdges, settings.colorLowThresh, settings.colorHighThresh, 3, true);
+            colorSrc.delete();
+
+            if (settings.colorLineWeight > 1) {
+                const lwSize = new cv.Size(settings.colorLineWeight + 1, settings.colorLineWeight + 1);
+                const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
+                cv.dilate(this.colorEdges, this.colorEdges, lwKernel);
+                lwKernel.delete();
+            }
+        }
+
         const bg = settings.preset.background;
         const ink = settings.preset.ink;
         // Pack RGBA into 32-bit integers for fast bulk writes.
@@ -311,11 +342,43 @@ class WorkerProcessor {
         const bgPx = ((255 << 24) | (bg[2] << 16) | (bg[1] << 8) | bg[0]) >>> 0;
         const inkPx = ((255 << 24) | (ink[2] << 16) | (ink[1] << 8) | ink[0]) >>> 0;
         const mask = this.edges.data;
+        const colorMask = settings.colorEdges ? this.colorEdges.data : null;
+        const rgbaData32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength / 4);
         const out = new Uint8ClampedArray(width * height * 4);
         const out32 = new Uint32Array(out.buffer);
 
+        const op = settings.colorOpacity !== undefined ? settings.colorOpacity : 1.0;
+        const rgbData = this.rgb.data; // use the normalized rgb data for paint colors
+
+        // Build a bulletproof JS lookup table for paint colors to guarantee they
+        // are brightened when autoNormalize is on, bypassing any OpenCV multi-channel LUT bugs.
+        const paintLut = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) paintLut[i] = i;
+        if (settings.autoNormalize && this._lastMean !== undefined && this._lastMean < 80) {
+            const gamma = Math.max(1.5, Math.min(3.0, 1.0 + (80 - this._lastMean) / 40));
+            for (let i = 0; i < 256; i++) {
+                paintLut[i] = Math.round(Math.pow(i / 255, 1 / gamma) * 255);
+            }
+        }
+
         for (let i = 0, len = mask.length; i < len; i++) {
-            out32[i] = mask[i] > 127 ? bgPx : inkPx;
+            if (mask[i] < 127) {
+                out32[i] = inkPx;
+            } else if (settings.colorEdges && colorMask[i] > 127) {
+                const idx = i * 3;
+                let r = paintLut[rgbData[idx]];
+                let g = paintLut[rgbData[idx + 1]];
+                let b = paintLut[rgbData[idx + 2]];
+                if (op < 1.0) {
+                    const bg = bgPx;
+                    r = ((bg & 0xff) * (1 - op) + r * op) | 0;
+                    g = (((bg >> 8) & 0xff) * (1 - op) + g * op) | 0;
+                    b = (((bg >> 16) & 0xff) * (1 - op) + b * op) | 0;
+                }
+                out32[i] = (255 << 24) | (b << 16) | (g << 8) | r;
+            } else {
+                out32[i] = bgPx;
+            }
         }
 
         return out;

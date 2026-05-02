@@ -32,7 +32,10 @@ const elements = {
     workerThreadsManual: document.getElementById('workerThreadsManual'),
     workerThreadsVal: document.getElementById('workerThreadsVal'),
     workerThreadsMax: document.getElementById('workerThreadsMax'),
-    workerThreadsHint: document.getElementById('workerThreadsHint')
+    workerThreadsHint: document.getElementById('workerThreadsHint'),
+    videoSeekerRow: document.getElementById('videoSeekerRow'),
+    videoSeeker: document.getElementById('videoSeeker'),
+    videoSeekerTime: document.getElementById('videoSeekerTime')
 };
 
 const STYLE_PRESETS = {
@@ -665,7 +668,13 @@ function getSettings() {
         darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
         darkBoostClip: Number(document.getElementById('customDarkBoostClip').value),
         mergeDoubleEdge: presetKey === 'custom' && document.getElementById('customMergeDoubleEdge').checked,
-        mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value)
+        mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value),
+        colorEdges: presetKey === 'custom' && document.getElementById('customColorEdges').checked,
+        colorLowThresh: Number(document.getElementById('customColorLowThresh').value),
+        colorHighThresh: Number(document.getElementById('customColorHighThresh').value),
+        colorLineWeight: Number(document.getElementById('customColorLineWeight').value),
+        colorSoftness: Number(document.getElementById('customColorSoftness').value),
+        colorOpacity: Number(document.getElementById('customColorOpacity').value) / 100.0
     };
 }
 
@@ -1061,6 +1070,7 @@ async function readSelectedFile(file) {
         state.mediaWidth = image.naturalWidth;
         state.mediaHeight = image.naturalHeight;
         updateFileMeta(`${file.name} · ${image.naturalWidth}×${image.naturalHeight} image`);
+        elements.videoSeekerRow.hidden = true;
         summarizeWorkload();
         return;
     }
@@ -1078,6 +1088,11 @@ async function readSelectedFile(file) {
         updateFileMeta(
             `${file.name} · ${video.videoWidth}×${video.videoHeight} video · ${video.duration.toFixed(1)}s`
         );
+        elements.videoSeeker.max = video.duration;
+        const initialPreviewTime = Math.min(Math.max(video.duration * 0.2, 0), Math.max(0, video.duration - 0.05));
+        elements.videoSeeker.value = initialPreviewTime;
+        elements.videoSeekerTime.textContent = `${initialPreviewTime.toFixed(1)}s`;
+        elements.videoSeekerRow.hidden = false;
         summarizeWorkload();
         // Eagerly load the video export engine in the background so the user
         // does not have to click the button manually before rendering.
@@ -1101,7 +1116,7 @@ async function drawCurrentSource() {
     }
 
     if (state.fileKind === 'video' && state.sourceVideo) {
-        const previewTime = Math.min(Math.max(state.sourceVideo.duration * 0.2, 0), Math.max(0, state.sourceVideo.duration - 0.05));
+        const previewTime = Number(elements.videoSeeker.value);
         await seekVideo(state.sourceVideo, previewTime);
         drawMediaToCanvas(state.sourceVideo, elements.sourceCanvas, settings.scale, settings.customMode);
     }
@@ -2171,6 +2186,18 @@ elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 
+elements.videoSeeker.addEventListener('input', () => {
+    const val = Number(elements.videoSeeker.value);
+    elements.videoSeekerTime.textContent = `${val.toFixed(1)}s`;
+});
+
+elements.videoSeeker.addEventListener('change', async () => {
+    if (!state.selectedFile || state.processing || state.fileKind !== 'video') {
+        return;
+    }
+    await onPreviewClick();
+});
+
 ['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -2192,7 +2219,7 @@ elements.resetBtn.addEventListener('click', resetWorkspace);
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customAutoNormalize', 'customDarkBoost', 'customDarkBoostClip', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customAutoNormalize', 'customDarkBoost', 'customDarkBoostClip', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity', 'customColorEdges', 'customColorLowThresh', 'customColorHighThresh', 'customColorLineWeight', 'customColorSoftness', 'customColorOpacity'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),
@@ -2203,7 +2230,12 @@ const customValueSpans = {
     customMedianPasses: document.getElementById('customMedianPassesVal'),
     customCleanSpecklesIntensity: document.getElementById('customCleanSpecklesIntensityVal'),
     customDarkBoostClip: document.getElementById('customDarkBoostClipVal'),
-    customMergeDoubleEdgeIntensity: document.getElementById('customMergeDoubleEdgeIntensityVal')
+    customMergeDoubleEdgeIntensity: document.getElementById('customMergeDoubleEdgeIntensityVal'),
+    customColorLowThresh: document.getElementById('customColorLowThreshVal'),
+    customColorHighThresh: document.getElementById('customColorHighThreshVal'),
+    customColorLineWeight: document.getElementById('customColorLineWeightVal'),
+    customColorSoftness: document.getElementById('customColorSoftnessVal'),
+    customColorOpacity: document.getElementById('customColorOpacityVal')
 };
 
 // Grey out bilateral diameter/sigma/passes sliders when bilateral smooth is disabled.
@@ -2250,6 +2282,16 @@ function syncDarkBoostRow() {
     document.getElementById('darkBoostClipRow').hidden = !enabled;
 }
 
+// Show the sliders for color edges when enabled.
+function syncColorEdgesRows() {
+    const enabled = document.getElementById('customColorEdges').checked;
+    document.getElementById('colorEdgesLowThreshRow').hidden = !enabled;
+    document.getElementById('colorEdgesHighThreshRow').hidden = !enabled;
+    document.getElementById('colorEdgesWeightRow').hidden = !enabled;
+    document.getElementById('colorEdgesSoftnessRow').hidden = !enabled;
+    document.getElementById('colorEdgesOpacityRow').hidden = !enabled;
+}
+
 customInputIds.forEach((id) => {
     document.getElementById(id).addEventListener('input', () => {
         if (customValueSpans[id]) {
@@ -2270,6 +2312,7 @@ customInputIds.forEach((id) => {
         if (id === 'customCleanSpeckles') { syncCleanSpecklesRow(); }
         if (id === 'customDarkBoost') { syncDarkBoostRow(); }
         if (id === 'customMergeDoubleEdge') { syncMergeDoubleEdgeRow(); }
+        if (id === 'customColorEdges') { syncColorEdgesRows(); }
         if (elements.preset.value !== 'custom' || !state.selectedFile || state.processing) {
             return;
         }
