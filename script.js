@@ -37,7 +37,10 @@ const elements = {
     videoSeeker: document.getElementById('videoSeeker'),
     videoSeekerTime: document.getElementById('videoSeekerTime'),
     cameraBtn: document.getElementById('cameraBtn'),
-    liveVideo: document.getElementById('liveVideo')
+    liveVideo: document.getElementById('liveVideo'),
+    recordBtn: document.getElementById('recordBtn'),
+    recCanvas: document.getElementById('recCanvas'),
+    captureLayout: document.getElementById('captureLayout')
 };
 
 const STYLE_PRESETS = {
@@ -196,6 +199,10 @@ const state = {
     pauseRequested: false,
     cameraStream: null,
     cameraLoop: false,
+    recording: false,
+    recorder: null,
+    recChunks: [],
+    recTrack: null,
     activeJobId: '',
     beforeUnloadAttached: false,
     mediaWidth: null,
@@ -588,6 +595,9 @@ function refreshActions() {
     const notReady = !state.cvReady || state.processing;
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
+    if (elements.recordBtn) {
+        elements.recordBtn.disabled = !state.cvReady || !hasFile;
+    }
     elements.fileInput.disabled = notReady;
     if (elements.cameraBtn) elements.cameraBtn.disabled = !state.cvReady;
     // Worker controls stay enabled during processing so the user can adjust
@@ -940,6 +950,7 @@ function requestCancel() {
 
     state.cancelRequested = true;
     state.cameraLoop = false;
+    if (state.recording) void stopPreviewRecording();
     state.pauseRequested = false;
     elements.pauseBtn.textContent = 'Pause';
     console.log('Cancel requested. Finishing the current step...', 'warn');
@@ -1210,14 +1221,138 @@ async function renderPreview() {
     await drawCurrentSource();
     throwIfCancelled();
     await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+    paintLiveCapture();
     clearRenderedOutput();
     setResultGlow(true);
+    refreshActions();
     console.log(
         state.fileKind === 'video'
-            ? 'Preview ready. Use Render final to process the full clip.'
-            : 'Preview ready. Use Render final to export the PNG.',
+            ? 'Preview ready. Use Record preview to capture the live split, or Render final for the full clip.'
+            : 'Preview ready. Use Record preview to capture the live layout, or Render final to export a PNG.',
         'success'
     );
+}
+
+function evenDim(n) {
+    const v = Math.max(2, Math.round(n));
+    return v + (v % 2);
+}
+
+function paintLiveCapture() {
+    const src = elements.sourceCanvas;
+    const ink = elements.outputCanvas;
+    const dest = elements.recCanvas;
+    if (!src || !ink || !dest || !ink.width) return;
+    const w = ink.width;
+    const h = ink.height;
+    const layout = elements.captureLayout ? elements.captureLayout.value : 'side';
+    const ctx = dest.getContext('2d');
+    if (layout === 'ink') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(ink, 0, 0, w, h);
+    } else if (layout === 'split') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(src, 0, 0, w, h);
+        const cut = Math.round(w * 0.52);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, cut, h);
+        ctx.clip();
+        ctx.drawImage(ink, 0, 0, w, h);
+        ctx.restore();
+        ctx.fillStyle = '#b85c38';
+        ctx.fillRect(cut - 1, 0, 2, h);
+    } else {
+        dest.width = evenDim(w * 2);
+        dest.height = evenDim(h);
+        ctx.fillStyle = '#f4efe6';
+        ctx.fillRect(0, 0, dest.width, dest.height);
+        ctx.drawImage(src, 0, 0, w, h);
+        ctx.drawImage(ink, w, 0, w, h);
+        ctx.font = '600 13px "Segoe UI", sans-serif';
+        ctx.fillStyle = 'rgba(22,33,47,0.72)';
+        ctx.fillRect(12, 12, 48, 22);
+        ctx.fillRect(w + 12, 12, 40, 22);
+        ctx.fillStyle = '#fffaf2';
+        ctx.fillText('Live', 20, 28);
+        ctx.fillText('Ink', w + 20, 28);
+    }
+    if (state.recTrack && typeof state.recTrack.requestFrame === 'function') {
+        state.recTrack.requestFrame();
+    }
+}
+
+function pickRecorderMime() {
+    const types = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
+        'video/mp4',
+    ];
+    return types.find((t) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) || 'video/webm';
+}
+
+function startPreviewRecording() {
+    const canvas = elements.recCanvas;
+    if (!canvas || !elements.outputCanvas.width) {
+        console.log('Preview a frame first.', 'warn');
+        return;
+    }
+    paintLiveCapture();
+    const mime = pickRecorderMime();
+    const stream = canvas.captureStream(18);
+    state.recTrack = stream.getVideoTracks()[0];
+    const mixed = new MediaStream(stream.getVideoTracks());
+    if (state.cameraStream) {
+        state.cameraStream.getAudioTracks().forEach((t) => mixed.addTrack(t));
+    }
+    const rec = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 5_000_000 });
+    state.recChunks = [];
+    rec.ondataavailable = (e) => {
+        if (e.data && e.data.size) state.recChunks.push(e.data);
+    };
+    rec.start(400);
+    state.recorder = rec;
+    state.recording = true;
+    elements.recordBtn.textContent = 'Stop & save';
+    setAdvisory('Recording the live preview layout. Stop to download WebM/MP4.', 'info');
+    console.log('Recording the on-screen preview.', 'info');
+}
+
+async function stopPreviewRecording() {
+    const rec = state.recorder;
+    if (!rec) return;
+    state.recording = false;
+    if (rec.state !== 'inactive') rec.stop();
+    await new Promise((resolve) => {
+        rec.addEventListener('stop', resolve, { once: true });
+        setTimeout(resolve, 1500);
+    });
+    state.recorder = null;
+    state.recTrack = null;
+    const chunks = state.recChunks || [];
+    state.recChunks = [];
+    elements.recordBtn.textContent = 'Record preview';
+    if (!chunks.length) return;
+    const mime = rec.mimeType || 'video/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(chunks, { type: mime.includes('mp4') ? 'video/mp4' : 'video/webm' });
+    const base = state.selectedFile && state.selectedFile.name
+        ? state.selectedFile.name.replace(/\.[^.]+$/, '')
+        : 'line-art';
+    setDownload(blob, `${base}-preview.${ext}`);
+    setAdvisory('Preview capture is ready to download.', 'success');
+    console.log('Preview capture ready.', 'success');
+}
+
+function togglePreviewRecording() {
+    if (state.recording) {
+        void stopPreviewRecording();
+    } else {
+        startPreviewRecording();
+    }
 }
 
 async function renderImageExport() {
@@ -2092,6 +2227,7 @@ async function startCamera() {
             throwIfCancelled();
             drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
             await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+            paintLiveCapture();
         }
     } catch (error) {
         console.error(error);
@@ -2102,6 +2238,7 @@ async function startCamera() {
     } finally {
         setBusy(false);
         updateUnloadProtection();
+        if (state.recording) void stopPreviewRecording();
     }
 }
 
@@ -2142,6 +2279,13 @@ async function handleFileSelection(file) {
 function resetWorkspace() {
     processor.reset();
     void stopCamera();
+    if (state.recording) {
+        state.recording = false;
+        if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+        state.recorder = null;
+        state.recChunks = [];
+        if (elements.recordBtn) elements.recordBtn.textContent = 'Record preview';
+    }
     state.selectedFile = null;
     state.fileKind = null;
     state.sourceImage = null;
@@ -2327,6 +2471,12 @@ elements.fileInput.addEventListener('change', async (event) => {
 
 elements.previewBtn.addEventListener('click', onPreviewClick);
 elements.renderBtn.addEventListener('click', onRenderClick);
+if (elements.recordBtn) {
+    elements.recordBtn.addEventListener('click', togglePreviewRecording);
+}
+if (elements.captureLayout) {
+    elements.captureLayout.addEventListener('change', paintLiveCapture);
+}
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);

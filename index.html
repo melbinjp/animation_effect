@@ -313,10 +313,22 @@
                 <div class="action-row">
                     <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
                     <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="recordBtn" type="button" class="secondary-button" disabled>Record preview</button>
                     <button id="pauseBtn" type="button" class="secondary-button" hidden disabled>Pause</button>
                     <button id="cancelBtn" type="button" class="secondary-button" hidden disabled>Cancel render</button>
                     <button id="resetBtn" type="button" class="ghost-button">Reset</button>
                 </div>
+
+                <div class="control-group">
+                    <label for="captureLayout">Capture layout</label>
+                    <select id="captureLayout">
+                        <option value="side" selected>Live + ink (side by side)</option>
+                        <option value="ink">Ink only</option>
+                        <option value="split">Split as a wipe</option>
+                    </select>
+                    <p class="control-hint">Records the on-screen preview — live and processed together, or ink only. No skeleton overlay.</p>
+                </div>
+                <canvas id="recCanvas" hidden aria-hidden="true"></canvas>
 
                 <div class="download-card" id="downloadCard" hidden>
                     <p class="status-label">Export</p>

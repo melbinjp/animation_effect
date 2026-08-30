@@ -34,6 +34,7 @@ Presets are studio-tuned for print-like ink. Face-mesh and pose/hand skeleton ov
 
 - Processes images entirely client-side and exports PNG files.
 - Processes videos client-side with OpenCV (edge detection) and FFmpeg WASM (MP4 encoding).
+- Records the live preview (camera or clip) as WebM/MP4: ink only, a split wipe, or live + ink side by side.
 - Keeps all media on the user's device — nothing is uploaded anywhere.
 - Video export engine loads automatically in the background when a video is selected.
 
