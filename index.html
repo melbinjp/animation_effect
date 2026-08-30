@@ -2,16 +2,16 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Line Art Animator — Turn Videos &amp; Photos into Animation</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Linearty — Turn Videos &amp; Photos into Animation</title>
   <link rel="canonical" href="https://linearty.wecanuseai.com/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="WeCanUseAI">
-  <meta property="og:title" content="Line Art Animator">
+  <meta property="og:title" content="Linearty">
   <meta property="og:description" content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server.">
   <meta property="og:url" content="https://linearty.wecanuseai.com/">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Line Art Animator">
+  <meta name="twitter:title" content="Linearty">
   <meta name="twitter:description" content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server.">
   <link rel="icon" type="image/x-icon" href="https://favicon.wecanuseai.com/favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="https://favicon.wecanuseai.com/favicon-32x32.png">
@@ -21,6 +21,9 @@
         name="description"
         content="Turn videos and photos of animals, people, and nature into eye-catching line-art animation. Runs entirely in the browser — no uploads, no server."
     >
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <script>
         // Favicon errors are non-fatal — log a note and continue.
@@ -34,21 +37,33 @@
 <body>
     <a href="#workspace" class="skip-link">Skip to workspace</a>
     <main class="page-shell">
-        <section class="hero">
-            <p class="eyebrow">Browser-Only Animation Studio</p>
-            <h1>Turn any video or photo into eye-catching line-art animation.</h1>
-            <p class="hero-copy">
-                Perfect for animals, people, and nature footage. Pick a style, preview instantly, and
-                export a share-ready PNG or MP4 — everything runs in your browser, nothing leaves your device.
-            </p>
-            <div class="hero-notes">
-                <span>Animals &amp; wildlife</span>
-                <span>People &amp; portraits</span>
-                <span>Plants &amp; nature</span>
-                <span>PNG &amp; MP4 export</span>
-                <span>Social-media ready</span>
+        <header class="site-header">
+            <div class="brand-row">
+                <div class="brand-mark">
+                    <span class="brand-icon" aria-hidden="true">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></svg>
+                    </span>
+                    <div>
+                        <p class="eyebrow">Browser-only animation studio</p>
+                        <p class="brand-name">Linearty</p>
+                    </div>
+                </div>
             </div>
-        </section>
+            <section class="hero">
+                <h1>Turn any video or photo into eye-catching line-art animation.</h1>
+                <p class="hero-copy">
+                    Perfect for animals, people, and nature footage. Pick a style, preview instantly, and
+                    export a share-ready PNG or MP4 — everything runs in your browser, nothing leaves your device.
+                </p>
+                <div class="hero-notes">
+                    <span>Animals & wildlife</span>
+                    <span>People & portraits</span>
+                    <span>Plants & nature</span>
+                    <span>PNG & MP4 export</span>
+                    <span>Stays on this device</span>
+                </div>
+            </section>
+        </header>
 
         <section class="studio-shell" id="workspace" aria-label="Line art conversion workspace">
             <aside class="panel controls-panel">
@@ -344,23 +359,27 @@
                 <div class="info-card">
                     <p class="status-label">Current file</p>
                     <p id="fileMeta">No file selected.</p>
-                    <div id="videoSeekerRow" hidden style="margin-top: 1rem;">
-                        <label for="videoSeeker" class="status-label" style="display: flex; justify-content: space-between; align-items: center; text-transform: uppercase; font-size: 0.7rem; font-weight: 700; color: #a4b4c4; margin-bottom: 0.5rem; letter-spacing: 0.05em;">
-                            Preview Frame <span id="videoSeekerTime" style="color: white; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">0.0s</span>
+                    <div id="videoSeekerRow" hidden>
+                        <label for="videoSeeker" class="status-label" style="display: flex; justify-content: space-between; align-items: center;">
+                            Preview Frame <span id="videoSeekerTime">0.0s</span>
                         </label>
                         <input type="range" id="videoSeeker" min="0" max="0" step="0.1" value="0" style="width: 100%;">
                     </div>
                 </div>
             </aside>
 
-            <section class="panel preview-panel">
-                <div class="panel-heading">
-                    <h2>Workspace</h2>
-                    <p>Preview uses the current settings. Video preview is sampled from the selected clip.</p>
+            <section class="panel preview-panel" id="previewDock">
+                <div class="workspace-toolbar">
+                    <div class="view-tabs" role="group" aria-label="Workspace view">
+                        <button type="button" class="view-tab is-active" data-view="result" aria-pressed="true">Ink</button>
+                        <button type="button" class="view-tab" data-view="original" aria-pressed="false">Photo</button>
+                        <button type="button" class="view-tab" data-view="split" aria-pressed="false">Split</button>
+                    </div>
+                    <p class="workspace-status" id="workspaceStatus">Drop a photo or clip</p>
                 </div>
 
-                <div class="canvas-grid">
-                    <figure class="canvas-card">
+                <div class="preview-stage" id="previewStage" data-view="result" style="--split: 52%;">
+                    <figure class="canvas-card source-frame">
                         <figcaption>Source frame</figcaption>
                         <canvas id="sourceCanvas"></canvas>
                     </figure>
@@ -368,6 +387,10 @@
                         <figcaption>Line-art result</figcaption>
                         <canvas id="canvasOutput"></canvas>
                     </figure>
+                </div>
+                <div class="split-row" id="splitRow" hidden>
+                    <label for="splitReveal">Reveal</label>
+                    <input type="range" id="splitReveal" min="0" max="100" value="52" aria-label="Split reveal between photo and ink">
                 </div>
 
                 <div class="video-result" id="videoResult" hidden>
@@ -378,7 +401,6 @@
         </section>
     </main>
 
-    <script src="vendor/ffmpeg.js"></script>
     <script src="script.js"></script>
 
     <footer role="contentinfo" class="wcua-footer">
