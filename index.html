@@ -77,7 +77,7 @@
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
                     <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
-                    <p class="control-hint">Live camera inks real edges only — no face mesh or hand skeleton overlay.</p>
+                    <p class="control-hint">Live camera uses body maps to hush background and quiet skin. Pose and face wireframes stay off unless you turn them on.</p>
                 </div>
                 <div class="sample-grid" aria-label="Sample stills">
                     <button type="button" class="sample-card" data-sample="samples/portrait.jpg" data-label="Portrait">
@@ -390,7 +390,46 @@
                         <option value="ink">Ink only</option>
                         <option value="split">Split as a wipe</option>
                     </select>
-                    <p class="control-hint">Records the on-screen preview — split follows the Reveal slider. No skeleton overlay.</p>
+                    <p class="control-hint">Records the on-screen preview — split follows the Reveal slider. Skeleton overlays stay off unless enabled below.</p>
+                </div>
+
+                <div class="control-group" id="bodyMapsGroup">
+                    <p class="custom-controls-label">Body maps</p>
+                    <div class="custom-toggle-row">
+                        <label for="humanAware" class="toggle-label">
+                            <input type="checkbox" id="humanAware" checked>
+                            Human-aware lines
+                        </label>
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="skinSmooth">Quiet skin <span id="skinSmoothVal">0.80</span></label>
+                        <input type="range" id="skinSmooth" min="0" max="1" step="0.01" value="0.80">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="hairBoost">Hair emphasis <span id="hairBoostVal">1.32</span></label>
+                        <input type="range" id="hairBoost" min="0.5" max="2" step="0.05" value="1.32">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="silhouetteBoost">Silhouette <span id="silhouetteBoostVal">0.72</span></label>
+                        <input type="range" id="silhouetteBoost" min="0" max="1.5" step="0.05" value="0.72">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="subjectIsolation">Background hush <span id="subjectIsolationVal">0.38</span></label>
+                        <input type="range" id="subjectIsolation" min="0" max="1" step="0.01" value="0.38">
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="poseLines" class="toggle-label">
+                            <input type="checkbox" id="poseLines">
+                            Pose scaffolding <span class="toggle-hint">(stick-figure bones — off by default)</span>
+                        </label>
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="faceContours" class="toggle-label">
+                            <input type="checkbox" id="faceContours">
+                            Face landmark mesh <span class="toggle-hint">(wireframe eyes and lips — off by default)</span>
+                        </label>
+                    </div>
+                    <p class="control-hint" id="humanStatusHint">Body maps idle — they load in the background.</p>
                 </div>
                 <canvas id="recCanvas" hidden aria-hidden="true"></canvas>
 
@@ -423,6 +462,7 @@
                         <button type="button" class="view-tab is-active" data-view="result" aria-pressed="true">Ink</button>
                         <button type="button" class="view-tab" data-view="original" aria-pressed="false">Photo</button>
                         <button type="button" class="view-tab" data-view="split" aria-pressed="false">Split</button>
+                        <button type="button" class="view-tab" data-view="body" aria-pressed="false">Body</button>
                     </div>
                     <p class="workspace-status" id="workspaceStatus">Drop a photo or clip</p>
                 </div>
@@ -435,6 +475,7 @@
                     <figure class="canvas-card emphasis-card">
                         <figcaption>Line-art result</figcaption>
                         <canvas id="canvasOutput"></canvas>
+                        <canvas id="bodyOverlay" class="body-overlay" aria-hidden="true"></canvas>
                     </figure>
                 </div>
                 <div class="split-row" id="splitRow" hidden>

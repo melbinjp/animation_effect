@@ -599,6 +599,20 @@ video {
     margin: 0;
 }
 
+.body-overlay {
+    opacity: 0;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+}
+
+.preview-stage[data-view="body"] .body-overlay {
+    opacity: 0.9;
+}
+
+.preview-stage[data-view="body"] #canvasOutput {
+    opacity: 0.55;
+}
+
 .emphasis-card {
     box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 18%, transparent);
 }

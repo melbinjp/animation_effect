@@ -31,9 +31,9 @@ All vendor assets (FFmpeg WASM, OpenCV) are either bundled locally or loaded fro
 | **Blueprint Draft** | Technical blue-tone style |
 | **Classic Canny** | Original Linearty OpenCV Canny look |
 
-Presets are studio-tuned for print-like ink. Face-mesh and pose/hand skeleton overlays are **not** drawn — camera and photo output is real edges only. Use **Classic Canny** if you want the previous binary-edge look.
+Presets are studio-tuned for print-like ink. **Body maps** (MediaPipe selfie multiclass) hush the background and quiet skin on people. Pose scaffolding and face landmark mesh stay **off** unless you turn them on. Use **Classic Canny** if you want the previous binary-edge look.
 
-Sample stills (Portrait, Figure, Still life) sit in the controls so you can try the engine immediately. **Play live** inks a clip in realtime; **Record preview** can capture the on-screen split, ink only, or live + ink. **Ink reveal** wipes photo to line art. Longest-side caps match the studio preview (Draft 540 → Print 1280, plus Native 4K). OpenCV inking and FFmpeg MP4 export are unchanged.
+Sample stills (Portrait, Figure, Still life) sit in the controls so you can try the engine immediately. **Play live** inks a clip in realtime; **Record preview** can capture the on-screen split, ink only, or live + ink. **Ink reveal** wipes photo to line art. Longest-side caps match the studio preview (Draft 540 → Print 1280, plus Native 4K). OpenCV inking and FFmpeg MP4 export are unchanged. Body-map models ship with the site and run entirely in the browser.
 
 ## What it does
 

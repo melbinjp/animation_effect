@@ -47,7 +47,16 @@ const elements = {
     workspaceStatus: document.getElementById('workspaceStatus'),
     qualityCap: document.getElementById('qualityCap'),
     playLiveBtn: document.getElementById('playLiveBtn'),
-    revealBtn: document.getElementById('revealBtn')
+    revealBtn: document.getElementById('revealBtn'),
+    bodyOverlay: document.getElementById('bodyOverlay'),
+    humanAware: document.getElementById('humanAware'),
+    poseLines: document.getElementById('poseLines'),
+    faceContours: document.getElementById('faceContours'),
+    skinSmooth: document.getElementById('skinSmooth'),
+    hairBoost: document.getElementById('hairBoost'),
+    silhouetteBoost: document.getElementById('silhouetteBoost'),
+    subjectIsolation: document.getElementById('subjectIsolation'),
+    humanStatusHint: document.getElementById('humanStatusHint')
 };
 
 const STYLE_PRESETS = {
@@ -255,6 +264,10 @@ const state = {
     cameraStream: null,
     cameraLoop: false,
     livePlay: false,
+    humanMod: null,
+    humanCache: null,
+    lastHuman: null,
+    humanStatus: 'off',
     recording: false,
     recorder: null,
     recChunks: [],
@@ -440,6 +453,7 @@ class LineArtProcessor {
                     }
                     state.cvReady = true;
                     refreshActions();
+                    void warmupHuman();
                 }
                 console.log(`[Main] Worker ${index} ready (${this._readyCount}/${this._concurrency})`);
                 this._releaseWorker(index);
@@ -592,6 +606,21 @@ class LineArtProcessor {
     async renderToData(sourceCanvas, settings) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
+        const payload = { ...settings };
+        try {
+            const human = await inferCachedHuman(sourceCanvas, width, height, settings);
+            if (human) {
+                payload.classMask = human.classMask;
+                payload.extraLines = human.extraLines;
+                payload.hasPerson = human.hasPerson;
+                state.lastHuman = human;
+            } else {
+                state.lastHuman = null;
+            }
+        } catch (err) {
+            console.warn('Body maps skipped', err);
+            state.lastHuman = null;
+        }
         const imageData = sourceCanvas
             .getContext('2d', { willReadFrequently: true })
             .getImageData(0, 0, width, height); // synchronous pixel copy
@@ -611,7 +640,7 @@ class LineArtProcessor {
             this._pending.set(id, { resolve, reject });
             // Transfer the pixel buffer zero-copy to the chosen worker.
             this._workers[workerIndex].postMessage(
-                { type: 'process', id, rgbaData: imageData.data, width, height, settings },
+                { type: 'process', id, rgbaData: imageData.data, width, height, settings: payload },
                 [imageData.data.buffer]
             );
         });
@@ -627,6 +656,7 @@ class LineArtProcessor {
         destinationCanvas.getContext('2d').putImageData(
             new ImageData(rawData, width, height), 0, 0
         );
+        paintBodyOverlay(width, height);
     }
 }
 
@@ -745,6 +775,92 @@ function applySplit(value) {
     if (elements.previewStage) elements.previewStage.style.setProperty('--split', `${v}%`);
 }
 
+function setHumanStatus(text) {
+    state.humanStatus = text;
+    if (elements.humanStatusHint) elements.humanStatusHint.textContent = text;
+}
+
+async function loadHumanModule() {
+    if (!state.humanMod) {
+        state.humanMod = await import('./human.js');
+    }
+    return state.humanMod;
+}
+
+async function warmupHuman() {
+    try {
+        setHumanStatus('Loading body maps…');
+        const mod = await loadHumanModule();
+        const ok = await mod.ensureHuman({ landmarks: false });
+        setHumanStatus(ok ? 'Body maps on — background hush and quiet skin.' : 'Body maps off — inking the whole frame.');
+        if (elements.workspaceStatus && ok) {
+            const cur = elements.workspaceStatus.textContent || '';
+            if (!/maps/i.test(cur)) elements.workspaceStatus.textContent = cur;
+        }
+    } catch (err) {
+        console.warn(err);
+        setHumanStatus('Body maps unavailable on this device.');
+    }
+}
+
+function fingerprintPixels(data, w, h) {
+    let hsh = (w * 73856093) ^ (h * 19349663);
+    const step = Math.max(16, (data.length / 96) | 0);
+    for (let i = 0; i < data.length; i += step) {
+        hsh = (Math.imul(hsh, 16777619) ^ data[i]) >>> 0;
+    }
+    return hsh;
+}
+
+async function inferCachedHuman(canvas, width, height, settings) {
+    if (!settings.humanAware) return null;
+    const mod = await loadHumanModule();
+    const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
+    if (!ok) return null;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const data = ctx.getImageData(0, 0, width, height).data;
+    const fp = fingerprintPixels(data, width, height);
+    const cache = state.humanCache;
+    if (
+        cache &&
+        cache.fp === fp &&
+        cache.w === width &&
+        cache.h === height &&
+        cache.pose === !!settings.poseLines &&
+        cache.face === !!settings.faceContours
+    ) {
+        return cache.maps;
+    }
+    const maps = mod.inferHuman(canvas, width, height, settings);
+    if (maps) {
+        state.humanCache = {
+            fp,
+            w: width,
+            h: height,
+            pose: !!settings.poseLines,
+            face: !!settings.faceContours,
+            maps,
+        };
+        if (maps.hasPerson) {
+            setHumanStatus(`Person ${Math.round(maps.personRatio * 100)}% — maps on.`);
+        }
+    }
+    return maps;
+}
+
+function paintBodyOverlay(width, height) {
+    const overlay = elements.bodyOverlay;
+    if (!overlay) return;
+    overlay.width = width;
+    overlay.height = height;
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, width, height);
+    const human = state.lastHuman;
+    if (!human || !human.classMask || !state.humanMod) return;
+    const rgba = state.humanMod.colorizeMask(human.classMask, width, height);
+    ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+}
+
 async function loadSample(url, label) {
     try {
         const res = await fetch(url);
@@ -762,6 +878,31 @@ function syncPresetChips() {
     document.querySelectorAll('.preset-chip').forEach((btn) => {
         btn.classList.toggle('is-active', btn.dataset.preset === current);
     });
+}
+
+function applyHumanPresetSliders(presetKey) {
+    const table = {
+        human: { skinSmooth: 0.84, hairBoost: 1.45, silhouetteBoost: 0.95, subjectIsolation: 0.28 },
+        subject: { skinSmooth: 0.7, hairBoost: 1.32, silhouetteBoost: 1, subjectIsolation: 0.94 },
+        manga: { skinSmooth: 0.8, hairBoost: 1.4, silhouetteBoost: 0.9, subjectIsolation: 0.22 },
+        neon: { skinSmooth: 0.55, hairBoost: 1.32, silhouetteBoost: 0.88, subjectIsolation: 0.55 },
+        blueprint: { skinSmooth: 0.76, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.18 },
+        classic: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
+        ultimate: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
+        studio: { skinSmooth: 0.78, hairBoost: 1.32, silhouetteBoost: 0.82, subjectIsolation: 0.38 },
+    };
+    const vals = table[presetKey] || table.ultimate;
+    const setSlider = (el, spanId, value) => {
+        if (!el) return;
+        el.value = String(value);
+        const span = document.getElementById(spanId);
+        if (span) span.textContent = Number(value).toFixed(2);
+    };
+    setSlider(elements.skinSmooth, 'skinSmoothVal', vals.skinSmooth);
+    setSlider(elements.hairBoost, 'hairBoostVal', vals.hairBoost);
+    setSlider(elements.silhouetteBoost, 'silhouetteBoostVal', vals.silhouetteBoost);
+    setSlider(elements.subjectIsolation, 'subjectIsolationVal', vals.subjectIsolation);
+    if (elements.humanAware) elements.humanAware.checked = presetKey !== 'classic';
 }
 
 async function playLiveVideo() {
@@ -910,7 +1051,14 @@ function getSettings() {
         colorHighThresh: Number(document.getElementById('customColorHighThresh').value),
         colorLineWeight: Number(document.getElementById('customColorLineWeight').value),
         colorSoftness: Number(document.getElementById('customColorSoftness').value),
-        colorOpacity: Number(document.getElementById('customColorOpacity').value) / 100.0
+        colorOpacity: Number(document.getElementById('customColorOpacity').value) / 100.0,
+        humanAware: !!(elements.humanAware && elements.humanAware.checked),
+        poseLines: !!(elements.poseLines && elements.poseLines.checked),
+        faceContours: !!(elements.faceContours && elements.faceContours.checked),
+        skinSmooth: Number(elements.skinSmooth && elements.skinSmooth.value) || 0.8,
+        hairBoost: Number(elements.hairBoost && elements.hairBoost.value) || 1.32,
+        silhouetteBoost: Number(elements.silhouetteBoost && elements.silhouetteBoost.value) || 0.72,
+        subjectIsolation: Number(elements.subjectIsolation && elements.subjectIsolation.value) || 0.38
     };
 }
 
@@ -2680,6 +2828,31 @@ if (window.innerWidth < 640 && elements.scale && Number(elements.scale.value) > 
 if (window.innerWidth < 640 && elements.qualityCap) {
     elements.qualityCap.value = '540';
 }
+
+[
+    ['skinSmooth', 'skinSmoothVal'],
+    ['hairBoost', 'hairBoostVal'],
+    ['silhouetteBoost', 'silhouetteBoostVal'],
+    ['subjectIsolation', 'subjectIsolationVal'],
+].forEach(([id, spanId]) => {
+    const el = document.getElementById(id);
+    const span = document.getElementById(spanId);
+    if (!el || !span) return;
+    el.addEventListener('input', () => {
+        span.textContent = Number(el.value).toFixed(2);
+    });
+});
+
+if (elements.poseLines) {
+    elements.poseLines.addEventListener('change', () => {
+        if (elements.poseLines.checked) void loadHumanModule().then((m) => m.ensureHuman({ landmarks: true }));
+    });
+}
+if (elements.faceContours) {
+    elements.faceContours.addEventListener('change', () => {
+        if (elements.faceContours.checked) void loadHumanModule().then((m) => m.ensureHuman({ landmarks: true }));
+    });
+}
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
@@ -2699,12 +2872,13 @@ elements.videoSeeker.addEventListener('change', async () => {
     await onPreviewClick();
 });
 
-['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps'].forEach((id) => {
+['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps', 'humanAware', 'poseLines', 'faceContours', 'skinSmooth', 'hairBoost', 'silhouetteBoost', 'subjectIsolation'].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.addEventListener('change', async () => {
         if (id === 'preset') {
             document.getElementById('customControls').hidden = elements.preset.value !== 'custom';
+            applyHumanPresetSliders(elements.preset.value);
         }
         if (id === 'videoFps') {
             elements.customVideoFps.hidden = elements.videoFps.value !== 'custom';
