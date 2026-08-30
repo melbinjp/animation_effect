@@ -32,6 +32,7 @@
     </script>
 </head>
 <body>
+    <a href="#workspace" class="skip-link">Skip to workspace</a>
     <main class="page-shell">
         <section class="hero">
             <p class="eyebrow">Browser-Only Animation Studio</p>
@@ -49,7 +50,7 @@
             </div>
         </section>
 
-        <section class="studio-shell" aria-label="Line art conversion workspace">
+        <section class="studio-shell" id="workspace" aria-label="Line art conversion workspace">
             <aside class="panel controls-panel">
                 <div class="panel-heading">
                     <h2>Controls</h2>
@@ -60,17 +61,22 @@
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
+                    <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
+                    <p class="control-hint">Live camera inks real edges only — no face mesh or hand skeleton overlay.</p>
                 </div>
+                <video id="liveVideo" class="live-video" playsinline muted hidden aria-hidden="true"></video>
 
                 <div class="control-group">
                     <label for="preset">Style preset</label>
                     <select id="preset">
-                        <option value="manga" selected>Manga Contrast</option>
+                        <option value="ultimate" selected>Ultimate Studio</option>
                         <option value="studio">Studio Ink</option>
+                        <option value="manga">Manga Contrast</option>
                         <option value="neon">Neon Pop</option>
                         <option value="warm">Warm Sketch</option>
                         <option value="vivid">Vivid Toon</option>
                         <option value="blueprint">Blueprint Draft</option>
+                        <option value="classic">Classic Canny</option>
                         <option value="custom">Custom / Experiment</option>
                     </select>
                 </div>

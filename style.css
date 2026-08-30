@@ -19,6 +19,22 @@
     box-sizing: border-box;
 }
 
+.skip-link {
+    position: absolute;
+    left: 12px;
+    top: -48px;
+    z-index: 100;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: var(--ink);
+    color: #fff;
+    text-decoration: none;
+}
+
+.skip-link:focus {
+    top: 12px;
+}
+
 body {
     margin: 0;
     font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
@@ -243,6 +259,19 @@ video {
 .uploader.is-loading {
     opacity: 0.6;
     cursor: not-allowed;
+}
+
+.camera-button {
+    justify-self: center;
+    min-height: 44px;
+}
+
+.live-video {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
 }
 
 .uploader.is-loading .uploader-label,

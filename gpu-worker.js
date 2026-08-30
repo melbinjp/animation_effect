@@ -835,6 +835,7 @@ class CpuProcessor {
         this.ensureSize(width, height);
         this.src.data.set(rgbaData);
         cv.cvtColor(this.src, this.rgb, cv.COLOR_RGBA2RGB);
+        if (settings.whiteBalance) applyGrayWorld(this.rgb);
 
         const detailFactor  = settings.detail / 62;
         const lowThreshold  = Math.max(12, Math.round(settings.preset.lowThreshold  / detailFactor));
@@ -843,6 +844,9 @@ class CpuProcessor {
         const d             = settings.preset.bilateralDiameter;
 
         if (!settings.customMode) {
+            if (settings.engine === 'ultimate') {
+                cv.cvtColor(this.rgb, this.gray, cv.COLOR_RGB2GRAY);
+            } else {
             cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
             if (settings.preset.smoothPasses >= 2) {
                 const refineSigma = Math.max(15, Math.round(sigma * 0.5));
@@ -850,6 +854,7 @@ class CpuProcessor {
                 cv.bilateralFilter(this.rgb,     this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
             }
             cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
+            }
         } else {
             if (settings.useBilateral) {
                 const bilateralPasses = Math.max(1, Math.min(5, settings.bilateralPasses || 2));
@@ -969,6 +974,10 @@ class CpuProcessor {
             lwKernel.delete();
         }
 
+        if (settings.engine === 'ultimate') {
+            return paintUltimateInk(this.gray, this.edges, width, height, settings);
+        }
+
         cv.bitwise_not(this.edges, this.edges);
 
         const bg    = settings.preset.background;
@@ -1009,6 +1018,7 @@ function initCpu() {
     console.log('[gpu-worker] Falling back to OpenCV CPU path...');
     try {
         importScripts('vendor/opencv.js');
+        importScripts('studio-ink.js');
         cv.onRuntimeInitialized = () => {
             console.log('[gpu-worker] OpenCV ready (CPU fallback)');
             cpuProcessor = new CpuProcessor();
@@ -1027,6 +1037,7 @@ initGpu()
         console.log('[gpu-worker] WebGPU pipeline ready');
         try {
             importScripts('vendor/opencv.js');
+            importScripts('studio-ink.js');
             cv.onRuntimeInitialized = () => {
                 cpuProcessor = new CpuProcessor();
                 console.log('[gpu-worker] CPU fallback ready for advanced features');
@@ -1046,7 +1057,7 @@ initGpu()
 
 self.onmessage = function ({ data: msg }) {
     if (msg.type === 'process') {
-        const reqCpu = msg.settings.autoNormalize || msg.settings.darkBoost || msg.settings.cleanSpeckles;
+        const reqCpu = msg.settings.autoNormalize || msg.settings.darkBoost || msg.settings.cleanSpeckles || msg.settings.engine === 'ultimate' || msg.settings.whiteBalance;
         if (reqCpu && cpuProcessor) {
             try {
                 const result = cpuProcessor.process(msg.rgbaData, msg.width, msg.height, msg.settings);

@@ -5,6 +5,7 @@ let processorInstance = null;
 console.log('[Worker] Starting OpenCV load...');
 try {
     importScripts('vendor/opencv.js');
+    importScripts('studio-ink.js');
     console.log('[Worker] OpenCV script imported, waiting for runtime initialization...');
 
     cv.onRuntimeInitialized = () => {
@@ -71,6 +72,7 @@ class WorkerProcessor {
         this.ensureSize(width, height);
         this.src.data.set(rgbaData);
         cv.cvtColor(this.src, this.rgb, cv.COLOR_RGBA2RGB);
+        if (settings.whiteBalance) applyGrayWorld(this.rgb);
         cv.cvtColor(this.rgb, this.grayRaw, cv.COLOR_RGB2GRAY);
 
         const detailFactor = settings.detail / 62;
@@ -80,6 +82,10 @@ class WorkerProcessor {
         const d = settings.preset.bilateralDiameter;
 
         if (!settings.customMode) {
+            if (settings.engine === 'ultimate') {
+                // XDoG carries the stroke; skip heavy bilateral so live camera stays responsive.
+                cv.cvtColor(this.rgb, this.gray, cv.COLOR_RGB2GRAY);
+            } else {
             // Standard presets always use bilateral pre-smoothing; pass count from preset.
             cv.bilateralFilter(this.rgb, this.smoothed, d, sigma, sigma, cv.BORDER_DEFAULT);
             if (settings.preset.smoothPasses >= 2) {
@@ -92,6 +98,7 @@ class WorkerProcessor {
                 cv.bilateralFilter(this.rgb, this.smoothed, d, refineSigma, refineSigma, cv.BORDER_DEFAULT);
             }
             cv.cvtColor(this.smoothed, this.gray, cv.COLOR_RGB2GRAY);
+            }
         } else {
             // Custom mode: each smooth method is independently toggled and can be
             // combined in any order — bilateral first (RGB), then Gaussian/median (gray).
@@ -307,6 +314,10 @@ class WorkerProcessor {
             const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
             cv.dilate(this.edges, this.edges, lwKernel);
             lwKernel.delete();
+        }
+
+        if (settings.engine === 'ultimate') {
+            return paintUltimateInk(this.gray, this.edges, width, height, settings);
         }
 
         cv.bitwise_not(this.edges, this.edges);
