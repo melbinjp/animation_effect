@@ -44,7 +44,10 @@ const elements = {
     previewStage: document.getElementById('previewStage'),
     splitRow: document.getElementById('splitRow'),
     splitReveal: document.getElementById('splitReveal'),
-    workspaceStatus: document.getElementById('workspaceStatus')
+    workspaceStatus: document.getElementById('workspaceStatus'),
+    qualityCap: document.getElementById('qualityCap'),
+    playLiveBtn: document.getElementById('playLiveBtn'),
+    revealBtn: document.getElementById('revealBtn')
 };
 
 const STYLE_PRESETS = {
@@ -173,6 +176,54 @@ const STYLE_PRESETS = {
         cleanSpeckles: true,
         mergeDoubleEdge: true
     },
+    human: {
+        label: 'Portrait',
+        engine: 'ultimate',
+        background: [250, 246, 238],
+        ink: [22, 28, 36],
+        lowThreshold: 28,
+        highThreshold: 100,
+        bilateralDiameter: 7,
+        sigma: 44,
+        smoothPasses: 1,
+        xdogSigma: 0.72,
+        xdogTau: 0.986,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
+    subject: {
+        label: 'Subject only',
+        engine: 'ultimate',
+        background: [255, 255, 255],
+        ink: [18, 18, 20],
+        lowThreshold: 30,
+        highThreshold: 110,
+        bilateralDiameter: 7,
+        sigma: 48,
+        smoothPasses: 1,
+        xdogSigma: 0.8,
+        xdogTau: 0.985,
+        xdogPhi: 220,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
+    pencil: {
+        label: 'Soft pencil',
+        engine: 'ultimate',
+        background: [250, 246, 238],
+        ink: [54, 42, 32],
+        lowThreshold: 24,
+        highThreshold: 90,
+        bilateralDiameter: 7,
+        sigma: 52,
+        smoothPasses: 1,
+        xdogSigma: 1.05,
+        xdogTau: 0.945,
+        xdogPhi: 70,
+        cleanSpeckles: false,
+        mergeDoubleEdge: false
+    },
     custom: {
         label: 'Custom / Experiment',
         engine: 'classic',
@@ -203,6 +254,7 @@ const state = {
     pauseRequested: false,
     cameraStream: null,
     cameraLoop: false,
+    livePlay: false,
     recording: false,
     recorder: null,
     recChunks: [],
@@ -603,6 +655,12 @@ function refreshActions() {
     if (elements.recordBtn) {
         elements.recordBtn.disabled = !state.cvReady || !hasFile;
     }
+    if (elements.playLiveBtn) {
+        elements.playLiveBtn.disabled = !state.cvReady || state.fileKind !== 'video' || state.processing;
+    }
+    if (elements.revealBtn) {
+        elements.revealBtn.disabled = !elements.outputCanvas || !elements.outputCanvas.width;
+    }
     elements.fileInput.disabled = notReady;
     if (elements.cameraBtn) elements.cameraBtn.disabled = !state.cvReady;
     // Worker controls stay enabled during processing so the user can adjust
@@ -687,6 +745,72 @@ function applySplit(value) {
     if (elements.previewStage) elements.previewStage.style.setProperty('--split', `${v}%`);
 }
 
+async function loadSample(url, label) {
+    try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        const file = new File([blob], `${label}.jpg`, { type: blob.type || 'image/jpeg' });
+        await handleFileSelection(file);
+    } catch (err) {
+        console.error(err);
+        console.log('Could not open that sample.', 'error');
+    }
+}
+
+function syncPresetChips() {
+    const current = elements.preset.value;
+    document.querySelectorAll('.preset-chip').forEach((btn) => {
+        btn.classList.toggle('is-active', btn.dataset.preset === current);
+    });
+}
+
+async function playLiveVideo() {
+    if (state.fileKind !== 'video' || !state.sourceVideo || state.processing) return;
+    const video = state.sourceVideo;
+    state.cancelRequested = false;
+    state.livePlay = true;
+    setBusy(true);
+    video.muted = true;
+    try {
+        await video.play();
+        while (state.livePlay && !state.cancelRequested && !video.paused && !video.ended) {
+            throwIfCancelled();
+            drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+            paintLiveCapture();
+            if (elements.videoSeeker) {
+                elements.videoSeeker.value = String(video.currentTime);
+                if (elements.videoSeekerTime) elements.videoSeekerTime.textContent = `${video.currentTime.toFixed(1)}s`;
+            }
+        }
+    } catch (err) {
+        if (!/cancel/i.test(String(err && err.message))) {
+            console.error(err);
+            console.log('Could not play that clip live.', 'error');
+        }
+    } finally {
+        state.livePlay = false;
+        setBusy(false);
+        if (state.recording) void stopPreviewRecording();
+        refreshActions();
+    }
+}
+
+function playInkReveal() {
+    if (!elements.outputCanvas || !elements.outputCanvas.width) return;
+    setView('split');
+    const start = performance.now();
+    const tick = (now) => {
+        const t = Math.min(1, (now - start) / 1600);
+        const eased = 1 - (1 - t) ** 3;
+        const v = eased * 100;
+        if (elements.splitReveal) elements.splitReveal.value = String(v);
+        applySplit(v);
+        if (t < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+}
+
 function setAdvisory(message, tone = 'info') {
     elements.advisoryText.textContent = message;
     elements.advisoryCard.dataset.tone = tone;
@@ -758,6 +882,7 @@ function getSettings() {
         detail: Number(elements.detail.value),
         lineWeight: Number(elements.lineWeight.value),
         scale: Number(elements.scale.value),
+        qualityCap: Number(elements.qualityCap && elements.qualityCap.value) || 720,
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
@@ -794,8 +919,8 @@ function computeScaledSize(width, height, scale, noCap = false) {
     // Cap at 4096 px (largest side) so 4K videos render at full native quality
     // while true 8K is safely downscaled to ~4K equivalent in standard presets.
     // Custom mode (noCap = true) bypasses the cap for unrestricted processing.
-    const dimensionCap = 4096;
-    const capRatio = (!noCap && largestSide > dimensionCap) ? dimensionCap / largestSide : 1;
+    const dimensionCap = noCap ? 8192 : (Number(elements.qualityCap && elements.qualityCap.value) || 720);
+    const capRatio = largestSide > dimensionCap ? dimensionCap / largestSide : 1;
     const ratio = Math.min(1, scale * capRatio);
 
     return {
@@ -974,6 +1099,7 @@ function requestCancel() {
 
     state.cancelRequested = true;
     state.cameraLoop = false;
+    state.livePlay = false;
     if (state.recording) void stopPreviewRecording();
     state.pauseRequested = false;
     elements.pauseBtn.textContent = 'Pause';
@@ -1284,17 +1410,25 @@ function paintLiveCapture() {
     if (!src || !ink || !dest || !ink.width) return;
     const w = ink.width;
     const h = ink.height;
-    const layout = elements.captureLayout ? elements.captureLayout.value : 'side';
+    let layout = elements.captureLayout ? elements.captureLayout.value : 'preview';
+    if (layout === 'preview') {
+        layout = state.view === 'split' ? 'split' : state.view === 'original' ? 'photo' : 'ink';
+    }
     const ctx = dest.getContext('2d');
     if (layout === 'ink') {
         dest.width = evenDim(w);
         dest.height = evenDim(h);
         ctx.drawImage(ink, 0, 0, w, h);
+    } else if (layout === 'photo') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(src, 0, 0, w, h);
     } else if (layout === 'split') {
         dest.width = evenDim(w);
         dest.height = evenDim(h);
         ctx.drawImage(src, 0, 0, w, h);
-        const cut = Math.round(w * 0.52);
+        const splitPct = Number(elements.splitReveal && elements.splitReveal.value) || 52;
+        const cut = Math.round(w * (splitPct / 100));
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, 0, cut, h);
@@ -2523,8 +2657,28 @@ document.querySelectorAll('.view-tab').forEach((btn) => {
 if (elements.splitReveal) {
     elements.splitReveal.addEventListener('input', () => applySplit(elements.splitReveal.value));
 }
+document.querySelectorAll('.preset-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        elements.preset.value = btn.dataset.preset;
+        elements.preset.dispatchEvent(new Event('change'));
+        syncPresetChips();
+    });
+});
+elements.preset.addEventListener('change', syncPresetChips);
+document.querySelectorAll('.sample-card').forEach((btn) => {
+    btn.addEventListener('click', () => void loadSample(btn.dataset.sample, btn.dataset.label));
+});
+if (elements.playLiveBtn) {
+    elements.playLiveBtn.addEventListener('click', () => void playLiveVideo());
+}
+if (elements.revealBtn) {
+    elements.revealBtn.addEventListener('click', playInkReveal);
+}
 if (window.innerWidth < 640 && elements.scale && Number(elements.scale.value) > 0.75) {
     elements.scale.value = '0.75';
+}
+if (window.innerWidth < 640 && elements.qualityCap) {
+    elements.qualityCap.value = '540';
 }
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
@@ -2545,7 +2699,7 @@ elements.videoSeeker.addEventListener('change', async () => {
     await onPreviewClick();
 });
 
-['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
+['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps'].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.addEventListener('change', async () => {
