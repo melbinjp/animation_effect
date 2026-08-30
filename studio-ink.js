@@ -2,11 +2,80 @@
 
 // Shared Ultimate studio ink: XDoG strokes + light Canny structure, soft paint.
 // Used by worker.js and gpu-worker.js. Relies on OpenCV (`cv`) being loaded.
-// Tracker overlays (face mesh, pose bones, hand skeleton) are intentionally
-// not drawn — output is real edges from the frame only.
+// Body-part maps (MediaPipe) hush background and quiet skin. Pose/face
+// skeleton overlays stay off unless the user turns those toggles on.
+
+const HUMAN_BG = 0;
+const HUMAN_HAIR = 1;
+const HUMAN_BODY = 2;
+const HUMAN_FACE = 3;
+const HUMAN_CLOTHES = 4;
+const HUMAN_OTHER = 5;
 
 function clamp01(v) {
     return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+function silhouetteMask(classMask, w, h) {
+    const n = w * h;
+    const bin = new Uint8Array(n);
+    for (let i = 0; i < n; i++) bin[i] = classMask[i] ? 1 : 0;
+    const dil = new Uint8Array(n);
+    const ero = new Uint8Array(n);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let d = 0;
+            let e = 1;
+            for (let dy = -2; dy <= 2; dy++) {
+                const yy = y + dy;
+                if (yy < 0 || yy >= h) { e = 0; continue; }
+                for (let dx = -2; dx <= 2; dx++) {
+                    const xx = x + dx;
+                    if (xx < 0 || xx >= w) { e = 0; continue; }
+                    const v = bin[yy * w + xx];
+                    if (v) d = 1;
+                    if (!v && Math.abs(dx) <= 1 && Math.abs(dy) <= 1) e = 0;
+                }
+            }
+            dil[y * w + x] = d;
+            ero[y * w + x] = bin[y * w + x] && e ? 1 : 0;
+        }
+    }
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = dil[i] && !ero[i] ? 1 : 0;
+    return out;
+}
+
+function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
+    if (!classMask || !settings.humanAware) return;
+    const n = width * height;
+    if (classMask.length !== n) return;
+    const isolation = settings.subjectIsolation == null ? 0.38 : settings.subjectIsolation;
+    const skin = settings.skinSmooth == null ? 0.8 : settings.skinSmooth;
+    const hair = settings.hairBoost == null ? 1.32 : settings.hairBoost;
+    const silB = settings.silhouetteBoost == null ? 0.72 : settings.silhouetteBoost;
+    const sil = silhouetteMask(classMask, width, height);
+    const poseOn = !!settings.poseLines;
+    const faceOn = !!settings.faceContours;
+    for (let i = 0; i < n; i++) {
+        const cls = classMask[i];
+        if (cls === HUMAN_BG) {
+            ink[i] *= 1 - isolation;
+        } else if (cls === HUMAN_FACE || cls === HUMAN_BODY) {
+            const keep = ink[i] > 0.58 ? 1 : 1 - skin;
+            ink[i] *= keep;
+        } else if (cls === HUMAN_HAIR) {
+            ink[i] = ink[i] * hair > 1 ? 1 : ink[i] * hair;
+        } else if (cls === HUMAN_CLOTHES || cls === HUMAN_OTHER) {
+            ink[i] = ink[i] * 1.06 > 1 ? 1 : ink[i] * 1.06;
+        }
+        const s = sil[i] * silB;
+        if (s > ink[i]) ink[i] = s;
+        if ((poseOn || faceOn) && extraLines && extraLines[i] > 80) {
+            const e = extraLines[i] / 255;
+            if (e > ink[i]) ink[i] = e;
+        }
+    }
 }
 
 function applyGrayWorld(rgbMat) {
@@ -54,7 +123,7 @@ function computeXdogMap(grayMat, sigma, tau, phi) {
     return out;
 }
 
-function paintUltimateInk(grayMat, edgeMat, width, height, settings) {
+function paintUltimateInk(grayMat, edgeMat, width, height, settings, classMask, extraLines) {
     const preset = settings.preset || {};
     const xdog = computeXdogMap(
         grayMat,
@@ -71,6 +140,7 @@ function paintUltimateInk(grayMat, edgeMat, width, height, settings) {
         const structure = canny[i] >= 200 ? 0.48 : 0;
         ink[i] = stroke > structure ? stroke : structure;
     }
+    applyHumanInk(ink, classMask, extraLines, width, height, settings);
 
     const bg = preset.background || [250, 246, 238];
     const strokeRgb = preset.ink || [22, 28, 36];

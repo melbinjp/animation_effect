@@ -77,16 +77,36 @@
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
                     <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
-                    <p class="control-hint">Live camera inks real edges only — no face mesh or hand skeleton overlay.</p>
+                    <p class="control-hint">Live camera uses body maps to hush background and quiet skin. Pose and face wireframes stay off unless you turn them on.</p>
+                </div>
+                <div class="sample-grid" aria-label="Sample stills">
+                    <button type="button" class="sample-card" data-sample="samples/portrait.jpg" data-label="Portrait">
+                        <img src="samples/portrait.jpg" alt="" width="240" height="180">
+                        <span>Portrait</span>
+                        <small>Face, hair, skin</small>
+                    </button>
+                    <button type="button" class="sample-card" data-sample="samples/fullbody.jpg" data-label="Figure">
+                        <img src="samples/fullbody.jpg" alt="" width="240" height="180">
+                        <span>Figure</span>
+                        <small>Pose and silhouette</small>
+                    </button>
+                    <button type="button" class="sample-card" data-sample="samples/still-life.jpg" data-label="Still life">
+                        <img src="samples/still-life.jpg" alt="" width="240" height="180">
+                        <span>Still life</span>
+                        <small>Quiet objects</small>
+                    </button>
                 </div>
                 <video id="liveVideo" class="live-video" playsinline muted hidden aria-hidden="true"></video>
 
                 <div class="control-group">
                     <label for="preset">Style preset</label>
                     <select id="preset">
-                        <option value="ultimate" selected>Ultimate Studio</option>
+                        <option value="ultimate" selected>Ultimate</option>
+                        <option value="human">Portrait</option>
+                        <option value="subject">Subject only</option>
                         <option value="studio">Studio Ink</option>
                         <option value="manga">Manga Contrast</option>
+                        <option value="pencil">Soft pencil</option>
                         <option value="neon">Neon Pop</option>
                         <option value="warm">Warm Sketch</option>
                         <option value="vivid">Vivid Toon</option>
@@ -94,6 +114,20 @@
                         <option value="classic">Classic Canny</option>
                         <option value="custom">Custom / Experiment</option>
                     </select>
+                    <div class="preset-chips" role="group" aria-label="Style preset">
+                        <button type="button" class="preset-chip is-active" data-preset="ultimate">Ultimate</button>
+                        <button type="button" class="preset-chip" data-preset="human">Portrait</button>
+                        <button type="button" class="preset-chip" data-preset="subject">Subject only</button>
+                        <button type="button" class="preset-chip" data-preset="studio">Studio Ink</button>
+                        <button type="button" class="preset-chip" data-preset="manga">Manga</button>
+                        <button type="button" class="preset-chip" data-preset="pencil">Soft pencil</button>
+                        <button type="button" class="preset-chip" data-preset="warm">Warm</button>
+                        <button type="button" class="preset-chip" data-preset="neon">Neon</button>
+                        <button type="button" class="preset-chip" data-preset="vivid">Vivid</button>
+                        <button type="button" class="preset-chip" data-preset="blueprint">Blueprint</button>
+                        <button type="button" class="preset-chip" data-preset="classic">Classic</button>
+                        <button type="button" class="preset-chip" data-preset="custom">Custom</button>
+                    </div>
                 </div>
 
                 <div class="control-group" id="customControls" hidden>
@@ -283,6 +317,18 @@
                         </select>
                     </div>
                     <div class="control-group">
+                        <label for="qualityCap">Longest-side cap</label>
+                        <select id="qualityCap">
+                            <option value="540">Draft 540</option>
+                            <option value="720" selected>Studio 720</option>
+                            <option value="960">Fine 960</option>
+                            <option value="1280">Print 1280</option>
+                            <option value="4096">Native 4K</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="control-grid">
+                    <div class="control-group">
                         <label for="videoFps">Video FPS</label>
                         <select id="videoFps">
                             <option value="original">Original</option>
@@ -328,7 +374,9 @@
                 <div class="action-row">
                     <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
                     <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="playLiveBtn" type="button" class="secondary-button" disabled>Play live</button>
                     <button id="recordBtn" type="button" class="secondary-button" disabled>Record preview</button>
+                    <button id="revealBtn" type="button" class="ghost-button" disabled>Ink reveal</button>
                     <button id="pauseBtn" type="button" class="secondary-button" hidden disabled>Pause</button>
                     <button id="cancelBtn" type="button" class="secondary-button" hidden disabled>Cancel render</button>
                     <button id="resetBtn" type="button" class="ghost-button">Reset</button>
@@ -337,11 +385,51 @@
                 <div class="control-group">
                     <label for="captureLayout">Capture layout</label>
                     <select id="captureLayout">
-                        <option value="side" selected>Live + ink (side by side)</option>
+                        <option value="preview" selected>As preview</option>
+                        <option value="side">Live + ink (side by side)</option>
                         <option value="ink">Ink only</option>
                         <option value="split">Split as a wipe</option>
                     </select>
-                    <p class="control-hint">Records the on-screen preview — live and processed together, or ink only. No skeleton overlay.</p>
+                    <p class="control-hint">Records the on-screen preview — split follows the Reveal slider. Skeleton overlays stay off unless enabled below.</p>
+                </div>
+
+                <div class="control-group" id="bodyMapsGroup">
+                    <p class="custom-controls-label">Body maps</p>
+                    <div class="custom-toggle-row">
+                        <label for="humanAware" class="toggle-label">
+                            <input type="checkbox" id="humanAware" checked>
+                            Human-aware lines
+                        </label>
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="skinSmooth">Quiet skin <span id="skinSmoothVal">0.80</span></label>
+                        <input type="range" id="skinSmooth" min="0" max="1" step="0.01" value="0.80">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="hairBoost">Hair emphasis <span id="hairBoostVal">1.32</span></label>
+                        <input type="range" id="hairBoost" min="0.5" max="2" step="0.05" value="1.32">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="silhouetteBoost">Silhouette <span id="silhouetteBoostVal">0.72</span></label>
+                        <input type="range" id="silhouetteBoost" min="0" max="1.5" step="0.05" value="0.72">
+                    </div>
+                    <div class="custom-slider-row">
+                        <label for="subjectIsolation">Background hush <span id="subjectIsolationVal">0.38</span></label>
+                        <input type="range" id="subjectIsolation" min="0" max="1" step="0.01" value="0.38">
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="poseLines" class="toggle-label">
+                            <input type="checkbox" id="poseLines">
+                            Pose scaffolding <span class="toggle-hint">(stick-figure bones — off by default)</span>
+                        </label>
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="faceContours" class="toggle-label">
+                            <input type="checkbox" id="faceContours">
+                            Face landmark mesh <span class="toggle-hint">(wireframe eyes and lips — off by default)</span>
+                        </label>
+                    </div>
+                    <p class="control-hint" id="humanStatusHint">Body maps idle — they load in the background.</p>
                 </div>
                 <canvas id="recCanvas" hidden aria-hidden="true"></canvas>
 
@@ -374,6 +462,7 @@
                         <button type="button" class="view-tab is-active" data-view="result" aria-pressed="true">Ink</button>
                         <button type="button" class="view-tab" data-view="original" aria-pressed="false">Photo</button>
                         <button type="button" class="view-tab" data-view="split" aria-pressed="false">Split</button>
+                        <button type="button" class="view-tab" data-view="body" aria-pressed="false">Body</button>
                     </div>
                     <p class="workspace-status" id="workspaceStatus">Drop a photo or clip</p>
                 </div>
@@ -386,6 +475,7 @@
                     <figure class="canvas-card emphasis-card">
                         <figcaption>Line-art result</figcaption>
                         <canvas id="canvasOutput"></canvas>
+                        <canvas id="bodyOverlay" class="body-overlay" aria-hidden="true"></canvas>
                     </figure>
                 </div>
                 <div class="split-row" id="splitRow" hidden>

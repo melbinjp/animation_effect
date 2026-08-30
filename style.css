@@ -332,6 +332,76 @@ video {
     color: var(--ink-soft);
 }
 
+.control-group:has(#preset) {
+    position: relative;
+}
+
+.control-group:has(#preset) > select#preset {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+}
+
+.preset-chip {
+    min-height: 36px;
+    padding: 0 0.75rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--surface-strong);
+    color: var(--ink);
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 500;
+}
+
+.preset-chip.is-active {
+    background: var(--accent);
+    color: #fff8f2;
+    border-color: var(--accent);
+}
+
+.sample-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.5rem;
+    margin-top: 0.85rem;
+}
+
+.sample-card {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface-strong);
+    text-align: left;
+    cursor: pointer;
+    color: inherit;
+}
+
+.sample-card img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+}
+
+.sample-card span {
+    display: block;
+    padding: 0.45rem 0.55rem 0;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+.sample-card small {
+    display: block;
+    padding: 0 0.55rem 0.5rem;
+    color: var(--ink-soft);
+    font-size: 0.7rem;
+}
+
 #fileInput {
     width: 100%;
 }
@@ -527,6 +597,20 @@ video {
     background: transparent;
     border: 0;
     margin: 0;
+}
+
+.body-overlay {
+    opacity: 0;
+    pointer-events: none;
+    mix-blend-mode: multiply;
+}
+
+.preview-stage[data-view="body"] .body-overlay {
+    opacity: 0.9;
+}
+
+.preview-stage[data-view="body"] #canvasOutput {
+    opacity: 0.55;
 }
 
 .emphasis-card {
@@ -786,6 +870,14 @@ video {
 
     .hero-copy,
     .hero-notes {
+        display: none;
+    }
+
+    .sample-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .sample-card small {
         display: none;
     }
 

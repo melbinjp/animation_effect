@@ -44,7 +44,19 @@ const elements = {
     previewStage: document.getElementById('previewStage'),
     splitRow: document.getElementById('splitRow'),
     splitReveal: document.getElementById('splitReveal'),
-    workspaceStatus: document.getElementById('workspaceStatus')
+    workspaceStatus: document.getElementById('workspaceStatus'),
+    qualityCap: document.getElementById('qualityCap'),
+    playLiveBtn: document.getElementById('playLiveBtn'),
+    revealBtn: document.getElementById('revealBtn'),
+    bodyOverlay: document.getElementById('bodyOverlay'),
+    humanAware: document.getElementById('humanAware'),
+    poseLines: document.getElementById('poseLines'),
+    faceContours: document.getElementById('faceContours'),
+    skinSmooth: document.getElementById('skinSmooth'),
+    hairBoost: document.getElementById('hairBoost'),
+    silhouetteBoost: document.getElementById('silhouetteBoost'),
+    subjectIsolation: document.getElementById('subjectIsolation'),
+    humanStatusHint: document.getElementById('humanStatusHint')
 };
 
 const STYLE_PRESETS = {
@@ -173,6 +185,54 @@ const STYLE_PRESETS = {
         cleanSpeckles: true,
         mergeDoubleEdge: true
     },
+    human: {
+        label: 'Portrait',
+        engine: 'ultimate',
+        background: [250, 246, 238],
+        ink: [22, 28, 36],
+        lowThreshold: 28,
+        highThreshold: 100,
+        bilateralDiameter: 7,
+        sigma: 44,
+        smoothPasses: 1,
+        xdogSigma: 0.72,
+        xdogTau: 0.986,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
+    subject: {
+        label: 'Subject only',
+        engine: 'ultimate',
+        background: [255, 255, 255],
+        ink: [18, 18, 20],
+        lowThreshold: 30,
+        highThreshold: 110,
+        bilateralDiameter: 7,
+        sigma: 48,
+        smoothPasses: 1,
+        xdogSigma: 0.8,
+        xdogTau: 0.985,
+        xdogPhi: 220,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
+    pencil: {
+        label: 'Soft pencil',
+        engine: 'ultimate',
+        background: [250, 246, 238],
+        ink: [54, 42, 32],
+        lowThreshold: 24,
+        highThreshold: 90,
+        bilateralDiameter: 7,
+        sigma: 52,
+        smoothPasses: 1,
+        xdogSigma: 1.05,
+        xdogTau: 0.945,
+        xdogPhi: 70,
+        cleanSpeckles: false,
+        mergeDoubleEdge: false
+    },
     custom: {
         label: 'Custom / Experiment',
         engine: 'classic',
@@ -203,6 +263,11 @@ const state = {
     pauseRequested: false,
     cameraStream: null,
     cameraLoop: false,
+    livePlay: false,
+    humanMod: null,
+    humanCache: null,
+    lastHuman: null,
+    humanStatus: 'off',
     recording: false,
     recorder: null,
     recChunks: [],
@@ -388,6 +453,7 @@ class LineArtProcessor {
                     }
                     state.cvReady = true;
                     refreshActions();
+                    void warmupHuman();
                 }
                 console.log(`[Main] Worker ${index} ready (${this._readyCount}/${this._concurrency})`);
                 this._releaseWorker(index);
@@ -540,6 +606,21 @@ class LineArtProcessor {
     async renderToData(sourceCanvas, settings) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
+        const payload = { ...settings };
+        try {
+            const human = await inferCachedHuman(sourceCanvas, width, height, settings);
+            if (human) {
+                payload.classMask = human.classMask;
+                payload.extraLines = human.extraLines;
+                payload.hasPerson = human.hasPerson;
+                state.lastHuman = human;
+            } else {
+                state.lastHuman = null;
+            }
+        } catch (err) {
+            console.warn('Body maps skipped', err);
+            state.lastHuman = null;
+        }
         const imageData = sourceCanvas
             .getContext('2d', { willReadFrequently: true })
             .getImageData(0, 0, width, height); // synchronous pixel copy
@@ -559,7 +640,7 @@ class LineArtProcessor {
             this._pending.set(id, { resolve, reject });
             // Transfer the pixel buffer zero-copy to the chosen worker.
             this._workers[workerIndex].postMessage(
-                { type: 'process', id, rgbaData: imageData.data, width, height, settings },
+                { type: 'process', id, rgbaData: imageData.data, width, height, settings: payload },
                 [imageData.data.buffer]
             );
         });
@@ -575,6 +656,7 @@ class LineArtProcessor {
         destinationCanvas.getContext('2d').putImageData(
             new ImageData(rawData, width, height), 0, 0
         );
+        paintBodyOverlay(width, height);
     }
 }
 
@@ -602,6 +684,12 @@ function refreshActions() {
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
     if (elements.recordBtn) {
         elements.recordBtn.disabled = !state.cvReady || !hasFile;
+    }
+    if (elements.playLiveBtn) {
+        elements.playLiveBtn.disabled = !state.cvReady || state.fileKind !== 'video' || state.processing;
+    }
+    if (elements.revealBtn) {
+        elements.revealBtn.disabled = !elements.outputCanvas || !elements.outputCanvas.width;
     }
     elements.fileInput.disabled = notReady;
     if (elements.cameraBtn) elements.cameraBtn.disabled = !state.cvReady;
@@ -687,6 +775,183 @@ function applySplit(value) {
     if (elements.previewStage) elements.previewStage.style.setProperty('--split', `${v}%`);
 }
 
+function setHumanStatus(text) {
+    state.humanStatus = text;
+    if (elements.humanStatusHint) elements.humanStatusHint.textContent = text;
+}
+
+async function loadHumanModule() {
+    if (!state.humanMod) {
+        state.humanMod = await import('./human.js');
+    }
+    return state.humanMod;
+}
+
+async function warmupHuman() {
+    try {
+        setHumanStatus('Loading body maps…');
+        const mod = await loadHumanModule();
+        const ok = await mod.ensureHuman({ landmarks: false });
+        setHumanStatus(ok ? 'Body maps on — background hush and quiet skin.' : 'Body maps off — inking the whole frame.');
+        if (elements.workspaceStatus && ok) {
+            const cur = elements.workspaceStatus.textContent || '';
+            if (!/maps/i.test(cur)) elements.workspaceStatus.textContent = cur;
+        }
+    } catch (err) {
+        console.warn(err);
+        setHumanStatus('Body maps unavailable on this device.');
+    }
+}
+
+function fingerprintPixels(data, w, h) {
+    let hsh = (w * 73856093) ^ (h * 19349663);
+    const step = Math.max(16, (data.length / 96) | 0);
+    for (let i = 0; i < data.length; i += step) {
+        hsh = (Math.imul(hsh, 16777619) ^ data[i]) >>> 0;
+    }
+    return hsh;
+}
+
+async function inferCachedHuman(canvas, width, height, settings) {
+    if (!settings.humanAware) return null;
+    const mod = await loadHumanModule();
+    const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
+    if (!ok) return null;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const data = ctx.getImageData(0, 0, width, height).data;
+    const fp = fingerprintPixels(data, width, height);
+    const cache = state.humanCache;
+    if (
+        cache &&
+        cache.fp === fp &&
+        cache.w === width &&
+        cache.h === height &&
+        cache.pose === !!settings.poseLines &&
+        cache.face === !!settings.faceContours
+    ) {
+        return cache.maps;
+    }
+    const maps = mod.inferHuman(canvas, width, height, settings);
+    if (maps) {
+        state.humanCache = {
+            fp,
+            w: width,
+            h: height,
+            pose: !!settings.poseLines,
+            face: !!settings.faceContours,
+            maps,
+        };
+        if (maps.hasPerson) {
+            setHumanStatus(`Person ${Math.round(maps.personRatio * 100)}% — maps on.`);
+        }
+    }
+    return maps;
+}
+
+function paintBodyOverlay(width, height) {
+    const overlay = elements.bodyOverlay;
+    if (!overlay) return;
+    overlay.width = width;
+    overlay.height = height;
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, width, height);
+    const human = state.lastHuman;
+    if (!human || !human.classMask || !state.humanMod) return;
+    const rgba = state.humanMod.colorizeMask(human.classMask, width, height);
+    ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+}
+
+async function loadSample(url, label) {
+    try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        const file = new File([blob], `${label}.jpg`, { type: blob.type || 'image/jpeg' });
+        await handleFileSelection(file);
+    } catch (err) {
+        console.error(err);
+        console.log('Could not open that sample.', 'error');
+    }
+}
+
+function syncPresetChips() {
+    const current = elements.preset.value;
+    document.querySelectorAll('.preset-chip').forEach((btn) => {
+        btn.classList.toggle('is-active', btn.dataset.preset === current);
+    });
+}
+
+function applyHumanPresetSliders(presetKey) {
+    const table = {
+        human: { skinSmooth: 0.84, hairBoost: 1.45, silhouetteBoost: 0.95, subjectIsolation: 0.28 },
+        subject: { skinSmooth: 0.7, hairBoost: 1.32, silhouetteBoost: 1, subjectIsolation: 0.94 },
+        manga: { skinSmooth: 0.8, hairBoost: 1.4, silhouetteBoost: 0.9, subjectIsolation: 0.22 },
+        neon: { skinSmooth: 0.55, hairBoost: 1.32, silhouetteBoost: 0.88, subjectIsolation: 0.55 },
+        blueprint: { skinSmooth: 0.76, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.18 },
+        classic: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
+        ultimate: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
+        studio: { skinSmooth: 0.78, hairBoost: 1.32, silhouetteBoost: 0.82, subjectIsolation: 0.38 },
+    };
+    const vals = table[presetKey] || table.ultimate;
+    const setSlider = (el, spanId, value) => {
+        if (!el) return;
+        el.value = String(value);
+        const span = document.getElementById(spanId);
+        if (span) span.textContent = Number(value).toFixed(2);
+    };
+    setSlider(elements.skinSmooth, 'skinSmoothVal', vals.skinSmooth);
+    setSlider(elements.hairBoost, 'hairBoostVal', vals.hairBoost);
+    setSlider(elements.silhouetteBoost, 'silhouetteBoostVal', vals.silhouetteBoost);
+    setSlider(elements.subjectIsolation, 'subjectIsolationVal', vals.subjectIsolation);
+    if (elements.humanAware) elements.humanAware.checked = presetKey !== 'classic';
+}
+
+async function playLiveVideo() {
+    if (state.fileKind !== 'video' || !state.sourceVideo || state.processing) return;
+    const video = state.sourceVideo;
+    state.cancelRequested = false;
+    state.livePlay = true;
+    setBusy(true);
+    video.muted = true;
+    try {
+        await video.play();
+        while (state.livePlay && !state.cancelRequested && !video.paused && !video.ended) {
+            throwIfCancelled();
+            drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+            paintLiveCapture();
+            if (elements.videoSeeker) {
+                elements.videoSeeker.value = String(video.currentTime);
+                if (elements.videoSeekerTime) elements.videoSeekerTime.textContent = `${video.currentTime.toFixed(1)}s`;
+            }
+        }
+    } catch (err) {
+        if (!/cancel/i.test(String(err && err.message))) {
+            console.error(err);
+            console.log('Could not play that clip live.', 'error');
+        }
+    } finally {
+        state.livePlay = false;
+        setBusy(false);
+        if (state.recording) void stopPreviewRecording();
+        refreshActions();
+    }
+}
+
+function playInkReveal() {
+    if (!elements.outputCanvas || !elements.outputCanvas.width) return;
+    setView('split');
+    const start = performance.now();
+    const tick = (now) => {
+        const t = Math.min(1, (now - start) / 1600);
+        const eased = 1 - (1 - t) ** 3;
+        const v = eased * 100;
+        if (elements.splitReveal) elements.splitReveal.value = String(v);
+        applySplit(v);
+        if (t < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+}
+
 function setAdvisory(message, tone = 'info') {
     elements.advisoryText.textContent = message;
     elements.advisoryCard.dataset.tone = tone;
@@ -758,6 +1023,7 @@ function getSettings() {
         detail: Number(elements.detail.value),
         lineWeight: Number(elements.lineWeight.value),
         scale: Number(elements.scale.value),
+        qualityCap: Number(elements.qualityCap && elements.qualityCap.value) || 720,
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
@@ -785,7 +1051,14 @@ function getSettings() {
         colorHighThresh: Number(document.getElementById('customColorHighThresh').value),
         colorLineWeight: Number(document.getElementById('customColorLineWeight').value),
         colorSoftness: Number(document.getElementById('customColorSoftness').value),
-        colorOpacity: Number(document.getElementById('customColorOpacity').value) / 100.0
+        colorOpacity: Number(document.getElementById('customColorOpacity').value) / 100.0,
+        humanAware: !!(elements.humanAware && elements.humanAware.checked),
+        poseLines: !!(elements.poseLines && elements.poseLines.checked),
+        faceContours: !!(elements.faceContours && elements.faceContours.checked),
+        skinSmooth: Number(elements.skinSmooth && elements.skinSmooth.value) || 0.8,
+        hairBoost: Number(elements.hairBoost && elements.hairBoost.value) || 1.32,
+        silhouetteBoost: Number(elements.silhouetteBoost && elements.silhouetteBoost.value) || 0.72,
+        subjectIsolation: Number(elements.subjectIsolation && elements.subjectIsolation.value) || 0.38
     };
 }
 
@@ -794,8 +1067,8 @@ function computeScaledSize(width, height, scale, noCap = false) {
     // Cap at 4096 px (largest side) so 4K videos render at full native quality
     // while true 8K is safely downscaled to ~4K equivalent in standard presets.
     // Custom mode (noCap = true) bypasses the cap for unrestricted processing.
-    const dimensionCap = 4096;
-    const capRatio = (!noCap && largestSide > dimensionCap) ? dimensionCap / largestSide : 1;
+    const dimensionCap = noCap ? 8192 : (Number(elements.qualityCap && elements.qualityCap.value) || 720);
+    const capRatio = largestSide > dimensionCap ? dimensionCap / largestSide : 1;
     const ratio = Math.min(1, scale * capRatio);
 
     return {
@@ -974,6 +1247,7 @@ function requestCancel() {
 
     state.cancelRequested = true;
     state.cameraLoop = false;
+    state.livePlay = false;
     if (state.recording) void stopPreviewRecording();
     state.pauseRequested = false;
     elements.pauseBtn.textContent = 'Pause';
@@ -1284,17 +1558,25 @@ function paintLiveCapture() {
     if (!src || !ink || !dest || !ink.width) return;
     const w = ink.width;
     const h = ink.height;
-    const layout = elements.captureLayout ? elements.captureLayout.value : 'side';
+    let layout = elements.captureLayout ? elements.captureLayout.value : 'preview';
+    if (layout === 'preview') {
+        layout = state.view === 'split' ? 'split' : state.view === 'original' ? 'photo' : 'ink';
+    }
     const ctx = dest.getContext('2d');
     if (layout === 'ink') {
         dest.width = evenDim(w);
         dest.height = evenDim(h);
         ctx.drawImage(ink, 0, 0, w, h);
+    } else if (layout === 'photo') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(src, 0, 0, w, h);
     } else if (layout === 'split') {
         dest.width = evenDim(w);
         dest.height = evenDim(h);
         ctx.drawImage(src, 0, 0, w, h);
-        const cut = Math.round(w * 0.52);
+        const splitPct = Number(elements.splitReveal && elements.splitReveal.value) || 52;
+        const cut = Math.round(w * (splitPct / 100));
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, 0, cut, h);
@@ -2523,8 +2805,53 @@ document.querySelectorAll('.view-tab').forEach((btn) => {
 if (elements.splitReveal) {
     elements.splitReveal.addEventListener('input', () => applySplit(elements.splitReveal.value));
 }
+document.querySelectorAll('.preset-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        elements.preset.value = btn.dataset.preset;
+        elements.preset.dispatchEvent(new Event('change'));
+        syncPresetChips();
+    });
+});
+elements.preset.addEventListener('change', syncPresetChips);
+document.querySelectorAll('.sample-card').forEach((btn) => {
+    btn.addEventListener('click', () => void loadSample(btn.dataset.sample, btn.dataset.label));
+});
+if (elements.playLiveBtn) {
+    elements.playLiveBtn.addEventListener('click', () => void playLiveVideo());
+}
+if (elements.revealBtn) {
+    elements.revealBtn.addEventListener('click', playInkReveal);
+}
 if (window.innerWidth < 640 && elements.scale && Number(elements.scale.value) > 0.75) {
     elements.scale.value = '0.75';
+}
+if (window.innerWidth < 640 && elements.qualityCap) {
+    elements.qualityCap.value = '540';
+}
+
+[
+    ['skinSmooth', 'skinSmoothVal'],
+    ['hairBoost', 'hairBoostVal'],
+    ['silhouetteBoost', 'silhouetteBoostVal'],
+    ['subjectIsolation', 'subjectIsolationVal'],
+].forEach(([id, spanId]) => {
+    const el = document.getElementById(id);
+    const span = document.getElementById(spanId);
+    if (!el || !span) return;
+    el.addEventListener('input', () => {
+        span.textContent = Number(el.value).toFixed(2);
+    });
+});
+
+if (elements.poseLines) {
+    elements.poseLines.addEventListener('change', () => {
+        if (elements.poseLines.checked) void loadHumanModule().then((m) => m.ensureHuman({ landmarks: true }));
+    });
+}
+if (elements.faceContours) {
+    elements.faceContours.addEventListener('change', () => {
+        if (elements.faceContours.checked) void loadHumanModule().then((m) => m.ensureHuman({ landmarks: true }));
+    });
 }
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
@@ -2545,12 +2872,13 @@ elements.videoSeeker.addEventListener('change', async () => {
     await onPreviewClick();
 });
 
-['preset', 'detail', 'lineWeight', 'scale', 'videoFps', 'customVideoFps'].forEach((id) => {
+['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps', 'humanAware', 'poseLines', 'faceContours', 'skinSmooth', 'hairBoost', 'silhouetteBoost', 'subjectIsolation'].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.addEventListener('change', async () => {
         if (id === 'preset') {
             document.getElementById('customControls').hidden = elements.preset.value !== 'custom';
+            applyHumanPresetSliders(elements.preset.value);
         }
         if (id === 'videoFps') {
             elements.customVideoFps.hidden = elements.videoFps.value !== 'custom';

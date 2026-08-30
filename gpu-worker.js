@@ -975,7 +975,7 @@ class CpuProcessor {
         }
 
         if (settings.engine === 'ultimate') {
-            return paintUltimateInk(this.gray, this.edges, width, height, settings);
+            return paintUltimateInk(this.gray, this.edges, width, height, settings, settings.classMask, settings.extraLines);
         }
 
         cv.bitwise_not(this.edges, this.edges);
