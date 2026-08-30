@@ -32,6 +32,7 @@
     </script>
 </head>
 <body>
+    <a href="#workspace" class="skip-link">Skip to workspace</a>
     <main class="page-shell">
         <section class="hero">
             <p class="eyebrow">Browser-Only Animation Studio</p>
@@ -49,7 +50,7 @@
             </div>
         </section>
 
-        <section class="studio-shell" aria-label="Line art conversion workspace">
+        <section class="studio-shell" id="workspace" aria-label="Line art conversion workspace">
             <aside class="panel controls-panel">
                 <div class="panel-heading">
                     <h2>Controls</h2>
@@ -60,17 +61,22 @@
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
+                    <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
+                    <p class="control-hint">Live camera inks real edges only — no face mesh or hand skeleton overlay.</p>
                 </div>
+                <video id="liveVideo" class="live-video" playsinline muted hidden aria-hidden="true"></video>
 
                 <div class="control-group">
                     <label for="preset">Style preset</label>
                     <select id="preset">
-                        <option value="manga" selected>Manga Contrast</option>
+                        <option value="ultimate" selected>Ultimate Studio</option>
                         <option value="studio">Studio Ink</option>
+                        <option value="manga">Manga Contrast</option>
                         <option value="neon">Neon Pop</option>
                         <option value="warm">Warm Sketch</option>
                         <option value="vivid">Vivid Toon</option>
                         <option value="blueprint">Blueprint Draft</option>
+                        <option value="classic">Classic Canny</option>
                         <option value="custom">Custom / Experiment</option>
                     </select>
                 </div>
@@ -307,10 +313,22 @@
                 <div class="action-row">
                     <button id="previewBtn" type="button" class="primary-button" disabled>Preview style</button>
                     <button id="renderBtn" type="button" class="primary-button accent-button" disabled>Render final</button>
+                    <button id="recordBtn" type="button" class="secondary-button" disabled>Record preview</button>
                     <button id="pauseBtn" type="button" class="secondary-button" hidden disabled>Pause</button>
                     <button id="cancelBtn" type="button" class="secondary-button" hidden disabled>Cancel render</button>
                     <button id="resetBtn" type="button" class="ghost-button">Reset</button>
                 </div>
+
+                <div class="control-group">
+                    <label for="captureLayout">Capture layout</label>
+                    <select id="captureLayout">
+                        <option value="side" selected>Live + ink (side by side)</option>
+                        <option value="ink">Ink only</option>
+                        <option value="split">Split as a wipe</option>
+                    </select>
+                    <p class="control-hint">Records the on-screen preview — live and processed together, or ink only. No skeleton overlay.</p>
+                </div>
+                <canvas id="recCanvas" hidden aria-hidden="true"></canvas>
 
                 <div class="download-card" id="downloadCard" hidden>
                     <p class="status-label">Export</p>

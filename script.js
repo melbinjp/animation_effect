@@ -35,72 +35,143 @@ const elements = {
     workerThreadsHint: document.getElementById('workerThreadsHint'),
     videoSeekerRow: document.getElementById('videoSeekerRow'),
     videoSeeker: document.getElementById('videoSeeker'),
-    videoSeekerTime: document.getElementById('videoSeekerTime')
+    videoSeekerTime: document.getElementById('videoSeekerTime'),
+    cameraBtn: document.getElementById('cameraBtn'),
+    liveVideo: document.getElementById('liveVideo'),
+    recordBtn: document.getElementById('recordBtn'),
+    recCanvas: document.getElementById('recCanvas'),
+    captureLayout: document.getElementById('captureLayout')
 };
 
 const STYLE_PRESETS = {
+    ultimate: {
+        label: 'Ultimate Studio',
+        engine: 'ultimate',
+        background: [250, 246, 238],
+        ink: [22, 28, 36],
+        lowThreshold: 32,
+        highThreshold: 108,
+        bilateralDiameter: 7,
+        sigma: 48,
+        smoothPasses: 1,
+        xdogSigma: 0.82,
+        xdogTau: 0.983,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
     manga: {
         label: 'Manga Contrast',
+        engine: 'ultimate',
         background: [255, 255, 255],
-        ink: [0, 0, 0],
-        lowThreshold: 28,
-        highThreshold: 96,
+        ink: [8, 8, 10],
+        lowThreshold: 34,
+        highThreshold: 118,
         bilateralDiameter: 9,
         sigma: 72,
-        smoothPasses: 2
+        smoothPasses: 1,
+        xdogSigma: 0.88,
+        xdogTau: 0.988,
+        xdogPhi: 280,
+        cleanSpeckles: true,
+        mergeDoubleEdge: true
     },
     studio: {
         label: 'Studio Ink',
-        background: [248, 245, 237],
-        ink: [23, 33, 47],
+        engine: 'ultimate',
+        background: [248, 244, 234],
+        ink: [28, 32, 38],
         lowThreshold: 38,
         highThreshold: 118,
         bilateralDiameter: 7,
         sigma: 52,
-        smoothPasses: 2
+        smoothPasses: 1,
+        xdogSigma: 0.7,
+        xdogTau: 0.987,
+        xdogPhi: 240,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
     },
     neon: {
         label: 'Neon Pop',
+        engine: 'ultimate',
         background: [10, 8, 22],
         ink: [0, 230, 200],
         lowThreshold: 22,
         highThreshold: 80,
         bilateralDiameter: 9,
         sigma: 68,
-        smoothPasses: 2
+        smoothPasses: 1,
+        xdogSigma: 0.74,
+        xdogTau: 0.98,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
     },
     warm: {
         label: 'Warm Sketch',
-        background: [255, 248, 232],
-        ink: [102, 48, 14],
+        engine: 'ultimate',
+        background: [255, 247, 232],
+        ink: [92, 44, 18],
         lowThreshold: 32,
         highThreshold: 104,
         bilateralDiameter: 7,
         sigma: 58,
-        smoothPasses: 2
+        smoothPasses: 1,
+        xdogSigma: 0.92,
+        xdogTau: 0.976,
+        xdogPhi: 160,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
     },
     vivid: {
         label: 'Vivid Toon',
+        engine: 'ultimate',
         background: [255, 255, 255],
-        ink: [26, 26, 180],
+        ink: [28, 28, 168],
         lowThreshold: 18,
         highThreshold: 66,
         bilateralDiameter: 11,
         sigma: 96,
-        smoothPasses: 2
+        smoothPasses: 1,
+        xdogSigma: 0.76,
+        xdogTau: 0.983,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
     },
     blueprint: {
         label: 'Blueprint Draft',
-        background: [225, 237, 245],
-        ink: [19, 57, 92],
+        engine: 'ultimate',
+        background: [224, 236, 244],
+        ink: [16, 52, 88],
         lowThreshold: 48,
         highThreshold: 144,
         bilateralDiameter: 5,
         sigma: 44,
-        smoothPasses: 1
+        smoothPasses: 1,
+        xdogSigma: 0.68,
+        xdogTau: 0.99,
+        xdogPhi: 210,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
+    },
+    classic: {
+        label: 'Classic Canny',
+        engine: 'classic',
+        background: [255, 255, 255],
+        ink: [0, 0, 0],
+        lowThreshold: 40,
+        highThreshold: 100,
+        bilateralDiameter: 13,
+        sigma: 90,
+        smoothPasses: 2,
+        cleanSpeckles: true,
+        mergeDoubleEdge: true
     },
     custom: {
         label: 'Custom / Experiment',
+        engine: 'classic',
         background: [255, 255, 255],
         ink: [0, 0, 0],
         lowThreshold: 60,
@@ -126,6 +197,12 @@ const state = {
     processing: false,
     cancelRequested: false,
     pauseRequested: false,
+    cameraStream: null,
+    cameraLoop: false,
+    recording: false,
+    recorder: null,
+    recChunks: [],
+    recTrack: null,
     activeJobId: '',
     beforeUnloadAttached: false,
     mediaWidth: null,
@@ -514,11 +591,15 @@ function setBusy(isBusy, isVideo = false) {
 }
 
 function refreshActions() {
-    const hasFile = Boolean(state.selectedFile);
+    const hasFile = Boolean(state.selectedFile) || state.fileKind === 'camera';
     const notReady = !state.cvReady || state.processing;
     elements.previewBtn.disabled = !state.cvReady || !hasFile || state.processing;
     elements.renderBtn.disabled = !state.cvReady || !hasFile || state.processing;
+    if (elements.recordBtn) {
+        elements.recordBtn.disabled = !state.cvReady || !hasFile;
+    }
     elements.fileInput.disabled = notReady;
+    if (elements.cameraBtn) elements.cameraBtn.disabled = !state.cvReady;
     // Worker controls stay enabled during processing so the user can adjust
     // concurrency dynamically mid-render without a full pool rebuild.
     elements.workerThreadsInput.disabled = !state.cvReady;
@@ -656,18 +737,24 @@ function getSettings() {
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
+        engine: preset.engine || (presetKey === 'custom' ? 'classic' : 'ultimate'),
+        whiteBalance: presetKey !== 'custom',
         useBilateral: presetKey === 'custom' && document.getElementById('customUseBilateral').checked,
         bilateralPasses: Number(document.getElementById('customBilateralPasses').value),
         useGaussian: presetKey === 'custom' && document.getElementById('customUseGaussian').checked,
         gaussianPasses: Number(document.getElementById('customGaussianPasses').value),
         useMedian: presetKey === 'custom' && document.getElementById('customUseMedian').checked,
         medianPasses: Number(document.getElementById('customMedianPasses').value),
-        cleanSpeckles: presetKey === 'custom' && document.getElementById('customCleanSpeckles').checked,
+        cleanSpeckles: presetKey === 'custom'
+            ? document.getElementById('customCleanSpeckles').checked
+            : preset.cleanSpeckles !== false,
         cleanSpecklesIntensity: Number(document.getElementById('customCleanSpecklesIntensity').value),
         autoNormalize: presetKey !== 'custom' || document.getElementById('customAutoNormalize').checked,
         darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
         darkBoostClip: Number(document.getElementById('customDarkBoostClip').value),
-        mergeDoubleEdge: presetKey === 'custom' && document.getElementById('customMergeDoubleEdge').checked,
+        mergeDoubleEdge: presetKey === 'custom'
+            ? document.getElementById('customMergeDoubleEdge').checked
+            : !!preset.mergeDoubleEdge,
         mergeDoubleEdgeIntensity: Number(document.getElementById('customMergeDoubleEdgeIntensity').value),
         colorEdges: presetKey === 'custom' && document.getElementById('customColorEdges').checked,
         colorLowThresh: Number(document.getElementById('customColorLowThresh').value),
@@ -862,6 +949,8 @@ function requestCancel() {
     }
 
     state.cancelRequested = true;
+    state.cameraLoop = false;
+    if (state.recording) void stopPreviewRecording();
     state.pauseRequested = false;
     elements.pauseBtn.textContent = 'Pause';
     console.log('Cancel requested. Finishing the current step...', 'warn');
@@ -1119,6 +1208,11 @@ async function drawCurrentSource() {
         const previewTime = Number(elements.videoSeeker.value);
         await seekVideo(state.sourceVideo, previewTime);
         drawMediaToCanvas(state.sourceVideo, elements.sourceCanvas, settings.scale, settings.customMode);
+        return;
+    }
+
+    if (state.fileKind === 'camera' && state.sourceVideo) {
+        drawMediaToCanvas(state.sourceVideo, elements.sourceCanvas, settings.scale, settings.customMode);
     }
 }
 
@@ -1127,14 +1221,138 @@ async function renderPreview() {
     await drawCurrentSource();
     throwIfCancelled();
     await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+    paintLiveCapture();
     clearRenderedOutput();
     setResultGlow(true);
+    refreshActions();
     console.log(
         state.fileKind === 'video'
-            ? 'Preview ready. Use Render final to process the full clip.'
-            : 'Preview ready. Use Render final to export the PNG.',
+            ? 'Preview ready. Use Record preview to capture the live split, or Render final for the full clip.'
+            : 'Preview ready. Use Record preview to capture the live layout, or Render final to export a PNG.',
         'success'
     );
+}
+
+function evenDim(n) {
+    const v = Math.max(2, Math.round(n));
+    return v + (v % 2);
+}
+
+function paintLiveCapture() {
+    const src = elements.sourceCanvas;
+    const ink = elements.outputCanvas;
+    const dest = elements.recCanvas;
+    if (!src || !ink || !dest || !ink.width) return;
+    const w = ink.width;
+    const h = ink.height;
+    const layout = elements.captureLayout ? elements.captureLayout.value : 'side';
+    const ctx = dest.getContext('2d');
+    if (layout === 'ink') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(ink, 0, 0, w, h);
+    } else if (layout === 'split') {
+        dest.width = evenDim(w);
+        dest.height = evenDim(h);
+        ctx.drawImage(src, 0, 0, w, h);
+        const cut = Math.round(w * 0.52);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, cut, h);
+        ctx.clip();
+        ctx.drawImage(ink, 0, 0, w, h);
+        ctx.restore();
+        ctx.fillStyle = '#b85c38';
+        ctx.fillRect(cut - 1, 0, 2, h);
+    } else {
+        dest.width = evenDim(w * 2);
+        dest.height = evenDim(h);
+        ctx.fillStyle = '#f4efe6';
+        ctx.fillRect(0, 0, dest.width, dest.height);
+        ctx.drawImage(src, 0, 0, w, h);
+        ctx.drawImage(ink, w, 0, w, h);
+        ctx.font = '600 13px "Segoe UI", sans-serif';
+        ctx.fillStyle = 'rgba(22,33,47,0.72)';
+        ctx.fillRect(12, 12, 48, 22);
+        ctx.fillRect(w + 12, 12, 40, 22);
+        ctx.fillStyle = '#fffaf2';
+        ctx.fillText('Live', 20, 28);
+        ctx.fillText('Ink', w + 20, 28);
+    }
+    if (state.recTrack && typeof state.recTrack.requestFrame === 'function') {
+        state.recTrack.requestFrame();
+    }
+}
+
+function pickRecorderMime() {
+    const types = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
+        'video/mp4',
+    ];
+    return types.find((t) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) || 'video/webm';
+}
+
+function startPreviewRecording() {
+    const canvas = elements.recCanvas;
+    if (!canvas || !elements.outputCanvas.width) {
+        console.log('Preview a frame first.', 'warn');
+        return;
+    }
+    paintLiveCapture();
+    const mime = pickRecorderMime();
+    const stream = canvas.captureStream(18);
+    state.recTrack = stream.getVideoTracks()[0];
+    const mixed = new MediaStream(stream.getVideoTracks());
+    if (state.cameraStream) {
+        state.cameraStream.getAudioTracks().forEach((t) => mixed.addTrack(t));
+    }
+    const rec = new MediaRecorder(mixed, { mimeType: mime, videoBitsPerSecond: 5_000_000 });
+    state.recChunks = [];
+    rec.ondataavailable = (e) => {
+        if (e.data && e.data.size) state.recChunks.push(e.data);
+    };
+    rec.start(400);
+    state.recorder = rec;
+    state.recording = true;
+    elements.recordBtn.textContent = 'Stop & save';
+    setAdvisory('Recording the live preview layout. Stop to download WebM/MP4.', 'info');
+    console.log('Recording the on-screen preview.', 'info');
+}
+
+async function stopPreviewRecording() {
+    const rec = state.recorder;
+    if (!rec) return;
+    state.recording = false;
+    if (rec.state !== 'inactive') rec.stop();
+    await new Promise((resolve) => {
+        rec.addEventListener('stop', resolve, { once: true });
+        setTimeout(resolve, 1500);
+    });
+    state.recorder = null;
+    state.recTrack = null;
+    const chunks = state.recChunks || [];
+    state.recChunks = [];
+    elements.recordBtn.textContent = 'Record preview';
+    if (!chunks.length) return;
+    const mime = rec.mimeType || 'video/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(chunks, { type: mime.includes('mp4') ? 'video/mp4' : 'video/webm' });
+    const base = state.selectedFile && state.selectedFile.name
+        ? state.selectedFile.name.replace(/\.[^.]+$/, '')
+        : 'line-art';
+    setDownload(blob, `${base}-preview.${ext}`);
+    setAdvisory('Preview capture is ready to download.', 'success');
+    console.log('Preview capture ready.', 'success');
+}
+
+function togglePreviewRecording() {
+    if (state.recording) {
+        void stopPreviewRecording();
+    } else {
+        startPreviewRecording();
+    }
 }
 
 async function renderImageExport() {
@@ -1962,6 +2180,68 @@ async function renderVideoExport() {
     }
 }
 
+async function stopCamera() {
+    state.cameraLoop = false;
+    if (state.cameraStream) {
+        state.cameraStream.getTracks().forEach((t) => t.stop());
+        state.cameraStream = null;
+    }
+    const video = elements.liveVideo;
+    if (video && video.srcObject) {
+        video.pause();
+        video.srcObject = null;
+    }
+}
+
+async function startCamera() {
+    if (!state.cvReady) {
+        console.log('Processing engine still loading — please wait a moment and try again.', 'warn');
+        return;
+    }
+    try {
+        await stopCamera();
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+        });
+        state.cameraStream = stream;
+        const video = elements.liveVideo;
+        video.srcObject = stream;
+        video.muted = true;
+        video.playsInline = true;
+        await video.play();
+        state.fileKind = 'camera';
+        state.sourceVideo = video;
+        state.sourceImage = null;
+        state.selectedFile = { name: 'camera.png' };
+        state.mediaWidth = video.videoWidth;
+        state.mediaHeight = video.videoHeight;
+        elements.videoSeekerRow.hidden = true;
+        updateFileMeta(`Camera · ${video.videoWidth}×${video.videoHeight}`);
+        setAdvisory('Live camera — tracker overlays stay off so you only get real line art.', 'success');
+        state.cameraLoop = true;
+        state.cancelRequested = false;
+        setBusy(true);
+        refreshActions();
+        while (state.cameraLoop && !state.cancelRequested) {
+            throwIfCancelled();
+            drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+            paintLiveCapture();
+        }
+    } catch (error) {
+        console.error(error);
+        const blocked = /NotAllowedError|Permission|denied/i.test(String(error.name || error.message || error));
+        console.log(blocked ? 'Camera permission was blocked. Drop a file instead.' : (error.message || 'Camera failed.'), 'error');
+        setAdvisory(blocked ? 'Camera blocked — drop a file instead.' : 'Camera failed.', 'error');
+        await stopCamera();
+    } finally {
+        setBusy(false);
+        updateUnloadProtection();
+        if (state.recording) void stopPreviewRecording();
+    }
+}
+
 async function handleFileSelection(file) {
     if (!file) {
         return;
@@ -1973,6 +2253,7 @@ async function handleFileSelection(file) {
     }
 
     try {
+        await stopCamera();
         setBusy(true);
         state.cancelRequested = false;
         resetProgress();
@@ -1997,6 +2278,14 @@ async function handleFileSelection(file) {
 
 function resetWorkspace() {
     processor.reset();
+    void stopCamera();
+    if (state.recording) {
+        state.recording = false;
+        if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+        state.recorder = null;
+        state.recChunks = [];
+        if (elements.recordBtn) elements.recordBtn.textContent = 'Record preview';
+    }
     state.selectedFile = null;
     state.fileKind = null;
     state.sourceImage = null;
@@ -2078,7 +2367,7 @@ function initWorkerThreadsControl() {
 }
 
 async function onPreviewClick() {
-    if (!state.selectedFile || state.processing) {
+    if ((!state.selectedFile && state.fileKind !== 'camera') || state.processing) {
         return;
     }
 
@@ -2120,7 +2409,7 @@ function onPauseClick() {
 }
 
 async function onRenderClick() {
-    if (!state.selectedFile || state.processing) {
+    if ((!state.selectedFile && state.fileKind !== 'camera') || state.processing) {
         return;
     }
 
@@ -2130,7 +2419,7 @@ async function onRenderClick() {
         updateUnloadProtection();
         resetProgress();
 
-        if (state.fileKind === 'image') {
+        if (state.fileKind === 'image' || state.fileKind === 'camera') {
             await renderImageExport();
             return;
         }
@@ -2182,9 +2471,18 @@ elements.fileInput.addEventListener('change', async (event) => {
 
 elements.previewBtn.addEventListener('click', onPreviewClick);
 elements.renderBtn.addEventListener('click', onRenderClick);
+if (elements.recordBtn) {
+    elements.recordBtn.addEventListener('click', togglePreviewRecording);
+}
+if (elements.captureLayout) {
+    elements.captureLayout.addEventListener('change', paintLiveCapture);
+}
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
+if (elements.cameraBtn) {
+    elements.cameraBtn.addEventListener('click', () => void startCamera());
+}
 
 elements.videoSeeker.addEventListener('input', () => {
     const val = Number(elements.videoSeeker.value);

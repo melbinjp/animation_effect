@@ -19,17 +19,22 @@ All vendor assets (FFmpeg WASM, OpenCV) are either bundled locally or loaded fro
 
 | Preset | Best for |
 |---|---|
-| **Manga Contrast** | Bold, high-contrast — great for portraits and animals |
+| **Ultimate Studio** (default) | Soft XDoG ink with light Canny structure — studio line art of faces, figures, and objects |
+| **Studio Ink** | Warm paper, charcoal, fine line |
+| **Manga Contrast** | Bold print blacks on white paper |
 | **Neon Pop** | Dark background with glowing cyan lines — vivid social-media look |
 | **Vivid Toon** | Clean white bg with bold indigo lines — cartoon / comic feel |
 | **Warm Sketch** | Cream background, rich brown lines — pencil-sketch warmth |
-| **Studio Ink** | Neutral warm paper look |
 | **Blueprint Draft** | Technical blue-tone style |
+| **Classic Canny** | Original Linearty OpenCV Canny look |
+
+Presets are studio-tuned for print-like ink. Face-mesh and pose/hand skeleton overlays are **not** drawn — camera and photo output is real edges only. Use **Classic Canny** if you want the previous binary-edge look.
 
 ## What it does
 
 - Processes images entirely client-side and exports PNG files.
 - Processes videos client-side with OpenCV (edge detection) and FFmpeg WASM (MP4 encoding).
+- Records the live preview (camera or clip) as WebM/MP4: ink only, a split wipe, or live + ink side by side.
 - Keeps all media on the user's device — nothing is uploaded anywhere.
 - Video export engine loads automatically in the background when a video is selected.
 
