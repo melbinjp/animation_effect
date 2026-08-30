@@ -40,7 +40,11 @@ const elements = {
     liveVideo: document.getElementById('liveVideo'),
     recordBtn: document.getElementById('recordBtn'),
     recCanvas: document.getElementById('recCanvas'),
-    captureLayout: document.getElementById('captureLayout')
+    captureLayout: document.getElementById('captureLayout'),
+    previewStage: document.getElementById('previewStage'),
+    splitRow: document.getElementById('splitRow'),
+    splitReveal: document.getElementById('splitReveal'),
+    workspaceStatus: document.getElementById('workspaceStatus')
 };
 
 const STYLE_PRESETS = {
@@ -203,6 +207,7 @@ const state = {
     recorder: null,
     recChunks: [],
     recTrack: null,
+    view: 'result',
     activeJobId: '',
     beforeUnloadAttached: false,
     mediaWidth: null,
@@ -661,6 +666,25 @@ function clearRenderedOutput() {
 
 function updateFileMeta(message) {
     elements.fileMeta.textContent = message;
+    if (elements.workspaceStatus) elements.workspaceStatus.textContent = message;
+}
+
+function setView(view) {
+    state.view = view;
+    if (elements.previewStage) {
+        elements.previewStage.dataset.view = view;
+    }
+    document.querySelectorAll('.view-tab').forEach((btn) => {
+        const on = btn.dataset.view === view;
+        btn.classList.toggle('is-active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    if (elements.splitRow) elements.splitRow.hidden = view !== 'split';
+}
+
+function applySplit(value) {
+    const v = Math.max(0, Math.min(100, Number(value) || 52));
+    if (elements.previewStage) elements.previewStage.style.setProperty('--split', `${v}%`);
 }
 
 function setAdvisory(message, tone = 'info') {
@@ -1021,11 +1045,26 @@ function getFFmpegClass() {
     return namespace?.FFmpeg || namespace;
 }
 
+function ensureFfmpegScript() {
+    if (getFFmpegClass()) return Promise.resolve();
+    if (window.__ffmpegScriptPromise) return window.__ffmpegScriptPromise;
+    window.__ffmpegScriptPromise = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'vendor/ffmpeg.js';
+        s.async = true;
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('Could not load video export engine.'));
+        document.head.appendChild(s);
+    });
+    return window.__ffmpegScriptPromise;
+}
+
 async function loadFFmpeg() {
     if (state.ffmpegReady) {
         return state.ffmpeg;
     }
 
+    await ensureFfmpegScript();
     const FFmpegClass = getFFmpegClass();
     if (typeof FFmpegClass !== 'function') {
         throw new Error('FFmpeg runtime was not found in vendor/ffmpeg.js.');
@@ -1381,6 +1420,7 @@ async function renderImageExport() {
 // The WASM binary is cached by the browser after the first load, so subsequent
 // calls are fast (compile from cache, ~100–300 ms) rather than a full download.
 async function createFreshFFmpeg() {
+    await ensureFfmpegScript();
     const FFmpegClass = getFFmpegClass();
     if (typeof FFmpegClass !== 'function') {
         throw new Error('FFmpeg runtime was not found in vendor/ffmpeg.js.');
@@ -2476,6 +2516,15 @@ if (elements.recordBtn) {
 }
 if (elements.captureLayout) {
     elements.captureLayout.addEventListener('change', paintLiveCapture);
+}
+document.querySelectorAll('.view-tab').forEach((btn) => {
+    btn.addEventListener('click', () => setView(btn.dataset.view));
+});
+if (elements.splitReveal) {
+    elements.splitReveal.addEventListener('input', () => applySplit(elements.splitReveal.value));
+}
+if (window.innerWidth < 640 && elements.scale && Number(elements.scale.value) > 0.75) {
+    elements.scale.value = '0.75';
 }
 elements.cancelBtn.addEventListener('click', requestCancel);
 elements.pauseBtn.addEventListener('click', onPauseClick);
