@@ -1,5 +1,10 @@
 const elements = {
     fileInput: document.getElementById('fileInput'),
+    resumeBanner: document.getElementById('resumeBanner'),
+    resumeBannerText: document.getElementById('resumeBannerText'),
+    resumeBannerResumeBtn: document.getElementById('resumeBannerResumeBtn'),
+    resumeBannerDiscardBtn: document.getElementById('resumeBannerDiscardBtn'),
+    resumeFileInput: document.getElementById('resumeFileInput'),
     cancelBtn: document.getElementById('cancelBtn'),
     pauseBtn: document.getElementById('pauseBtn'),
     advisoryCard: document.getElementById('advisoryCard'),
@@ -21,6 +26,9 @@ const elements = {
     downloadCard: document.getElementById('downloadCard'),
     audioDownloadLink: document.getElementById('audioDownload'),
     audioDownloadCard: document.getElementById('audioDownloadCard'),
+    partialDownloadLink: document.getElementById('partialDownload'),
+    partialDownloadCard: document.getElementById('partialDownloadCard'),
+    partialDownloadHint: document.getElementById('partialDownloadHint'),
     sourceCanvas: document.getElementById('sourceCanvas'),
     outputCanvas: document.getElementById('canvasOutput'),
     outputCard: document.querySelector('.emphasis-card'),
@@ -259,6 +267,7 @@ const state = {
     outputUrl: '',
     videoPreviewUrl: '',
     audioUrl: '',
+    partialUrl: '',
     processing: false,
     cancelRequested: false,
     pauseRequested: false,
@@ -743,12 +752,16 @@ function clearRenderedOutput() {
     revokeUrl('outputUrl');
     revokeUrl('videoPreviewUrl');
     revokeUrl('audioUrl');
+    revokeUrl('partialUrl');
     elements.downloadCard.hidden = true;
     elements.downloadLink.removeAttribute('href');
     elements.downloadLink.removeAttribute('download');
     elements.audioDownloadCard.hidden = true;
     elements.audioDownloadLink.removeAttribute('href');
     elements.audioDownloadLink.removeAttribute('download');
+    elements.partialDownloadCard.hidden = true;
+    elements.partialDownloadLink.removeAttribute('href');
+    elements.partialDownloadLink.removeAttribute('download');
     elements.videoResult.hidden = true;
     elements.outputVideo.removeAttribute('src');
     elements.outputVideo.load();
@@ -1782,6 +1795,14 @@ function computeEncodeChunkSize(width, height) {
 // exactly the bits the content requires — near-binary line-art compresses to
 // far less than the source, so the output is always smaller in practice.
 // A hard bitrate ceiling would only hurt quality without saving space.
+// A chunk encode failure is usually a transient WASM/FFmpeg hiccup, not a
+// real problem with the frame data — the frame PNGs are only deleted below
+// after a *successful* exec, so a retry has exactly the same input a fresh
+// attempt would. MAX_CHUNK_ENCODE_ATTEMPTS = 3 means up to 2 retries before
+// the failure is allowed to propagate and (via the caller) abort the job.
+const MAX_CHUNK_ENCODE_ATTEMPTS = 3;
+const CHUNK_RETRY_BACKOFF_MS = 300;
+
 async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, threadsPerSeg) {
     const chunkDir = `seg${segIdx}/c${chunkIdx}`;
     const outPath  = `${chunkDir}/out.mp4`;
@@ -1805,21 +1826,33 @@ async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, thre
         '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
         outPath,
     ];
-    const segLog  = [];
-    const segLogH = ({ message }) => segLog.push(message);
-    segFfmpeg.on('log', segLogH);
-    let exitCode;
-    try {
-        exitCode = await segFfmpeg.exec(segArgs);
-    } finally {
-        segFfmpeg.off('log', segLogH);
-    }
-    if (exitCode !== 0) {
-        throw new Error(
-            `Chunk ${segIdx}:${chunkIdx} encode failed (exit ${exitCode}).\n` +
-            segLog.slice(-20).join('\n')
-        );
-    }
+
+    // retryWithBackoff comes from render-math.js (loaded before this file —
+    // see index.html), kept dependency-free there so the retry-then-throw
+    // behavior is unit-testable against a fake exec, without real FFmpeg.
+    await retryWithBackoff(async (attempt) => {
+        const segLog  = [];
+        const segLogH = ({ message }) => segLog.push(message);
+        segFfmpeg.on('log', segLogH);
+        let exitCode;
+        try {
+            exitCode = await segFfmpeg.exec(segArgs);
+        } finally {
+            segFfmpeg.off('log', segLogH);
+        }
+        if (exitCode !== 0) {
+            if (attempt < MAX_CHUNK_ENCODE_ATTEMPTS) {
+                console.warn(
+                    `Chunk ${segIdx}:${chunkIdx} encode failed (exit ${exitCode}), ` +
+                    `retrying (attempt ${attempt + 1}/${MAX_CHUNK_ENCODE_ATTEMPTS})...`
+                );
+            }
+            throw new Error(
+                `Chunk ${segIdx}:${chunkIdx} encode failed (exit ${exitCode}).\n` +
+                segLog.slice(-20).join('\n')
+            );
+        }
+    }, MAX_CHUNK_ENCODE_ATTEMPTS, CHUNK_RETRY_BACKOFF_MS);
 
     const mp4Data = await segFfmpeg.readFile(outPath);
 
@@ -1835,12 +1868,215 @@ async function encodeOneChunk(segFfmpeg, segIdx, chunkIdx, frameCount, fps, thre
     return mp4Data;
 }
 
-async function renderVideoExport() {
+function allSegmentIndices(segCount) {
+    return Array.from({ length: segCount }, (_, s) => s);
+}
+
+// Concatenates the given segments' chunk MP4s into one final video (muxing
+// the original audio when available), writing the result to outPath in the
+// main ffmpeg instance and returning its bytes. Shared by the normal success
+// path (all segments) and attemptPartialSalvage below (a prefix of them) —
+// the only difference between the two is which segment indices are passed.
+async function assembleSegmentsToVideo(ffmpeg, segInstances, chunkMp4Maps, segmentIndices, { jobId, inputPath, sourceWritten, outPath }) {
+    // Per-segment: concat that segment's chunk MP4s (stream-copy) within its
+    // own instance, so large MP4 data never moves between instances.
+    const segMp4Bufs = await Promise.all(segmentIndices.map(async (s) => {
+        const segFfmpeg = segInstances[s];
+        const chunkKeys = Object.keys(chunkMp4Maps[s])
+            .map(Number)
+            .sort((a, b) => a - b);
+
+        if (chunkKeys.length === 0) {
+            throw new Error(`Segment ${s} has no encoded chunks.`);
+        }
+        if (chunkKeys.length === 1) {
+            // Single chunk — no concat needed, already a valid MP4.
+            return chunkMp4Maps[s][chunkKeys[0]];
+        }
+
+        // Write each chunk MP4 to the segment instance's WASM FS, concat via
+        // stream copy, read the result, then delete temporaries.
+        for (const c of chunkKeys) {
+            await segFfmpeg.writeFile(`seg${s}/chunk${c}.mp4`, chunkMp4Maps[s][c]);
+            chunkMp4Maps[s][c] = null; // GC: written to WASM FS
+        }
+        const concatLines = chunkKeys
+            .map(c => `file 'chunk${c}.mp4'`)
+            .join('\n');
+        await segFfmpeg.writeFile(
+            `seg${s}/concat_chunks.txt`,
+            new TextEncoder().encode(concatLines)
+        );
+        const concatLog  = [];
+        const concatLogH = ({ message }) => concatLog.push(message);
+        segFfmpeg.on('log', concatLogH);
+        let concatCode;
+        try {
+            concatCode = await segFfmpeg.exec([
+                '-y', '-f', 'concat', '-safe', '0',
+                '-i', `seg${s}/concat_chunks.txt`,
+                '-c', 'copy',
+                `seg${s}/out.mp4`,
+            ]);
+        } finally {
+            segFfmpeg.off('log', concatLogH);
+        }
+        if (concatCode !== 0) {
+            throw new Error(
+                `Segment ${s} chunk concat failed (exit ${concatCode}).\n` +
+                concatLog.slice(-20).join('\n')
+            );
+        }
+        const mp4 = await segFfmpeg.readFile(`seg${s}/out.mp4`);
+        // Delete chunk MP4s and the concat result immediately.
+        await Promise.all(chunkKeys.map(c =>
+            safeDeleteFile(segFfmpeg, `seg${s}/chunk${c}.mp4`)
+        ));
+        await safeDeleteFile(segFfmpeg, `seg${s}/concat_chunks.txt`);
+        await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
+        return mp4;
+    }));
+
+    // Write segment MP4s to the main instance for the final concat/mux.
+    for (let i = 0; i < segmentIndices.length; i++) {
+        await ffmpeg.writeFile(`${jobId}/seg${segmentIndices[i]}.mp4`, segMp4Bufs[i]);
+        segMp4Bufs[i] = null; // GC: safely written to main FS
+    }
+
+    let finalArgs;
+    if (segmentIndices.length === 1) {
+        const only = segmentIndices[0];
+        if (sourceWritten) {
+            // Single segment + audio: mux audio onto the encoded video.
+            // -c:v copy avoids a re-encode. -c:a aac -q:a 1: VBR AAC quality
+            // level 1 (highest), fully transparent with no bitrate ceiling.
+            finalArgs = [
+                '-y',
+                '-i', `${jobId}/seg${only}.mp4`,
+                '-i', inputPath,
+                '-map', '0:v:0',
+                '-map', '1:a?',
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-q:a', '1',
+                '-shortest',
+                '-movflags', '+faststart',
+                outPath,
+            ];
+        } else {
+            finalArgs = [
+                '-y',
+                '-i', `${jobId}/seg${only}.mp4`,
+                '-c', 'copy',
+                '-movflags', '+faststart',
+                outPath,
+            ];
+        }
+    } else {
+        // Multiple segments: write a concat list, then stream-copy. Uses the
+        // original segment indices (not renumbered), so a salvage call with a
+        // non-contiguous-from-zero... — actually always a 0-based prefix here,
+        // but the concat list works with any subset regardless.
+        const concatContent = segmentIndices
+            .map(s => `file 'seg${s}.mp4'`)
+            .join('\n');
+        await ffmpeg.writeFile(
+            `${jobId}/concat.txt`,
+            new TextEncoder().encode(concatContent)
+        );
+        if (sourceWritten) {
+            finalArgs = [
+                '-y',
+                '-f', 'concat', '-safe', '0',
+                '-i', `${jobId}/concat.txt`,
+                '-i', inputPath,
+                '-map', '0:v:0',
+                '-map', '1:a?',
+                '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
+                '-c:a', 'aac', '-q:a', '1',
+                '-shortest',
+                '-movflags', '+faststart',
+                outPath,
+            ];
+        } else {
+            finalArgs = [
+                '-y',
+                '-f', 'concat', '-safe', '0',
+                '-i', `${jobId}/concat.txt`,
+                '-c', 'copy',
+                '-movflags', '+faststart',
+                outPath,
+            ];
+        }
+    }
+
+    const finalLog  = [];
+    const finalLogH = ({ message }) => finalLog.push(message);
+    ffmpeg.on('log', finalLogH);
+    let finalCode;
+    try {
+        finalCode = await ffmpeg.exec(finalArgs);
+    } finally {
+        ffmpeg.off('log', finalLogH);
+    }
+    if (finalCode !== 0) {
+        throw new Error(
+            `Final video assembly failed (exit ${finalCode}).\n` +
+            finalLog.slice(-30).join('\n')
+        );
+    }
+
+    const outputData = await ffmpeg.readFile(outPath);
+    if (!outputData || outputData.byteLength === 0) {
+        throw new Error(
+            'FFmpeg produced an empty output file. The video encoding may have failed.'
+        );
+    }
+    return outputData;
+}
+
+// On an unrecoverable chunk failure, salvage whatever prefix of segments did
+// complete rather than losing a multi-hour render to one bad chunk.
+// computeExpectedChunksForSegment / longestCompleteSegmentPrefix come from
+// render-math.js (loaded before this file — see index.html), kept dependency-
+// free there so they're unit-testable without a browser.
+async function attemptPartialSalvage(ffmpeg, segInstances, chunkMp4Maps, { segCount, totalFrames, framesPerSegment, chunkFrames, jobId, inputPath, sourceWritten, safeBaseName }) {
+    const expectedCounts = allSegmentIndices(segCount).map(s =>
+        computeExpectedChunksForSegment(s, segCount, totalFrames, framesPerSegment, chunkFrames)
+    );
+    const prefix = longestCompleteSegmentPrefix(chunkMp4Maps, expectedCounts);
+    if (prefix.length === 0) return; // segment 0 itself failed — nothing usable
+
+    const partialPath = `${jobId}/partial.mp4`;
+    const outputData = await assembleSegmentsToVideo(ffmpeg, segInstances, chunkMp4Maps, prefix, {
+        jobId, inputPath, sourceWritten, outPath: partialPath,
+    });
+    await safeDeleteFile(ffmpeg, partialPath);
+
+    const coveredFrames = prefix.length === segCount
+        ? totalFrames
+        : prefix.length * framesPerSegment;
+    const blob = new Blob([outputData], { type: 'video/mp4' });
+    revokeUrl('partialUrl');
+    state.partialUrl = URL.createObjectURL(blob);
+    elements.partialDownloadLink.href     = state.partialUrl;
+    elements.partialDownloadLink.download = `${safeBaseName}-lineart-partial.mp4`;
+    elements.partialDownloadHint.textContent =
+        `${prefix.length} of ${segCount} segments completed (${coveredFrames} of ${totalFrames} frames) before the export failed.`;
+    elements.partialDownloadCard.hidden = false;
+    console.log(
+        `Partial render available: ${prefix.length}/${segCount} segments.`, 'warn'
+    );
+}
+
+// resumeJob (Fix 3), when provided: { jobId, meta, chunkMp4Maps } loaded from
+// a prior interrupted attempt via render-checkpoint.js. Validated against
+// this run's freshly computed layout before any of it is trusted.
+async function renderVideoExport(resumeJob) {
     const ffmpeg = await loadFFmpeg();
     const settings = getSettings();
     let fps = settings.videoFps;
     const video = state.sourceVideo;
-    const jobId = `job-${Date.now()}`;
+    const jobId = resumeJob ? resumeJob.jobId : `job-${Date.now()}`;
     const extension = state.selectedFile.name.includes('.')
         ? state.selectedFile.name.slice(state.selectedFile.name.lastIndexOf('.'))
         : '.mp4';
@@ -1875,6 +2111,13 @@ async function renderVideoExport() {
     let cleanedChunks     = null;
     // All pending chunk-encode promises (awaited after the frame loop).
     const allEncodePs     = [];
+    // Best-effort IndexedDB checkpoint writes (Fix 3) — awaited before final
+    // assembly so a job marked complete never has a checkpoint write racing
+    // behind it, but never allowed to fail the render itself.
+    let checkpointPromises = [];
+    // Global frame indices to skip entirely because a resumed job already has
+    // their chunk durably persisted. Set once the resume is validated below.
+    let skipFrames = null;
 
     try {
         await ffmpeg.createDir(jobId);
@@ -1980,6 +2223,41 @@ async function renderVideoExport() {
         );
         ENCODE_CHUNK_FRAMES = computeEncodeChunkSize(estDims.width, estDims.height);
 
+        // ── Checkpoint (Fix 3): validate a resume against what this attempt
+        // actually computed, and persist fresh job metadata either way ────────
+        // A resume is only trusted if the stored layout matches exactly what
+        // this run just (re)computed from the same file/settings — any
+        // mismatch (changed settings, coincidentally same-named file) falls
+        // back to a normal, non-resumed render rather than risk assembling
+        // frames from an incompatible chunk layout.
+        let resumedChunks = null;
+        if (resumeJob && resumeJob.meta &&
+            resumeJob.meta.totalFrames === totalFrames &&
+            resumeJob.meta.segCount === segCount &&
+            resumeJob.meta.framesPerSegment === framesPerSegment &&
+            resumeJob.meta.chunkFrames === ENCODE_CHUNK_FRAMES) {
+            resumedChunks = resumeJob.chunkMp4Maps;
+            console.log('Resuming render from checkpoint — skipping already-completed chunks.', 'info');
+        } else if (resumeJob) {
+            console.warn(
+                'Stored checkpoint no longer matches this render (settings or source changed) — starting fresh.'
+            );
+        }
+        try {
+            await saveJobMeta(jobId, {
+                fileName: state.selectedFile.name,
+                fileSize: state.selectedFile.size,
+                fileLastModified: state.selectedFile.lastModified,
+                totalFrames, segCount, framesPerSegment,
+                chunkFrames: ENCODE_CHUNK_FRAMES, fps,
+            });
+        } catch (checkpointErr) {
+            console.warn(
+                'Could not save render checkpoint (resume will be unavailable for this job):',
+                checkpointErr.message
+            );
+        }
+
         // Thread budget: split cores evenly across segment encode workers so all
         // segments encode in parallel without excessive thread contention.
         threadsPerSeg = Math.max(
@@ -1987,10 +2265,23 @@ async function renderVideoExport() {
         );
 
         // Initialise per-segment state for the streaming encode pipeline.
+        // Segments/chunks already present in resumedChunks are seeded in as
+        // already-complete: cleanedChunks marks them done so encodeOneChunk is
+        // never re-invoked for them, and the frame loop below skips their frames.
         segEncodeChain   = segInstances.map(() => Promise.resolve());
-        chunkMp4Maps     = segInstances.map(() => ({}));
+        chunkMp4Maps     = segInstances.map((_, s) => ({ ...(resumedChunks && resumedChunks[s]) }));
         chunkFrameCounts = segInstances.map(() => ({}));
         cleanedChunks    = new Set();
+        if (resumedChunks) {
+            for (let s = 0; s < segCount; s++) {
+                for (const c of Object.keys(chunkMp4Maps[s]).map(Number)) {
+                    cleanedChunks.add(`${s}-${c}`);
+                }
+            }
+            skipFrames = framesToSkipForResume(
+                totalFrames, segCount, framesPerSegment, ENCODE_CHUNK_FRAMES, cleanedChunks
+            );
+        }
 
         // Pre-create all chunk sub-directories so frame writes never race with
         // directory creation.  The number of chunks is small (typically <100 per
@@ -2038,6 +2329,18 @@ async function renderVideoExport() {
 
             for (let fi = batchStart; fi < batchEnd; fi++) {
                 const capturedFi = fi;
+
+                if (skipFrames && skipFrames.has(capturedFi)) {
+                    // Already durably persisted from a prior attempt (Fix 3
+                    // resume) — no decode, no OpenCV, no WASM FS write needed.
+                    completedFrames++;
+                    setProgress(
+                        5 + (completedFrames / totalFrames) * 83,
+                        `Skipping already-completed frame ${completedFrames} of ${totalFrames}...`
+                    );
+                    continue;
+                }
+
                 // Cap at duration-1ms so the last seek never overshoots.
                 const frameTime  = Math.min(video.duration - 0.001, capturedFi / fps);
                 // Route each frame to the correct segment instance.
@@ -2172,6 +2475,17 @@ async function renderVideoExport() {
                                     // Mark as cleaned; key format: 'seg${s}-${c}'.
                                     // The finally block skips chunks in this set.
                                     cleanedChunks.add(`${segIdx}-${chunkIdx}`);
+                                    // Durable checkpoint (Fix 3) — best-effort;
+                                    // a failed save here only makes this one
+                                    // chunk unresumable, never fails the render.
+                                    checkpointPromises.push(
+                                        saveChunk(jobId, segIdx, chunkIdx, mp4).catch((err) => {
+                                            console.warn(
+                                                `Could not checkpoint chunk ${segIdx}:${chunkIdx}:`,
+                                                err.message
+                                            );
+                                        })
+                                    );
                                 })
                             );
                         allEncodePs.push(encP);
@@ -2207,180 +2521,41 @@ async function renderVideoExport() {
         if (allEncodePs.length > 0) {
             const encResults = await Promise.allSettled(allEncodePs);
             const encFailure = encResults.find(r => r.status === 'rejected');
-            if (encFailure) throw encFailure.reason;
+            if (encFailure) {
+                // Best-effort: a chunk exhausted its retries (Fix 1) and the job
+                // is going to fail, but whatever already completed is real, valid
+                // video sitting in memory — offer it rather than silently
+                // discarding it in the finally block below. Never let a problem
+                // *here* mask the original failure.
+                try {
+                    await attemptPartialSalvage(ffmpeg, segInstances, chunkMp4Maps, {
+                        segCount, totalFrames, framesPerSegment,
+                        chunkFrames: ENCODE_CHUNK_FRAMES, jobId, inputPath,
+                        sourceWritten, safeBaseName,
+                    });
+                } catch (salvageErr) {
+                    console.warn('Partial-render salvage failed:', salvageErr.message);
+                }
+                throw encFailure.reason;
+            }
         }
 
+        // Let any still-pending checkpoint writes land before final assembly —
+        // best-effort, already individually caught above, never blocks on error.
+        await Promise.allSettled(checkpointPromises);
+
         throwIfCancelled();
 
-        // ── Segment assembly: concat each segment's chunk MP4s ─────────────────
-        // Each segment has one or more chunk mini-MP4s stored in chunkMp4Maps.
-        // Concatenate them (stream-copy) within the owning segment instance so
-        // we never need to move large MP4 data between instances.
-        setProgress(92, 'Assembling video segments...');
+        setProgress(92, 'Assembling final video...');
         state.encodePhaseOffset = 92;
-        state.encodePhaseScale  = 0.04;
-
-        const segMp4Bufs = await Promise.all(segInstances.map(async (segFfmpeg, s) => {
-            const chunkKeys = Object.keys(chunkMp4Maps[s])
-                .map(Number)
-                .sort((a, b) => a - b);
-
-            if (chunkKeys.length === 0) {
-                throw new Error(`Segment ${s} has no encoded chunks.`);
-            }
-            if (chunkKeys.length === 1) {
-                // Single chunk — no concat needed, already a valid MP4.
-                return chunkMp4Maps[s][chunkKeys[0]];
-            }
-
-            // Write each chunk MP4 to the segment instance's WASM FS, concat via
-            // stream copy, read the result, then delete temporaries.
-            for (const c of chunkKeys) {
-                await segFfmpeg.writeFile(`seg${s}/chunk${c}.mp4`, chunkMp4Maps[s][c]);
-                chunkMp4Maps[s][c] = null; // GC: written to WASM FS
-            }
-            const concatLines = chunkKeys
-                .map(c => `file 'chunk${c}.mp4'`)
-                .join('\n');
-            await segFfmpeg.writeFile(
-                `seg${s}/concat_chunks.txt`,
-                new TextEncoder().encode(concatLines)
-            );
-            const concatLog  = [];
-            const concatLogH = ({ message }) => concatLog.push(message);
-            segFfmpeg.on('log', concatLogH);
-            let concatCode;
-            try {
-                concatCode = await segFfmpeg.exec([
-                    '-y', '-f', 'concat', '-safe', '0',
-                    '-i', `seg${s}/concat_chunks.txt`,
-                    '-c', 'copy',
-                    `seg${s}/out.mp4`,
-                ]);
-            } finally {
-                segFfmpeg.off('log', concatLogH);
-            }
-            if (concatCode !== 0) {
-                throw new Error(
-                    `Segment ${s} chunk concat failed (exit ${concatCode}).\n` +
-                    concatLog.slice(-20).join('\n')
-                );
-            }
-            const mp4 = await segFfmpeg.readFile(`seg${s}/out.mp4`);
-            // Delete chunk MP4s and the concat result immediately.
-            await Promise.all(chunkKeys.map(c =>
-                safeDeleteFile(segFfmpeg, `seg${s}/chunk${c}.mp4`)
-            ));
-            await safeDeleteFile(segFfmpeg, `seg${s}/concat_chunks.txt`);
-            await safeDeleteFile(segFfmpeg, `seg${s}/out.mp4`);
-            return mp4;
-        }));
-
-        throwIfCancelled();
-
-        // ── Final assembly: merge all segments + mux original audio ───────────
-        const assemblyLabel = sourceWritten ? 'Assembling final video with audio...' : 'Assembling final video (video-only)...';
-        setProgress(96, assemblyLabel);
+        state.encodePhaseScale  = 0.08;
         console.log('Assembling final video...', 'info');
 
-        // Map progress events to the 96–100 % band during the final mux.
-        state.encodePhaseOffset = 96;
-        state.encodePhaseScale  = 0.04;
-
-        // Write segment MP4s to the main instance for concat.
-        for (let s = 0; s < segCount; s++) {
-            await ffmpeg.writeFile(`${jobId}/seg${s}.mp4`, segMp4Bufs[s]);
-            segMp4Bufs[s] = null; // GC: safely written to main FS
-        }
-
-        let finalArgs;
-        if (segCount === 1) {
-            if (sourceWritten) {
-                // Single segment + audio: mux audio onto the encoded video.
-                // -c:v copy avoids a re-encode.
-                // -c:a aac -q:a 1: VBR AAC quality level 1 (highest), ensuring
-                // the audio track is fully transparent with no bitrate ceiling
-                // that could degrade quality vs. the source.
-                finalArgs = [
-                    '-y',
-                    '-i', `${jobId}/seg0.mp4`,
-                    '-i', inputPath,
-                    '-map', '0:v:0',
-                    '-map', '1:a?',
-                    '-c:v', 'copy',
-                    '-c:a', 'aac', '-q:a', '1',
-                    '-shortest',
-                    '-movflags', '+faststart',
-                    outputPath,
-                ];
-            } else {
-                // Source not written — no audio track available.
-                finalArgs = [
-                    '-y',
-                    '-i', `${jobId}/seg0.mp4`,
-                    '-c', 'copy',
-                    '-movflags', '+faststart',
-                    outputPath,
-                ];
-            }
-        } else {
-            // Multiple segments: write a concat list, then stream-copy.
-            const concatContent = Array.from(
-                { length: segCount }, (_, s) => `file 'seg${s}.mp4'`
-            ).join('\n');
-            await ffmpeg.writeFile(
-                `${jobId}/concat.txt`,
-                new TextEncoder().encode(concatContent)
-            );
-            if (sourceWritten) {
-                finalArgs = [
-                    '-y',
-                    '-f', 'concat', '-safe', '0',
-                    '-i', `${jobId}/concat.txt`,
-                    '-i', inputPath,
-                    '-map', '0:v:0',
-                    '-map', '1:a?',
-                    '-c:v', 'copy',   // all segments share codec/params — stream-copy is safe
-                    '-c:a', 'aac', '-q:a', '1',
-                    '-shortest',
-                    '-movflags', '+faststart',
-                    outputPath,
-                ];
-            } else {
-                finalArgs = [
-                    '-y',
-                    '-f', 'concat', '-safe', '0',
-                    '-i', `${jobId}/concat.txt`,
-                    '-c', 'copy',
-                    '-movflags', '+faststart',
-                    outputPath,
-                ];
-            }
-        }
-
-        const finalLog  = [];
-        const finalLogH = ({ message }) => finalLog.push(message);
-        ffmpeg.on('log', finalLogH);
-        let finalCode;
-        try {
-            finalCode = await ffmpeg.exec(finalArgs);
-        } finally {
-            ffmpeg.off('log', finalLogH);
-        }
-        if (finalCode !== 0) {
-            throw new Error(
-                `Final video assembly failed (exit ${finalCode}).\n` +
-                finalLog.slice(-30).join('\n')
-            );
-        }
+        const outputData = await assembleSegmentsToVideo(ffmpeg, segInstances, chunkMp4Maps, allSegmentIndices(segCount), {
+            jobId, inputPath, sourceWritten, outPath: outputPath,
+        });
 
         throwIfCancelled();
-        const outputData = await ffmpeg.readFile(outputPath);
-        if (!outputData || outputData.byteLength === 0) {
-            throw new Error(
-                'FFmpeg produced an empty output file. The video encoding may have failed.'
-            );
-        }
         const videoBlob = new Blob([outputData], { type: 'video/mp4' });
         setDownload(videoBlob, `${safeBaseName}-lineart.mp4`);
         // Separate blob URL for the video preview element so Chrome's range-request
@@ -2391,6 +2566,13 @@ async function renderVideoExport() {
         elements.videoResult.hidden = false;
         setProgress(100, 'MP4 export ready.');
         console.log('Video render complete. Download or review the MP4.', 'success');
+
+        // The job succeeded end to end — its checkpoint has no further use.
+        try {
+            await deleteJob(jobId);
+        } catch (checkpointErr) {
+            console.warn('Could not clear render checkpoint:', checkpointErr.message);
+        }
 
         // ── Audio-only extract — always offer when source is available ─────────
         // Extract the audio track separately so the user can re-mux manually
@@ -2835,6 +3017,109 @@ async function onRenderClick() {
     }
 }
 
+// ── Resume across a tab crash/reload (Fix 3) ─────────────────────────────────
+// checkForResumableJob() runs once on load; the banner it may show is the
+// only UI surface for this feature — resuming or discarding both go through
+// render-checkpoint.js, never touching IndexedDB directly from here.
+
+function formatJobAge(createdAt) {
+    const minutes = Math.max(0, Math.round((Date.now() - createdAt) / 60000));
+    if (minutes < 1) return 'moments ago';
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.round(minutes / 60);
+    return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+}
+
+async function checkForResumableJob() {
+    let jobs;
+    try {
+        jobs = await listIncompleteJobs();
+    } catch (err) {
+        // IndexedDB can be unavailable (private browsing in some browsers) —
+        // resume is a nice-to-have, never worth surfacing an error for.
+        console.warn('Could not check for a resumable render:', err.message);
+        return;
+    }
+    if (!jobs || jobs.length === 0) return;
+
+    // Most recent first; only ever offer one at a time to keep this simple.
+    jobs.sort((a, b) => b.createdAt - a.createdAt);
+    const job = jobs[0];
+
+    let chunkCount = 0;
+    try {
+        const chunks = await loadJobChunks(job.jobId);
+        chunkCount = Object.values(chunks).reduce((n, c) => n + Object.keys(c).length, 0);
+    } catch (_) { /* best-effort — banner still shows without a chunk count */ }
+
+    elements.resumeBannerText.textContent =
+        `Interrupted render found: ${job.fileName} (${chunkCount} chunks saved), ${formatJobAge(job.createdAt)}.`;
+    elements.resumeBanner.hidden = false;
+
+    elements.resumeBannerResumeBtn.onclick = () => {
+        elements.resumeFileInput.value = '';
+        elements.resumeFileInput.onchange = async () => {
+            const file = elements.resumeFileInput.files[0];
+            if (file) await resumeRenderFromFile(file, job);
+        };
+        elements.resumeFileInput.click();
+    };
+
+    elements.resumeBannerDiscardBtn.onclick = async () => {
+        try {
+            await deleteJob(job.jobId);
+        } catch (err) {
+            console.warn('Could not discard checkpoint:', err.message);
+        }
+        elements.resumeBanner.hidden = true;
+    };
+}
+
+async function resumeRenderFromFile(file, job) {
+    const matches = file.name === job.fileName &&
+        file.size === job.fileSize &&
+        file.lastModified === job.fileLastModified;
+    if (!matches) {
+        const proceed = confirm(
+            `"${file.name}" does not match the interrupted job ("${job.fileName}"). ` +
+            'Resuming with a different file may produce a corrupted result. Resume anyway?'
+        );
+        if (!proceed) return;
+    }
+
+    elements.resumeBanner.hidden = true;
+
+    await handleFileSelection(file);
+    if (state.fileKind !== 'video') {
+        setAdvisory('That file could not be loaded as video — resume cancelled.', 'error');
+        return;
+    }
+
+    let chunkMp4Maps;
+    try {
+        chunkMp4Maps = await loadJobChunks(job.jobId);
+    } catch (err) {
+        setAdvisory('Could not load the saved checkpoint — starting a fresh render instead.', 'warn');
+        chunkMp4Maps = {};
+    }
+
+    try {
+        setBusy(true);
+        state.cancelRequested = false;
+        updateUnloadProtection();
+        resetProgress();
+        setBusy(true, true);
+        await renderVideoExport({ jobId: job.jobId, meta: job, chunkMp4Maps });
+    } catch (error) {
+        console.error(error);
+        console.log(error.message || 'Rendering failed.', error.message === 'Render cancelled.' ? 'warn' : 'error');
+    } finally {
+        setBusy(false);
+        state.cancelRequested = false;
+        updateUnloadProtection();
+    }
+}
+
 function attachDropZone() {
     ['dragenter', 'dragover'].forEach((eventName) => {
         elements.dropZone.addEventListener(eventName, (event) => {
@@ -3178,3 +3463,4 @@ initWorkerThreadsControl();
 // repeated getImageData calls in renderToData do not trigger a browser warning.
 elements.sourceCanvas.getContext('2d', { willReadFrequently: true });
 resetWorkspace();
+void checkForResumableJob();

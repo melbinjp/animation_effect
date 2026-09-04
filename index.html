@@ -72,6 +72,15 @@
                     <p>Pick a file, tune the look, preview, then render the final result.</p>
                 </div>
 
+                <div class="resume-banner" id="resumeBanner" hidden>
+                    <p id="resumeBannerText"></p>
+                    <div class="resume-banner-actions">
+                        <button type="button" id="resumeBannerResumeBtn" class="secondary-button">Resume</button>
+                        <button type="button" id="resumeBannerDiscardBtn" class="secondary-button">Discard</button>
+                    </div>
+                    <input type="file" id="resumeFileInput" accept="image/*,video/*" hidden>
+                </div>
+
                 <div class="uploader" id="dropZone">
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
@@ -447,6 +456,12 @@
                     <p class="control-hint">Use this if you need to manually mux audio + video.</p>
                 </div>
 
+                <div class="download-card" id="partialDownloadCard" hidden>
+                    <p class="status-label">Partial export</p>
+                    <a id="partialDownload" class="download-link" href="#">Download partial result</a>
+                    <p class="control-hint" id="partialDownloadHint"></p>
+                </div>
+
                 <div class="info-card">
                     <p class="status-label">Current file</p>
                     <p id="fileMeta">No file selected.</p>
@@ -494,6 +509,8 @@
         </section>
     </main>
 
+    <script src="render-math.js"></script>
+    <script src="render-checkpoint.js"></script>
     <script src="script.js"></script>
 
     <footer role="contentinfo" class="wcua-footer">
