@@ -2599,13 +2599,22 @@ async function startScreenCapture() {
     }
     try {
         await stopCamera();
-        // No audio: the pipeline only ever inks video frames, and requesting
-        // system/tab audio here would just be one more permission prompt for
-        // a track this app never reads.
+        // The ink pipeline itself never reads audio, but "Record preview"
+        // mixes in whatever's on state.cameraStream — so leaving this false
+        // meant a screen/tab recording was always silent even though the
+        // recorder was ready to include audio the whole time. Chrome shows
+        // a "Share tab audio" checkbox for actual tab shares when this is
+        // true; window/full-screen audio capture support varies by OS.
         const stream = await navigator.mediaDevices.getDisplayMedia({
             video: { frameRate: { ideal: 30 } },
-            audio: false,
+            audio: true,
         });
+        // Screen content is mostly small text and UI detail, which the
+        // camera-tuned defaults (75% scale, 720px cap) turn to mush well
+        // before the ink filter even runs. Bump both for a screen source —
+        // still adjustable afterward, this just picks a sane starting point.
+        if (elements.scale) elements.scale.value = '1';
+        if (elements.qualityCap) elements.qualityCap.value = '1280';
         await runLiveSource(stream, {
             label: 'Screen share',
             fileName: 'screen.png',
