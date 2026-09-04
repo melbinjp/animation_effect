@@ -830,8 +830,6 @@ function fingerprintPixels(data, w, h) {
 async function inferCachedHuman(canvas, width, height, settings) {
     if (!settings.humanAware) return null;
     const mod = await loadHumanModule();
-    const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
-    if (!ok) return null;
 
     // Live camera/screen capture is continuous motion by definition. The
     // sparse pixel fingerprint below only samples ~96 points, which under
@@ -841,7 +839,18 @@ async function inferCachedHuman(canvas, width, height, settings) {
     // actual movement). The cache still earns its keep on a static image or
     // a paused/scrubbed video preview, where identical frames are the norm
     // — just not here, where they're the exception.
+    //
+    // The same signal decides MediaPipe's running mode: VIDEO mode assumes
+    // strictly sequential, strictly increasing-timestamp calls — true for
+    // this loop (one frame processed and awaited at a time), never true for
+    // batch export's concurrent decode pool. See human.js's engineCache.
     const isLiveSource = state.fileKind === 'camera';
+
+    const ok = await mod.ensureHuman({
+        landmarks: !!(settings.poseLines || settings.faceContours),
+        mode: isLiveSource ? 'VIDEO' : 'IMAGE',
+    });
+    if (!ok) return null;
 
     let fp = null;
     if (!isLiveSource) {
@@ -861,7 +870,7 @@ async function inferCachedHuman(canvas, width, height, settings) {
         }
     }
 
-    const maps = mod.inferHuman(canvas, width, height, settings);
+    const maps = mod.inferHuman(canvas, width, height, settings, isLiveSource);
     if (maps) {
         if (!isLiveSource) {
             state.humanCache = {
@@ -922,6 +931,13 @@ function applyHumanPresetSliders(presetKey) {
         classic: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
         ultimate: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
         studio: { skinSmooth: 0.78, hairBoost: 1.32, silhouetteBoost: 0.82, subjectIsolation: 0.38 },
+        // Pencil had no entry here at all — it silently inherited ultimate's
+        // values, tuned for a bolder line (xdogPhi 210 vs pencil's 70). A
+        // softer line makes ultimate's hair/silhouette boost overshoot more
+        // visibly, which is what the artifacts reported against pencil
+        // specifically were partly a symptom of. Scaled gentler throughout
+        // to match pencil's already-soft character.
+        pencil: { skinSmooth: 0.72, hairBoost: 1.2, silhouetteBoost: 0.6, subjectIsolation: 0.26 },
     };
     const vals = table[presetKey] || table.ultimate;
     const setSlider = (el, spanId, value) => {

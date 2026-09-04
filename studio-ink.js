@@ -46,6 +46,42 @@ function silhouetteMask(classMask, w, h) {
     return out;
 }
 
+// For each pixel, how locally uniform its classification is — 1.0 deep
+// inside a solid region of one class, tapering toward 0 right at a class
+// boundary (all 8 neighbors agree vs. none of them do). This is a proxy for
+// classification confidence built from the hard mask alone, not MediaPipe's
+// actual per-class confidence: that data never leaves human.js today, and
+// threading all 6 full-resolution float channels through the worker
+// postMessage boundary for this would cost far more than the improvement is
+// worth. Used below to stop committing fully to one class's treatment
+// exactly where the classification itself is least trustworthy — a
+// misclassified or boundary pixel gets a blended, partial treatment instead
+// of a hard jump from its neighbor's completely different one.
+function computeClassConfidence(classMask, w, h) {
+    const n = w * h;
+    const conf = new Float32Array(n);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            const i = y * w + x;
+            const cls = classMask[i];
+            let same = 0;
+            let total = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+                const yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                for (let dx = -1; dx <= 1; dx++) {
+                    const xx = x + dx;
+                    if (xx < 0 || xx >= w) continue;
+                    total++;
+                    if (classMask[yy * w + xx] === cls) same++;
+                }
+            }
+            conf[i] = total > 0 ? same / total : 1;
+        }
+    }
+    return conf;
+}
+
 function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
     if (!classMask || !settings.humanAware) return;
     const n = width * height;
@@ -55,20 +91,30 @@ function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
     const hair = settings.hairBoost == null ? 1.32 : settings.hairBoost;
     const silB = settings.silhouetteBoost == null ? 0.72 : settings.silhouetteBoost;
     const sil = silhouetteMask(classMask, width, height);
+    const conf = computeClassConfidence(classMask, width, height);
     const poseOn = !!settings.poseLines;
     const faceOn = !!settings.faceContours;
     for (let i = 0; i < n; i++) {
         const cls = classMask[i];
+        const original = ink[i];
+        let treated = original;
         if (cls === HUMAN_BG) {
-            ink[i] *= 1 - isolation;
+            treated = original * (1 - isolation);
         } else if (cls === HUMAN_FACE || cls === HUMAN_BODY) {
-            const keep = ink[i] > 0.58 ? 1 : 1 - skin;
-            ink[i] *= keep;
+            const keep = original > 0.58 ? 1 : 1 - skin;
+            treated = original * keep;
         } else if (cls === HUMAN_HAIR) {
-            ink[i] = ink[i] * hair > 1 ? 1 : ink[i] * hair;
+            treated = original * hair > 1 ? 1 : original * hair;
         } else if (cls === HUMAN_CLOTHES || cls === HUMAN_OTHER) {
-            ink[i] = ink[i] * 1.06 > 1 ? 1 : ink[i] * 1.06;
+            treated = original * 1.06 > 1 ? 1 : original * 1.06;
         }
+        // Blend toward the untreated value exactly where this pixel's
+        // classification disagrees with its neighbors — a segmentation
+        // boundary or an isolated misclassified pixel — instead of applying
+        // the full treatment right up to a hard edge.
+        const c = conf[i];
+        ink[i] = original * (1 - c) + treated * c;
+
         const s = sil[i] * silB;
         if (s > ink[i]) ink[i] = s;
         if ((poseOn || faceOn) && extraLines && extraLines[i] > 80) {
