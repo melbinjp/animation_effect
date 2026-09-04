@@ -32,8 +32,10 @@
 // 14. Optional line-weight dilation
 // 15. Colourize: edge mask → ink/background RGBA
 //
-// Note: CLAHE (darkBoost) is not implemented on the GPU path; that step is
-// silently skipped.  All other settings are fully respected.
+// Note: this comment previously said CLAHE (darkBoost) was skipped on the
+// GPU path. That's stale — whiteBalance, the 3-stage auto-normalize
+// (gamma lift / histogram stretch / adaptive CLAHE), and manual darkBoost
+// are all implemented here too, matching worker.js. Full parity.
 // ─────────────────────────────────────────────────────────────────────────────
 
 let useGpu = false;
@@ -809,9 +811,34 @@ class CpuProcessor {
         this.smoothed = null;
         this.gray     = null;
         this.edges    = null;
+        // See WorkerProcessor._kernelCache in worker.js — same fix, kept in
+        // sync per this class's own header comment.
+        this._kernelCache = new Map();
+    }
+
+    _getRectKernel(size) {
+        const key = `rect${size}`;
+        let k = this._kernelCache.get(key);
+        if (!k) {
+            k = cv.Mat.ones(size, size, cv.CV_8U);
+            this._kernelCache.set(key, k);
+        }
+        return k;
+    }
+
+    _getEllipseKernel(size) {
+        const key = `ellipse${size}`;
+        let k = this._kernelCache.get(key);
+        if (!k) {
+            k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(size, size));
+            this._kernelCache.set(key, k);
+        }
+        return k;
     }
 
     reset() {
+        this._kernelCache.forEach((k) => k.delete());
+        this._kernelCache.clear();
         [this.src, this.rgb, this.smoothed, this.gray, this.edges].forEach((mat) => {
             if (mat) mat.delete();
         });
@@ -926,9 +953,7 @@ class CpuProcessor {
 
         cv.Canny(this.gray, this.edges, lowThreshold, highThreshold, 3, true);
 
-        const closeKernel = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
-        closeKernel.delete();
+        cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, this._getRectKernel(3));
 
         if (settings.cleanSpeckles) {
             const speckleIntensity = Math.max(1, Math.min(3, settings.cleanSpecklesIntensity || 1));
@@ -959,19 +984,12 @@ class CpuProcessor {
         if (settings.mergeDoubleEdge) {
             const intensity   = Math.max(1, Math.min(5, settings.mergeDoubleEdgeIntensity || 2));
             const mergeSize   = 3 + intensity * 2;
-            const mergeKernel = cv.Mat.ones(mergeSize, mergeSize, cv.CV_8U);
-            cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, mergeKernel);
-            mergeKernel.delete();
-            const thinKernel  = cv.Mat.ones(3, 3, cv.CV_8U);
-            cv.erode(this.edges, this.edges, thinKernel);
-            thinKernel.delete();
+            cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, this._getRectKernel(mergeSize));
+            cv.erode(this.edges, this.edges, this._getRectKernel(3));
         }
 
         if (settings.lineWeight > 1) {
-            const lwSize = new cv.Size(settings.lineWeight + 1, settings.lineWeight + 1);
-            const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
-            cv.dilate(this.edges, this.edges, lwKernel);
-            lwKernel.delete();
+            cv.dilate(this.edges, this.edges, this._getEllipseKernel(settings.lineWeight + 1));
         }
 
         if (settings.engine === 'ultimate') {

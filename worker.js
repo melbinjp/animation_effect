@@ -28,9 +28,38 @@ class WorkerProcessor {
         this.grayRaw = null;
         this.edges = null;
         this.colorEdges = null;
+        // Kernel shapes depend only on settings (fixed per render, or per a
+        // handful of slider values), never on frame content — allocating a
+        // fresh one every single frame and deleting it a few lines later was
+        // pure WASM-heap churn across a multi-thousand-frame render. Cached
+        // here, keyed by exactly what determines the shape, and freed in
+        // reset() alongside everything else.
+        this._kernelCache = new Map();
+    }
+
+    _getRectKernel(size) {
+        const key = `rect${size}`;
+        let k = this._kernelCache.get(key);
+        if (!k) {
+            k = cv.Mat.ones(size, size, cv.CV_8U);
+            this._kernelCache.set(key, k);
+        }
+        return k;
+    }
+
+    _getEllipseKernel(size) {
+        const key = `ellipse${size}`;
+        let k = this._kernelCache.get(key);
+        if (!k) {
+            k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(size, size));
+            this._kernelCache.set(key, k);
+        }
+        return k;
     }
 
     reset() {
+        this._kernelCache.forEach((k) => k.delete());
+        this._kernelCache.clear();
         [this.src, this.rgb, this.smoothed, this.gray, this.edges].forEach((mat) => {
             if (mat) {
                 mat.delete();
@@ -233,9 +262,7 @@ class WorkerProcessor {
 
         // Morphological closing bridges tiny gaps between nearby edge segments,
         // producing closed, cartoon-style contours around subjects.
-        const closeKernel = cv.Mat.ones(3, 3, cv.CV_8U);
-        cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, closeKernel);
-        closeKernel.delete();
+        cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, this._getRectKernel(3));
 
         // Optional: connected-component dot removal — removes isolated edge fragments
         // (single pixels, tiny specks from skin pores, fabric grain, etc.) without
@@ -300,20 +327,13 @@ class WorkerProcessor {
             const intensity = Math.max(1, Math.min(5, settings.mergeDoubleEdgeIntensity || DEFAULT_MERGE_INTENSITY));
             // Kernel grows: intensity 1 → 5×5, 2 → 7×7, 3 → 9×9, 4 → 11×11, 5 → 13×13
             const mergeSize = 3 + intensity * 2;
-            const mergeKernel = cv.Mat.ones(mergeSize, mergeSize, cv.CV_8U);
-            cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, mergeKernel);
-            mergeKernel.delete();
+            cv.morphologyEx(this.edges, this.edges, cv.MORPH_CLOSE, this._getRectKernel(mergeSize));
             // One erosion pass to thin the merged blobs back toward single-pixel edges.
-            const thinKernel = cv.Mat.ones(3, 3, cv.CV_8U);
-            cv.erode(this.edges, this.edges, thinKernel);
-            thinKernel.delete();
+            cv.erode(this.edges, this.edges, this._getRectKernel(3));
         }
 
         if (settings.lineWeight > 1) {
-            const lwSize = new cv.Size(settings.lineWeight + 1, settings.lineWeight + 1);
-            const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
-            cv.dilate(this.edges, this.edges, lwKernel);
-            lwKernel.delete();
+            cv.dilate(this.edges, this.edges, this._getEllipseKernel(settings.lineWeight + 1));
         }
 
         if (settings.engine === 'ultimate') {
@@ -335,10 +355,7 @@ class WorkerProcessor {
             colorSrc.delete();
 
             if (settings.colorLineWeight > 1) {
-                const lwSize = new cv.Size(settings.colorLineWeight + 1, settings.colorLineWeight + 1);
-                const lwKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, lwSize);
-                cv.dilate(this.colorEdges, this.colorEdges, lwKernel);
-                lwKernel.delete();
+                cv.dilate(this.colorEdges, this.colorEdges, this._getEllipseKernel(settings.colorLineWeight + 1));
             }
         }
 
@@ -354,7 +371,6 @@ class WorkerProcessor {
         const inkPx = ((255 << 24) | (ink[2] << 16) | (ink[1] << 8) | ink[0]) >>> 0;
         const mask = this.edges.data;
         const colorMask = settings.colorEdges ? this.colorEdges.data : null;
-        const rgbaData32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength / 4);
         const out = new Uint8ClampedArray(width * height * 4);
         const out32 = new Uint32Array(out.buffer);
 
