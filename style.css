@@ -306,6 +306,14 @@ video {
     cursor: not-allowed;
 }
 
+.live-source-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    justify-self: center;
+}
+
 .camera-button {
     justify-self: center;
     min-height: 44px;

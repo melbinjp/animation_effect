@@ -76,8 +76,11 @@
                     <label class="uploader-label" for="fileInput">Drop a photo or video clip here</label>
                     <p class="uploader-copy">animals · people · plants · any subject</p>
                     <input type="file" id="fileInput" accept="image/*,video/*">
-                    <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
-                    <p class="control-hint">Live camera uses body maps to hush background and quiet skin. Pose and face wireframes stay off unless you turn them on.</p>
+                    <div class="live-source-buttons">
+                        <button id="cameraBtn" type="button" class="secondary-button camera-button">Use camera</button>
+                        <button id="screenBtn" type="button" class="secondary-button camera-button">Use screen / tab</button>
+                    </div>
+                    <p class="control-hint">Camera uses body maps to hush background and quiet skin. Screen or tab share inks whatever you pick — pose and face wireframes stay off unless you turn them on.</p>
                 </div>
                 <div class="sample-grid" aria-label="Sample stills">
                     <button type="button" class="sample-card" data-sample="samples/portrait.jpg" data-label="Portrait">

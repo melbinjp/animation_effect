@@ -37,6 +37,7 @@ const elements = {
     videoSeeker: document.getElementById('videoSeeker'),
     videoSeekerTime: document.getElementById('videoSeekerTime'),
     cameraBtn: document.getElementById('cameraBtn'),
+    screenBtn: document.getElementById('screenBtn'),
     liveVideo: document.getElementById('liveVideo'),
     recordBtn: document.getElementById('recordBtn'),
     recCanvas: document.getElementById('recCanvas'),
@@ -693,6 +694,7 @@ function refreshActions() {
     }
     elements.fileInput.disabled = notReady;
     if (elements.cameraBtn) elements.cameraBtn.disabled = !state.cvReady;
+    if (elements.screenBtn) elements.screenBtn.disabled = !state.cvReady || !navigator.mediaDevices?.getDisplayMedia;
     // Worker controls stay enabled during processing so the user can adjust
     // concurrency dynamically mid-render without a full pool rebuild.
     elements.workerThreadsInput.disabled = !state.cvReady;
@@ -2515,6 +2517,48 @@ async function stopCamera() {
     }
 }
 
+// Shared by the webcam and the screen/tab source: once a MediaStream is live,
+// everything downstream (render, preview, record, export) only ever cares
+// that fileKind is 'camera' — a continuously-updating video element — not
+// where the frames actually came from.
+async function runLiveSource(stream, { label, fileName, successMessage }) {
+    state.cameraStream = stream;
+    const video = elements.liveVideo;
+    video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
+    await video.play();
+    state.fileKind = 'camera';
+    state.sourceVideo = video;
+    state.sourceImage = null;
+    state.selectedFile = { name: fileName };
+    state.mediaWidth = video.videoWidth;
+    state.mediaHeight = video.videoHeight;
+    elements.videoSeekerRow.hidden = true;
+    updateFileMeta(`${label} · ${video.videoWidth}×${video.videoHeight}`);
+    setAdvisory(successMessage, 'success');
+    state.cameraLoop = true;
+    state.cancelRequested = false;
+    setBusy(true);
+    refreshActions();
+
+    // Screen/tab shares (and some cameras) can end on their own — the
+    // browser's own "Stop sharing" control, a closed tab, an unplugged
+    // camera — without this the loop would spin forever redrawing the last
+    // frozen frame instead of noticing the source is gone.
+    const [videoTrack] = stream.getVideoTracks();
+    if (videoTrack) {
+        videoTrack.addEventListener('ended', () => { state.cameraLoop = false; });
+    }
+
+    while (state.cameraLoop && !state.cancelRequested) {
+        throwIfCancelled();
+        drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
+        await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+        paintLiveCapture();
+    }
+}
+
 async function startCamera() {
     if (!state.cvReady) {
         console.log('Processing engine still loading — please wait a moment and try again.', 'warn');
@@ -2526,36 +2570,55 @@ async function startCamera() {
             video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
             audio: false,
         });
-        state.cameraStream = stream;
-        const video = elements.liveVideo;
-        video.srcObject = stream;
-        video.muted = true;
-        video.playsInline = true;
-        await video.play();
-        state.fileKind = 'camera';
-        state.sourceVideo = video;
-        state.sourceImage = null;
-        state.selectedFile = { name: 'camera.png' };
-        state.mediaWidth = video.videoWidth;
-        state.mediaHeight = video.videoHeight;
-        elements.videoSeekerRow.hidden = true;
-        updateFileMeta(`Camera · ${video.videoWidth}×${video.videoHeight}`);
-        setAdvisory('Live camera — tracker overlays stay off so you only get real line art.', 'success');
-        state.cameraLoop = true;
-        state.cancelRequested = false;
-        setBusy(true);
-        refreshActions();
-        while (state.cameraLoop && !state.cancelRequested) {
-            throwIfCancelled();
-            drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
-            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
-            paintLiveCapture();
-        }
+        await runLiveSource(stream, {
+            label: 'Camera',
+            fileName: 'camera.png',
+            successMessage: 'Live camera — tracker overlays stay off so you only get real line art.',
+        });
     } catch (error) {
         console.error(error);
         const blocked = /NotAllowedError|Permission|denied/i.test(String(error.name || error.message || error));
         console.log(blocked ? 'Camera permission was blocked. Drop a file instead.' : (error.message || 'Camera failed.'), 'error');
         setAdvisory(blocked ? 'Camera blocked — drop a file instead.' : 'Camera failed.', 'error');
+        await stopCamera();
+    } finally {
+        setBusy(false);
+        updateUnloadProtection();
+        if (state.recording) void stopPreviewRecording();
+    }
+}
+
+async function startScreenCapture() {
+    if (!state.cvReady) {
+        console.log('Processing engine still loading — please wait a moment and try again.', 'warn');
+        return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+        setAdvisory('Screen/tab capture is not supported in this browser.', 'error');
+        return;
+    }
+    try {
+        await stopCamera();
+        // No audio: the pipeline only ever inks video frames, and requesting
+        // system/tab audio here would just be one more permission prompt for
+        // a track this app never reads.
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 30 } },
+            audio: false,
+        });
+        await runLiveSource(stream, {
+            label: 'Screen share',
+            fileName: 'screen.png',
+            successMessage: 'Live screen/tab — use the browser\'s own "Stop sharing" control to end it.',
+        });
+    } catch (error) {
+        console.error(error);
+        // getDisplayMedia rejects with NotAllowedError both when the user
+        // denies the OS-level prompt and when they just close the picker —
+        // "cancelled" reads truer than "blocked" for the common case.
+        const cancelled = /NotAllowedError|Permission|denied/i.test(String(error.name || error.message || error));
+        console.log(cancelled ? 'Screen/tab share was cancelled.' : (error.message || 'Screen capture failed.'), cancelled ? 'warn' : 'error');
+        setAdvisory(cancelled ? 'Screen share cancelled.' : 'Screen capture failed.', 'error');
         await stopCamera();
     } finally {
         setBusy(false);
@@ -2858,6 +2921,9 @@ elements.pauseBtn.addEventListener('click', onPauseClick);
 elements.resetBtn.addEventListener('click', resetWorkspace);
 if (elements.cameraBtn) {
     elements.cameraBtn.addEventListener('click', () => void startCamera());
+}
+if (elements.screenBtn) {
+    elements.screenBtn.addEventListener('click', () => void startScreenCapture());
 }
 
 elements.videoSeeker.addEventListener('input', () => {
