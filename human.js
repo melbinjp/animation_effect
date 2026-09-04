@@ -36,8 +36,19 @@ function quietLogs() {
     console.info = (...args) => { if (!skip(args)) origInfo(...args); };
 }
 
+// Pose/face landmark models are an extra download plus extra per-frame
+// inference on top of segmentation, for a purely optional overlay effect —
+// worth skipping on a genuinely low-power device. A viewport-width media
+// query was the previous proxy for that, but window width tracks browser
+// zoom/split-screen, not device capability: a narrow desktop window
+// incorrectly skipped landmarks, and a maximized tablet on weak hardware
+// incorrectly loaded them. navigator.hardwareConcurrency/deviceMemory are
+// the same real capability signals script.js already uses for worker sizing.
 function skipLandmarks() {
-    return typeof window !== 'undefined' && window.matchMedia('(max-width: 640px)').matches;
+    if (typeof navigator === 'undefined') return false;
+    const cores = navigator.hardwareConcurrency || 4;
+    const memoryGB = (typeof navigator.deviceMemory === 'number') ? navigator.deviceMemory : null;
+    return cores <= 2 || (memoryGB !== null && memoryGB <= 2);
 }
 
 const emptyDetect = { detect: () => ({ landmarks: [], faceLandmarks: [] }) };
@@ -50,8 +61,13 @@ async function createWithDelegate(delegate) {
         ImageSegmenter.createFromOptions(wasm, {
             baseOptions: { modelAssetPath: SEG_MODEL, ...common },
             runningMode: 'IMAGE',
-            outputCategoryMask: true,
-            outputConfidenceMasks: false,
+            // Confidence masks (one float32 mask per class), not the hard
+            // categoryMask: upsampling a per-class confidence value with
+            // bilinear interpolation is correct; interpolating between two
+            // label IDs (e.g. hair=1, face=3) is not — it produces a
+            // spurious third class at the boundary. See upsampleClassesBilinear.
+            outputCategoryMask: false,
+            outputConfidenceMasks: true,
         }),
         loadPose
             ? PoseLandmarker.createFromOptions(wasm, {
@@ -111,13 +127,47 @@ export async function ensureHuman(options = {}) {
     return !!(await loadPromise);
 }
 
-function upsampleNearest(src, sw, sh, dw, dh) {
+// Upsamples the model's 6 per-class confidence channels with bilinear
+// interpolation, then takes the highest-confidence class per output pixel.
+// This is the correct way to upsample a categorical segmentation mask: the
+// model only ever produces a 256x256 result, so every real output resolution
+// needs this. Bilinear-interpolating the *hard* class labels instead (the
+// previous approach) is mathematically meaningless at a boundary — averaging
+// hair=1 and face=3 does not produce a valid third class — and produces
+// visibly blocky, jagged mask edges once upsampled past a few hundred pixels.
+function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
+    const numClasses = channels.length;
     const out = new Uint8Array(dw * dh);
+    const scaleX = (sw - 1) / Math.max(dw - 1, 1);
+    const scaleY = (sh - 1) / Math.max(dh - 1, 1);
+
     for (let y = 0; y < dh; y++) {
-        const sy = Math.min(sh - 1, Math.round((y * (sh - 1)) / Math.max(dh - 1, 1)));
+        const sy = y * scaleY;
+        const y0 = Math.floor(sy);
+        const y1 = Math.min(sh - 1, y0 + 1);
+        const fy = sy - y0;
+        const rowY0 = y0 * sw;
+        const rowY1 = y1 * sw;
+
         for (let x = 0; x < dw; x++) {
-            const sx = Math.min(sw - 1, Math.round((x * (sw - 1)) / Math.max(dw - 1, 1)));
-            out[y * dw + x] = src[sy * sw + sx];
+            const sx = x * scaleX;
+            const x0 = Math.floor(sx);
+            const x1 = Math.min(sw - 1, x0 + 1);
+            const fx = sx - x0;
+
+            let bestClass = 0;
+            let bestVal = -Infinity;
+            for (let c = 0; c < numClasses; c++) {
+                const ch = channels[c];
+                const top = ch[rowY0 + x0] + (ch[rowY0 + x1] - ch[rowY0 + x0]) * fx;
+                const bot = ch[rowY1 + x0] + (ch[rowY1 + x1] - ch[rowY1 + x0]) * fx;
+                const val = top + (bot - top) * fy;
+                if (val > bestVal) {
+                    bestVal = val;
+                    bestClass = c;
+                }
+            }
+            out[y * dw + x] = bestClass;
         }
     }
     return out;
@@ -164,22 +214,21 @@ export function inferHuman(image, width, height, settings) {
     try {
         const { seg, pose, face } = engines;
         let classMask = new Uint8Array(width * height);
-        let mw = width;
-        let mh = height;
         let copied = false;
         seg.segment(image, (result) => {
-            const mask = result.categoryMask;
-            if (!mask) return;
-            const data = mask.getAsUint8Array();
-            mw = mask.width;
-            mh = mask.height;
-            classMask = new Uint8Array(data);
+            const masks = result.confidenceMasks;
+            if (!masks || masks.length === 0) return;
+            const mw = masks[0].width;
+            const mh = masks[0].height;
+            const channels = masks.map((m) => m.getAsFloat32Array());
+            // Bilinear on each class's own confidence, then argmax — correct
+            // regardless of whether mw/mh already match width/height, since
+            // the interpolation weight is exactly 0 wherever source and
+            // target pixels align. See upsampleClassesBilinear.
+            classMask = upsampleClassesBilinear(channels, mw, mh, width, height);
             copied = true;
         });
         if (!copied) return null;
-        if (mw !== width || mh !== height) {
-            classMask = upsampleNearest(classMask, mw, mh, width, height);
-        }
         let person = 0;
         for (let i = 0; i < classMask.length; i++) {
             if (classMask[i] !== HUMAN_BG) person++;

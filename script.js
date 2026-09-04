@@ -832,30 +832,47 @@ async function inferCachedHuman(canvas, width, height, settings) {
     const mod = await loadHumanModule();
     const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
     if (!ok) return null;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const data = ctx.getImageData(0, 0, width, height).data;
-    const fp = fingerprintPixels(data, width, height);
-    const cache = state.humanCache;
-    if (
-        cache &&
-        cache.fp === fp &&
-        cache.w === width &&
-        cache.h === height &&
-        cache.pose === !!settings.poseLines &&
-        cache.face === !!settings.faceContours
-    ) {
-        return cache.maps;
+
+    // Live camera/screen capture is continuous motion by definition. The
+    // sparse pixel fingerprint below only samples ~96 points, which under
+    // real motion can easily collide between two visually different frames
+    // — the cache then wrongly reuses a stale mask against new video, which
+    // is exactly what reads as ghosting (the silhouette lagging behind
+    // actual movement). The cache still earns its keep on a static image or
+    // a paused/scrubbed video preview, where identical frames are the norm
+    // — just not here, where they're the exception.
+    const isLiveSource = state.fileKind === 'camera';
+
+    let fp = null;
+    if (!isLiveSource) {
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const data = ctx.getImageData(0, 0, width, height).data;
+        fp = fingerprintPixels(data, width, height);
+        const cache = state.humanCache;
+        if (
+            cache &&
+            cache.fp === fp &&
+            cache.w === width &&
+            cache.h === height &&
+            cache.pose === !!settings.poseLines &&
+            cache.face === !!settings.faceContours
+        ) {
+            return cache.maps;
+        }
     }
+
     const maps = mod.inferHuman(canvas, width, height, settings);
     if (maps) {
-        state.humanCache = {
-            fp,
-            w: width,
-            h: height,
-            pose: !!settings.poseLines,
-            face: !!settings.faceContours,
-            maps,
-        };
+        if (!isLiveSource) {
+            state.humanCache = {
+                fp,
+                w: width,
+                h: height,
+                pose: !!settings.poseLines,
+                face: !!settings.faceContours,
+                maps,
+            };
+        }
         if (maps.hasPerson) {
             setHumanStatus(`Person ${Math.round(maps.personRatio * 100)}% — maps on.`);
         }
