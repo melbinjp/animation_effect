@@ -1,0 +1,14 @@
+{
+  "name": "linearty",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Turn videos and photos into line-art animation, entirely in the browser.",
+  "license": "MIT",
+  "author": "Melbin J Paulose",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5"
+  }
+}
