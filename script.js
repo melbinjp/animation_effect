@@ -613,12 +613,18 @@ class LineArtProcessor {
     // to any canvas.  Pixels are extracted from sourceCanvas synchronously
     // (before the first await), so the caller may safely overwrite sourceCanvas
     // on the very next iteration of an async loop.
-    async renderToData(sourceCanvas, settings) {
+    //
+    // opts.allowHumanCache defaults to false — safe by default. Only a caller
+    // that is genuinely re-rendering one static, unchanging frame (the seek-bar
+    // preview) should pass true; every frame-advancing loop (live capture,
+    // live playback, batch export) must pass false or omit it, or the cached
+    // mask goes stale against a moving subject. See inferCachedHuman.
+    async renderToData(sourceCanvas, settings, opts = {}) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
         const payload = { ...settings };
         try {
-            const human = await inferCachedHuman(sourceCanvas, width, height, settings);
+            const human = await inferCachedHuman(sourceCanvas, width, height, settings, !!opts.allowHumanCache);
             if (human) {
                 payload.classMask = human.classMask;
                 payload.extraLines = human.extraLines;
@@ -657,10 +663,10 @@ class LineArtProcessor {
     }
 
     // Convenience wrapper: render to a visible canvas (used for single-frame preview).
-    async render(sourceCanvas, destinationCanvas, settings) {
+    async render(sourceCanvas, destinationCanvas, settings, opts = {}) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
-        const rawData = await this.renderToData(sourceCanvas, settings);
+        const rawData = await this.renderToData(sourceCanvas, settings, opts);
         destinationCanvas.width = width;
         destinationCanvas.height = height;
         destinationCanvas.getContext('2d').putImageData(
@@ -827,24 +833,28 @@ function fingerprintPixels(data, w, h) {
     return hsh;
 }
 
-async function inferCachedHuman(canvas, width, height, settings) {
+// allowCache: the caller states explicitly whether this frame is a genuine
+// static snapshot (safe to reuse a cached mask if the pixels truly haven't
+// changed) or part of a sequence advancing through time. This used to be
+// inferred from state.fileKind === 'camera', which only ever covered live
+// camera/screen capture — it silently missed playLiveVideo and the batch
+// export frame loop, both real motion sequences with fileKind === 'video',
+// so their frames kept hitting the cache. The sparse ~96-sample pixel
+// fingerprint below can collide between two visually different frames under
+// motion, wrongly reusing a stale mask against new video — a stale mask's
+// silhouette/skin/hair sits where the subject *used to be*, which blended
+// against the current frame's real edges (where the subject *now is*) reads
+// as ghosting/blur on anything moving. Defaulting allowCache to false at
+// every call site means a future caller I haven't accounted for fails safe
+// (always fresh inference) instead of silently reintroducing this bug.
+async function inferCachedHuman(canvas, width, height, settings, allowCache = false) {
     if (!settings.humanAware) return null;
     const mod = await loadHumanModule();
     const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
     if (!ok) return null;
 
-    // Live camera/screen capture is continuous motion by definition. The
-    // sparse pixel fingerprint below only samples ~96 points, which under
-    // real motion can easily collide between two visually different frames
-    // — the cache then wrongly reuses a stale mask against new video, which
-    // is exactly what reads as ghosting (the silhouette lagging behind
-    // actual movement). The cache still earns its keep on a static image or
-    // a paused/scrubbed video preview, where identical frames are the norm
-    // — just not here, where they're the exception.
-    const isLiveSource = state.fileKind === 'camera';
-
     let fp = null;
-    if (!isLiveSource) {
+    if (allowCache) {
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const data = ctx.getImageData(0, 0, width, height).data;
         fp = fingerprintPixels(data, width, height);
@@ -863,7 +873,7 @@ async function inferCachedHuman(canvas, width, height, settings) {
 
     const maps = mod.inferHuman(canvas, width, height, settings);
     if (maps) {
-        if (!isLiveSource) {
+        if (allowCache) {
             state.humanCache = {
                 fp,
                 w: width,
@@ -949,7 +959,8 @@ async function playLiveVideo() {
         while (state.livePlay && !state.cancelRequested && !video.paused && !video.ended) {
             throwIfCancelled();
             drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
-            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+            // Sequential playback of a real motion sequence — never cache.
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false });
             paintLiveCapture();
             if (elements.videoSeeker) {
                 elements.videoSeeker.value = String(video.currentTime);
@@ -1565,7 +1576,10 @@ async function renderPreview() {
     throwIfCancelled();
     await drawCurrentSource();
     throwIfCancelled();
-    await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+    // The one caller where the same static frame genuinely can be re-rendered
+    // unchanged (a settings tweak, re-selecting the same scrub position) —
+    // caching here is correct, not the bug the other three callers had.
+    await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: true });
     paintLiveCapture();
     clearRenderedOutput();
     setResultGlow(true);
@@ -2429,7 +2443,11 @@ async function renderVideoExport(resumeJob) {
                         // Phase 2: OpenCV/GPU processing → PNG encode → write to
                         // the assigned segment/chunk directory.
                         throwIfCancelled();
-                        let rawData = await processor.renderToData(offCanvas, settings);
+                        // Every frame here is a genuinely different point in the
+                        // source video — never cache (this was the actual bug:
+                        // fileKind === 'video' let this hit the cache before,
+                        // reusing a stale human mask against a moving subject).
+                        let rawData = await processor.renderToData(offCanvas, settings, { allowHumanCache: false });
                         offCanvas = null; // release canvas backing store immediately
 
                         throwIfCancelled();
@@ -2762,7 +2780,8 @@ async function runLiveSource(stream, { label, fileName, successMessage }) {
     while (state.cameraLoop && !state.cancelRequested) {
         throwIfCancelled();
         drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
-        await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings());
+        // Live camera/screen capture — never cache (unchanged behavior, now stated explicitly).
+        await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false });
         paintLiveCapture();
     }
 }
