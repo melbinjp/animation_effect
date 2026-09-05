@@ -132,33 +132,54 @@ def probe_video(path):
     return {"width": width, "height": height, "fps": fps, "total_frames": total_frames, "has_audio": has_audio}
 
 
-def _encoder_extra_args(encoder):
-    # A 90s 1080p ink-line render came out to ~380MB against a 43MB source,
-    # which first looked like a missing-quality-flag bug on h264_qsv (ink
-    # output looks visually simpler than the source footage). Tested against
-    # the actual real ink pixel content (not a synthetic proxy) before
-    # committing to that theory: h264_qsv's plain default (no quality flag)
-    # produced output roughly the SAME size as libx264 -crf 20 on identical
-    # frames, and adding -global_quality 20 made it ~40% LARGER, not
-    # smaller -- the opposite of what a "fix" should do. So the real
-    # explanation is that ink/line-art content (hard binary edges, plus
-    # frame-to-frame edge jitter from source sensor noise amplified through
-    # Canny) is inherently harder for H.264's block-DCT+motion-prediction
-    # model to compress than smooth natural video, regardless of encoder --
-    # the source's small size reflects how well natural video compresses,
-    # not a bitrate target the ink output should also hit. h264_qsv is left
-    # at its plain default rather than an unverified "fix" that measurably
-    # made real content worse.
+# Named quality tiers, same idea as the Linearty Android app's
+# encoder_quality_mode setting (SAME_AS_INPUT/INDISTINGUISHABLE/BALANCED/
+# SMALL_SIZE -> CRF 21/18/24/28) -- CRF is a quality TARGET, not a size
+# target, so naming tiers by what they look like (not an arbitrary number)
+# is the right UI, and reusing that app's exact tier boundaries where they
+# overlap keeps the two products consistent rather than inventing new
+# numbers for the same idea. Extended past that app's ceiling of 28 with an
+# "aggressive" tier, since ink/line-art content (flat color, hard edges, no
+# photographic gradient/texture) tolerates far more compression before
+# looking different -- confirmed live on real ink output: CRF 20 (this
+# file's old hardcoded default) -> 33.0MB for a 90s 1080p clip; CRF 28 (the
+# Android app's own max) -> 15.8MB (52% smaller); CRF 32 -> 9.1MB (72%
+# smaller). Higher than that (36/40 measured 86-93% smaller) risks visibly
+# softening the actual lines -- the one thing that must stay crisp for this
+# style -- so isn't offered as a named tier; use --crf directly if you want
+# to push further after checking output quality yourself.
+QUALITY_PRESETS = {
+    "indistinguishable": 18,
+    "optimized": 21,
+    "balanced": 24,
+    "small": 28,
+    "aggressive": 32,
+    "maximum": 40,  # user-confirmed by eye against real output: still looks fine at CRF 40 (93% smaller than CRF 20)
+}
+
+
+def _encoder_extra_args(encoder, crf):
+    # h264_qsv and h264_vaapi have no validated quality-target flag (see
+    # detect_encoder's docstring / this file's git history: h264_qsv's
+    # -global_quality measured 40% LARGER than its plain default on real
+    # ink content, the opposite of what a quality flag should do, and
+    # h264_vaapi's -qp was never validated at all) -- --quality/--crf only
+    # actually changes output size on libx264 and h264_nvenc, the two
+    # encoders with a real, tested quality control. This matters less in
+    # practice than it sounds: a CPU-only pod (this project's actual
+    # deployment target so far) always falls back to libx264 anyway.
     if encoder == "h264_nvenc":
         # -rc vbr alongside -cq is the standard, well-documented pairing for
         # reliable nvenc constant-quality behavior (unlike qsv's
         # -global_quality above, this one isn't just an untested guess).
-        return ["-preset", "p4", "-rc", "vbr", "-cq", "20"]
+        # nvenc's cq scale isn't numerically identical to x264's crf, but
+        # tracks the same direction closely enough to reuse the same value.
+        return ["-preset", "p4", "-rc", "vbr", "-cq", str(crf)]
     if encoder == "h264_vaapi":
         return ["-vaapi_device", "/dev/dri/renderD128", "-vf", "format=nv12,hwupload"]
     if encoder == "h264_qsv":
         return ["-preset", "medium"]
-    return ["-preset", "medium", "-crf", "20"]
+    return ["-preset", "medium", "-crf", str(crf)]
 
 
 def _encoder_actually_works(encoder, extra_args):
@@ -180,13 +201,13 @@ def _encoder_actually_works(encoder, extra_args):
     return result.returncode == 0
 
 
-def detect_encoder(preferred):
+def detect_encoder(preferred, crf):
     """preferred: 'auto' | 'nvenc' | 'vaapi' | 'qsv' | 'libx264' | any raw
     ffmpeg encoder name. 'auto' probes candidates with a real test encode
     (see _encoder_actually_works) and picks the first that actually
     initializes, falling back to libx264 if none do."""
     if preferred == "libx264":
-        return "libx264", _encoder_extra_args("libx264")
+        return "libx264", _encoder_extra_args("libx264", crf)
 
     result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
     available = result.stdout
@@ -201,7 +222,7 @@ def detect_encoder(preferred):
 
     for enc in candidates:
         if enc in available:
-            extra = _encoder_extra_args(enc)
+            extra = _encoder_extra_args(enc, crf)
             if _encoder_actually_works(enc, extra):
                 return enc, extra
             print(f"Encoder '{enc}' is compiled into ffmpeg but failed a live test encode; skipping.", file=sys.stderr)
@@ -209,7 +230,7 @@ def detect_encoder(preferred):
     if preferred not in ("auto",) and preferred not in name_map:
         raise RuntimeError(f"Requested encoder '{preferred}' not found in ffmpeg -encoders output")
 
-    return "libx264", _encoder_extra_args("libx264")
+    return "libx264", _encoder_extra_args("libx264", crf)
 
 
 def _resolve_dims(width, height, max_dimension):
@@ -242,6 +263,11 @@ def _build_settings(args):
         "pose_lines": args.pose_lines,
         "face_contours": args.face_contours,
         "temporal_denoise": args.temporal_denoise,
+        # Not an ink-pipeline setting -- bundled into settings purely so
+        # _process_segment's hardware-encoder-failed fallback (which only
+        # has settings/encoder/encoder_args in scope, not args) can rebuild
+        # libx264 args with the right CRF instead of a hardcoded one.
+        "crf": args.crf,
     }
     if preset_name == "custom":
         settings.update({"use_bilateral": True, "use_gaussian": False, "use_median": False})
@@ -374,7 +400,7 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
 
     if encode_proc.returncode != 0:
         if encoder != "libx264":
-            fallback_args = _encoder_extra_args("libx264")
+            fallback_args = _encoder_extra_args("libx264", settings["crf"])
             return _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, src_h,
                                      out_w, out_h, settings, "libx264", fallback_args, tmp_dir)
         raise RuntimeError(f"Segment {seg_idx} encode failed ({frames_written} frames written): "
@@ -479,6 +505,25 @@ def parse_args():
                               "-- negligible next to render time. Set to 0 to disable.")
     parser.add_argument("--encoder", default="auto", choices=["auto", "nvenc", "vaapi", "qsv", "libx264"],
                          help="Video encoder. 'auto' tries hardware encoders in order and falls back to libx264.")
+    quality_choices = ", ".join(f"{name} (CRF {crf})" for name, crf in QUALITY_PRESETS.items())
+    parser.add_argument("--quality", choices=list(QUALITY_PRESETS), default="balanced",
+                         help=f"Named output-size/quality tier ({quality_choices}). Default 'balanced' (CRF "
+                              f"24) -- meaningfully smaller than this file's old hardcoded CRF 20 with real "
+                              f"margin before the point real ink content was tested to start losing crispness "
+                              f"(see --crf's help for the actual measured numbers). Same tier names/CRF "
+                              f"values as the Linearty Android app's encoder_quality_mode setting where they "
+                              f"overlap (up to 'small'); 'aggressive' goes further since ink/line-art content "
+                              f"specifically (flat color, no photographic gradient) tolerates more compression "
+                              f"than the general video that app's tiers were designed for. Ignored if --crf "
+                              f"is also given.")
+    parser.add_argument("--crf", type=int, default=None,
+                         help="Explicit CRF, overriding --quality, for any value not covered by a named "
+                              "tier (or just a preference for a raw number). Lower = higher quality/larger "
+                              "file. Measured live on a real 90s 1080p ink render: CRF 20 -> 33.0MB, "
+                              "24 -> 24.5MB, 28 -> 15.8MB (52%% smaller than 20), 32 -> 9.1MB (72%% smaller), "
+                              "40 -> 2.4MB (93%% smaller, user-confirmed by eye to still look right on real "
+                              "output). Nothing stops you from going even further than 40, but that's past "
+                              "what's actually been checked for line crispness -- worth a look before trusting it.")
     parser.add_argument("--gpu-filter", action="store_true", dest="gpu_filter",
                          help="Opportunistic OpenCV CUDA use for the ink filter itself. Only takes effect if the "
                               "installed opencv build has CUDA support (the standard pip wheel does not); "
@@ -490,6 +535,8 @@ def main():
     args = parse_args()
     if args.human_aware is None:
         args.human_aware = args.preset != "classic"  # mirrors script.js's own default
+    if args.crf is None:
+        args.crf = QUALITY_PRESETS[args.quality]
 
     if args.gpu_filter:
         import cv2
@@ -502,11 +549,11 @@ def main():
     out_w, out_h = _resolve_dims(info["width"], info["height"], args.max_dimension)
     settings = _build_settings(args)
 
-    encoder, encoder_args = detect_encoder(args.encoder)
+    encoder, encoder_args = detect_encoder(args.encoder, args.crf)
     print(f"Input: {info['width']}x{info['height']} @ {info['fps']:.3f}fps, "
           f"{info['total_frames']} frames, audio={info['has_audio']}")
     print(f"Output: {out_w}x{out_h} @ {fps:.3f}fps, preset={args.preset}, human_aware={args.human_aware}, "
-          f"encoder={encoder}, workers={args.workers}")
+          f"encoder={encoder}, crf={args.crf}, workers={args.workers}")
 
     segments = build_segments(info["total_frames"], args.workers)
     print(f"Split into {len(segments)} segments across {args.workers} worker(s)")
