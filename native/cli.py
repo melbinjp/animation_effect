@@ -197,6 +197,7 @@ def _build_settings(args):
         "human_aware": args.human_aware,
         "pose_lines": args.pose_lines,
         "face_contours": args.face_contours,
+        "temporal_denoise": args.temporal_denoise,
     }
     if preset_name == "custom":
         settings.update({"use_bilateral": True, "use_gaussian": False, "use_median": False})
@@ -266,6 +267,7 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
     encode_proc = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     frames_written = 0
+    prev_gray = None  # carried sequentially across this segment's frames -- see temporal_denoise below
     try:
         for _ in range(num_frames):
             raw = decode_proc.stdout.read(frame_size)
@@ -285,10 +287,15 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
                 else:
                     frame_settings["human_aware"] = False
 
+            if settings.get("temporal_denoise"):
+                if frame_settings is settings:
+                    frame_settings = dict(settings)
+                frame_settings["prev_gray"] = prev_gray
+
             # Pass the RGB conversion already computed above (when
             # human-aware) so process_frame doesn't redo the identical
             # cv2.cvtColor call a second time -- same bytes either way.
-            out_rgb = pipeline.process_frame(rgba, frame_settings, rgb=rgb_for_human)
+            out_rgb, prev_gray = pipeline.process_frame(rgba, frame_settings, rgb=rgb_for_human)
             if (out_w, out_h) != (src_w, src_h):
                 out_rgb = cv2.resize(out_rgb, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
@@ -376,6 +383,10 @@ def parse_args():
     parser.add_argument("--no-human-aware", dest="human_aware", action="store_false")
     parser.add_argument("--pose-lines", action="store_true", dest="pose_lines")
     parser.add_argument("--face-contours", action="store_true", dest="face_contours")
+    parser.add_argument("--temporal-denoise", action="store_true", dest="temporal_denoise",
+                         help="Experimental: motion-adaptive smoothing of the pre-Canny gray image "
+                              "to reduce sensor-noise-driven edge jitter (and the file-size bloat it "
+                              "causes), without blurring real motion -- off by default, opt in to test.")
     parser.add_argument("--max-dimension", type=int, default=None,
                          help="Opt-in resolution cap. Omit for full source resolution (the default) -- "
                               "unlike the browser version, nothing is capped unless you ask for it.")

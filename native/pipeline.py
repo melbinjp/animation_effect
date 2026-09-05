@@ -23,7 +23,7 @@ already-selected dict from presets.py (not just its name).
 import numpy as np
 import cv2
 
-from ink import apply_gray_world, paint_ultimate_ink
+from ink import apply_gray_world, paint_ultimate_ink, temporal_denoise_gray
 
 
 def _rect_kernel(size):
@@ -51,12 +51,24 @@ def _remove_small_components(edges, min_area):
 def process_frame(rgba, settings, rgb=None):
     """rgba: (H, W, 4) uint8 array (RGBA, matching the browser's ImageData
     layout — the alpha channel is dropped immediately, same as worker.js's
-    cv.COLOR_RGBA2RGB). Returns an (H, W, 3) uint8 RGB image.
+    cv.COLOR_RGBA2RGB). Returns (out_rgb, new_prev_gray): out_rgb is an
+    (H, W, 3) uint8 RGB image; new_prev_gray is the pre-Canny working gray
+    to pass back in as settings["prev_gray"] on the NEXT sequential frame
+    (None if settings["temporal_denoise"] is falsy -- nothing to carry).
 
     rgb: pass the RGBA->RGB conversion of this same frame if the caller
     already computed it (e.g. for human-aware segmentation, which needs its
     own RGB copy) to skip redoing the exact same cv2.cvtColor call twice per
-    frame -- bit-identical either way, this only avoids the duplicate work."""
+    frame -- bit-identical either way, this only avoids the duplicate work.
+
+    settings["temporal_denoise"]: opt-in motion-adaptive smoothing of the
+    pre-Canny gray image (see ink.temporal_denoise_gray) to damp the sensor-
+    noise-driven edge jitter that inflates encoded file size -- see that
+    function's docstring for why it only smooths where frame-to-frame change
+    is small, so real motion is never blurred. settings["prev_gray"] is the
+    previous frame's returned new_prev_gray, or None for a segment's first
+    frame; the caller (one sequential process per video segment, same as the
+    MediaPipe/RVM recurrent state) is responsible for carrying it forward."""
     if rgb is None:
         rgb = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
 
@@ -106,6 +118,11 @@ def process_frame(rgba, settings, rgb=None):
             for _ in range(max(1, min(3, settings.get("median_passes", 1)))):
                 gray = cv2.medianBlur(gray, 3)
 
+    new_prev_gray = gray
+    if settings.get("temporal_denoise"):
+        gray = temporal_denoise_gray(gray, settings.get("prev_gray"))
+        new_prev_gray = gray
+
     # Three-stage adaptive normalize — see worker.js's comment for the full
     # rationale (gamma lift / histogram stretch / adaptive CLAHE cascade).
     last_mean = None
@@ -151,13 +168,16 @@ def process_frame(rgba, settings, rgb=None):
         edges = cv2.dilate(edges, _ellipse_kernel(settings["line_weight"] + 1))
 
     if settings.get("engine") == "ultimate":
-        return paint_ultimate_ink(
+        out = paint_ultimate_ink(
             gray, edges, settings,
             class_mask=settings.get("class_mask"),
             extra_lines=settings.get("extra_lines"),
+            alpha=settings.get("alpha"),
         )
+    else:
+        out = _paint_classic(rgb, gray_raw, edges, settings, last_mean)
 
-    return _paint_classic(rgb, gray_raw, edges, settings, last_mean)
+    return out, new_prev_gray
 
 
 def _paint_classic(rgb, gray_raw, edges, settings, last_mean):

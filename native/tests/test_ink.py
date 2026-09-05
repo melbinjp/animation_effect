@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ink import compute_class_confidence, compute_xdog_map, apply_human_ink, silhouette_mask
+from ink import compute_class_confidence, compute_xdog_map, apply_human_ink, silhouette_mask, temporal_denoise_gray
 
 HUMAN_BG, HUMAN_HAIR, HUMAN_BODY, HUMAN_FACE, HUMAN_CLOTHES, HUMAN_OTHER = range(6)
 
@@ -112,3 +112,47 @@ def test_silhouette_mask_marks_only_the_transition_band():
     assert sil[10, 17] == 0.0
     # Right at the boundary: silhouette band should be active somewhere nearby.
     assert sil[10, 8:12].sum() > 0
+
+
+def test_temporal_denoise_gray_passes_through_on_first_frame():
+    gray = np.full((10, 10), 100, dtype=np.uint8)
+    out = temporal_denoise_gray(gray, None)
+    assert out is gray
+
+
+def test_temporal_denoise_gray_blends_small_static_noise():
+    rng = np.random.default_rng(7)
+    prev = np.full((20, 20), 128, dtype=np.uint8)
+    # Small per-pixel sensor-noise-level jitter (+/- a few levels), no real motion.
+    noise = rng.integers(-4, 5, (20, 20))
+    current = np.clip(128 + noise, 0, 255).astype(np.uint8)
+
+    out = temporal_denoise_gray(current, prev, motion_threshold=18.0, base_alpha=0.55)
+
+    # Blended result should sit between current and prev, closer to a
+    # genuine blend than to current alone -- i.e. smoothing actually happened.
+    diff_from_current = np.abs(out.astype(np.int16) - current.astype(np.int16))
+    assert diff_from_current.mean() > 0
+    # But it should still be close to both (no wild divergence for tiny noise).
+    assert diff_from_current.max() <= 5
+
+
+def test_temporal_denoise_gray_leaves_real_motion_alone():
+    prev = np.zeros((20, 20), dtype=np.uint8)
+    current = np.zeros((20, 20), dtype=np.uint8)
+    # A hard edge that moved a long way between frames -- large, real change.
+    current[:, 10:] = 255
+
+    out = temporal_denoise_gray(current, prev, motion_threshold=18.0, base_alpha=0.55)
+
+    # High-motion region: blend weight should collapse to ~1.0 (current
+    # frame kept as-is), not smeared toward prev's all-zero value.
+    assert np.array_equal(out[:, 10:], current[:, 10:])
+
+
+def test_temporal_denoise_gray_output_dtype_and_shape():
+    prev = np.full((8, 8), 50, dtype=np.uint8)
+    current = np.full((8, 8), 60, dtype=np.uint8)
+    out = temporal_denoise_gray(current, prev)
+    assert out.dtype == np.uint8
+    assert out.shape == (8, 8)

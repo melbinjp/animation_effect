@@ -35,6 +35,41 @@ def clamp01(arr):
     return np.clip(arr, 0.0, 1.0)
 
 
+def temporal_denoise_gray(gray, prev_gray, motion_threshold=18.0, base_alpha=0.55):
+    """Motion-adaptive temporal smoothing on the pre-Canny grayscale image --
+    the architecturally correct fix for edge jitter, per this project's own
+    measurements: denoising AFTER Canny (on the already-binarized ink
+    output) does essentially nothing, since a hard edge/no-edge decision
+    can't be un-made after the fact; denoising the continuous gray image
+    BEFORE thresholding stops noise from ever flipping that decision.
+
+    Blends the current frame toward the previous frame's smoothed gray, but
+    ONLY where the two are already close (small per-pixel difference,
+    i.e. probably sensor noise on an otherwise-static region) -- where the
+    difference is large (real motion), the blend weight collapses to 1.0
+    (100% current frame, no smoothing at all). This is deliberate: a fixed
+    blend ratio applied uniformly would ghost/smear fast-moving edges --
+    exactly the motion-blur regression already fixed once this session for
+    a different reason (inferCachedHuman's cache bypass). Motion-adaptive
+    weighting is the established way real temporal denoisers (e.g. hqdn3d's
+    temporal component) avoid that failure mode.
+
+    gray, prev_gray: (H, W) uint8. prev_gray may be None (first frame in a
+    segment -- returns gray unchanged, no prior frame to blend with).
+    Returns the smoothed (H, W) uint8 gray to both use for this frame's
+    Canny input AND pass back in as next frame's prev_gray.
+    """
+    if prev_gray is None:
+        return gray
+
+    diff = np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16)).astype(np.float32)
+    motion_weight = clamp01(diff / motion_threshold)
+    effective_alpha = base_alpha + (1 - base_alpha) * motion_weight
+
+    smoothed = effective_alpha * gray.astype(np.float32) + (1 - effective_alpha) * prev_gray.astype(np.float32)
+    return np.clip(smoothed, 0, 255).astype(np.uint8)
+
+
 def silhouette_mask(class_mask):
     """A band around the subject's outline — pixels near a foreground/
     background transition — used to force a minimum ink value right at the
@@ -118,6 +153,51 @@ def apply_human_ink(ink, class_mask, extra_lines, settings):
     return blended.astype(np.float32)
 
 
+def apply_human_ink_alpha(ink, alpha, extra_lines, settings):
+    """Variant of apply_human_ink for a continuous foreground alpha matte
+    (RVM's `pha` output, 0=background..1=foreground) instead of MediaPipe's
+    discrete 6-class mask. RVM doesn't distinguish hair/face/clothes -- it's
+    a single-subject matte -- so this collapses the per-part branches
+    (skin-smooth vs hair-boost vs clothes) into one "foreground" treatment
+    (the skin-smooth curve, since that's the dominant look for human/subject
+    presets) and uses RVM's own alpha directly as the blend weight instead
+    of the class-mask-derived compute_class_confidence proxy -- alpha IS a
+    real per-pixel confidence here, not something to approximate.
+
+    This is a deliberate, disclosed simplification: hair no longer gets its
+    own boost. Silhouette boost still applies, computed from a binarized
+    version of the alpha (alpha > 0.5) through the same silhouette_mask.
+    """
+    if alpha is None or not settings.get("human_aware"):
+        return ink
+
+    isolation = settings.get("subject_isolation", 0.38)
+    skin = settings.get("skin_smooth", 0.8)
+    sil_boost = settings.get("silhouette_boost", 0.72)
+
+    binary_mask = (alpha > 0.5).astype(np.uint8)
+    sil = silhouette_mask(binary_mask)
+
+    original = ink
+    bg_treated = original * (1 - isolation)
+    keep = np.where(original > 0.58, 1.0, 1 - skin)
+    fg_treated = original * keep
+
+    a = alpha.astype(np.float32)
+    treated = bg_treated * (1 - a) + fg_treated * a
+    blended = original * (1 - a) + treated * a
+
+    sil_val = sil * sil_boost
+    blended = np.maximum(blended, sil_val)
+
+    if (settings.get("pose_lines") or settings.get("face_contours")) and extra_lines is not None:
+        e = extra_lines.astype(np.float32) / 255.0
+        line_mask = extra_lines > 80
+        blended = np.where(line_mask & (e > blended), e, blended)
+
+    return blended.astype(np.float32)
+
+
 def apply_gray_world(rgb):
     """In-place-equivalent white balance (returns a new array). rgb is
     (H, W, 3) uint8, channel order (R, G, B)."""
@@ -151,10 +231,14 @@ def compute_xdog_map(gray, sigma, tau, phi):
     return np.where(dog >= eps, 1.0, 1.0 + np.tanh(p * (dog - eps))).astype(np.float32)
 
 
-def paint_ultimate_ink(gray, edges, settings, class_mask=None, extra_lines=None):
+def paint_ultimate_ink(gray, edges, settings, class_mask=None, extra_lines=None, alpha=None):
     """gray: (H, W) grayscale (post-smoothing, pre-normalize is fine — same
     input studio-ink.js's paintUltimateInk receives). edges: (H, W) uint8
-    Canny output. Returns an (H, W, 3) uint8 RGB image."""
+    Canny output. Returns an (H, W, 3) uint8 RGB image.
+
+    alpha: optional continuous foreground matte (e.g. from RVM), used
+    instead of class_mask when provided -- see apply_human_ink_alpha. Only
+    one of class_mask/alpha should be set; alpha takes priority if both are."""
     preset = settings["preset"]
     xdog = compute_xdog_map(
         gray,
@@ -168,7 +252,10 @@ def paint_ultimate_ink(gray, edges, settings, class_mask=None, extra_lines=None)
     structure = np.where(edges >= 200, 0.48, 0.0)
     ink = np.maximum(stroke, structure).astype(np.float32)
 
-    ink = apply_human_ink(ink, class_mask, extra_lines, settings)
+    if alpha is not None:
+        ink = apply_human_ink_alpha(ink, alpha, extra_lines, settings)
+    else:
+        ink = apply_human_ink(ink, class_mask, extra_lines, settings)
 
     bg = np.array(preset.get("background", (250, 246, 238)), dtype=np.float32)
     stroke_rgb = np.array(preset.get("ink", (22, 28, 36)), dtype=np.float32)
