@@ -1,0 +1,6 @@
+# Extra dependencies for webui.py's browser UI, on top of requirements.txt.
+# Kept separate so a CLI-only install doesn't pull in a web framework it
+# doesn't need.
+fastapi
+uvicorn
+python-multipart

@@ -4,3 +4,4 @@ __pycache__/
 .hypothesis/
 dummy.mp4
 node_modules/
+native/webui_job_*.log

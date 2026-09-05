@@ -29,10 +29,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import human as human_mod
 import pipeline
 from presets import get_preset, get_human_tuning
+
+# Set by _init_worker in each worker process: a shared-memory int array, one
+# slot per segment, so the main process can render a live progress bar
+# without waiting for a whole (thousands-of-frames) segment to finish.
+_progress = None
 
 
 def probe_video(path):
@@ -163,9 +169,11 @@ def _build_settings(args):
     return settings
 
 
-def _init_worker():
+def _init_worker(progress_array):
     import cv2
     cv2.setNumThreads(1)  # avoid N processes x M internal cv2 threads oversubscribing cores
+    global _progress
+    _progress = progress_array
 
 
 def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, src_h, out_w, out_h,
@@ -237,6 +245,8 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
                 # a clean non-zero exit.
                 break
             frames_written += 1
+            if _progress is not None:
+                _progress[seg_idx] = frames_written
     finally:
         decode_proc.stdout.close()
         decode_proc.wait()
@@ -358,11 +368,27 @@ def main():
         ]
 
         import multiprocessing as mp
-        with mp.Pool(processes=args.workers, initializer=_init_worker) as pool:
-            seg_paths = []
-            for i, seg_path in enumerate(pool.imap(_process_segment_star, job_args)):
-                seg_paths.append(seg_path)
-                print(f"Segment {i + 1}/{len(segments)} done")
+        progress_array = mp.Array("i", len(segments))
+        total_frames = info["total_frames"]
+        with mp.Pool(processes=args.workers, initializer=_init_worker, initargs=(progress_array,)) as pool:
+            async_result = pool.map_async(_process_segment_star, job_args)
+            start_wall = time.time()
+            # One newline-terminated line per update (not an in-place \r bar):
+            # this is meant to be watched via `tail -f` / `Get-Content -Wait`
+            # on a redirected log file as much as in an interactive terminal,
+            # and \r updates render as one unreadable run-on line in a file.
+            while not async_result.ready():
+                async_result.wait(5)
+                done = sum(progress_array)
+                elapsed = time.time() - start_wall
+                pct = 100 * done / max(1, total_frames)
+                rate = done / elapsed if elapsed > 0 else 0
+                eta_s = (total_frames - done) / rate if rate > 0 else 0
+                print(f"Progress: {done}/{total_frames} frames ({pct:5.1f}%) | "
+                      f"{rate:6.1f} fps | elapsed {elapsed / 60:5.1f}m | ETA {eta_s / 60:5.1f}m",
+                      flush=True)
+            seg_paths = async_result.get()
+        print(f"All {len(segments)} segments done")
 
         video_only_path = os.path.join(tmp_dir, "video_only.mp4")
         concat_segments(seg_paths, tmp_dir, video_only_path)

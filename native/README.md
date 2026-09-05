@@ -53,6 +53,46 @@ Common flags:
 - `--encoder auto|nvenc|vaapi|qsv|libx264` -- see the GPU section below
 - `--gpu-filter` -- opportunistic OpenCV CUDA use for the ink filter itself
 
+While running, `cli.py` prints a real progress line every 5 seconds --
+frame count, percentage, aggregate fps, elapsed time, and ETA -- parsed from
+a shared-memory counter each worker updates per frame, not just a
+per-segment "done" marker (which for a large `--workers` count could
+otherwise mean only a handful of updates across a very long render). Each
+update is its own newline-terminated line rather than an in-place `\r` bar,
+specifically so it reads correctly when redirected to a log file and
+tailed (`tail -f` / `Get-Content -Wait`), not just in an interactive
+terminal.
+
+**Never edit these files while a render is running.** On Windows,
+`multiprocessing` always re-imports the whole script fresh from disk for
+any new worker process it spawns (including replacing one that
+unexpectedly died) -- editing `cli.py`/`human.py`/`pipeline.py` mid-run risks
+a signature mismatch between the running main process and a freshly
+spawned worker, which can spiral into an endless respawn-crash loop. This
+happened during development; the fix was killing the whole process tree
+and relaunching, not patching around it. `webui.py` doesn't have this
+problem since it's a separate file the running job's workers never import.
+
+## Web UI
+
+`webui.py` is a local browser front end for the same CLI -- pick a file
+path and settings, watch the same live progress in a page instead of a
+terminal, cancel a running job. It shares the actual website's stylesheet
+(`style.css`, one directory up) so it looks like the same product, not a
+bolted-on dev tool.
+
+```
+pip install -r requirements.txt -r requirements-webui.txt
+python webui.py
+```
+
+Then open http://127.0.0.1:8765/. It launches renders as plain `python
+cli.py ...` subprocesses (the same command you'd run by hand), so
+everything in the Usage/GPU sections above still applies -- the page is
+just a form and a progress viewer on top. Local-only by design (binds to
+127.0.0.1), no auth, no multi-user job isolation -- built for one person
+watching their own renders, not a shared service.
+
 ## GPU: three independent, honestly-scoped levers
 
 There is no single "use GPU" switch -- three separate things can each use
