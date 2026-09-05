@@ -276,7 +276,7 @@ def _build_settings(args):
     return settings
 
 
-def _init_worker(progress_array, worker_slot_counter, stagger_seconds, threads_per_worker):
+def _init_worker(progress_array, worker_slot_counter, stagger_seconds, threads_per_worker, total_workers):
     # Claim a slot number and, if staggering, sleep proportionally to it
     # BEFORE this worker's _process_segment call starts spawning its own
     # ffmpeg decode/encode subprocesses. Root cause this addresses: spawning
@@ -293,6 +293,37 @@ def _init_worker(progress_array, worker_slot_counter, stagger_seconds, threads_p
         worker_slot_counter.value += 1
     if stagger_seconds > 0 and slot > 0:
         time.sleep(slot * stagger_seconds)
+
+    # Pin this worker to its own share of the real, allowed core set.
+    # Necessary because MediaPipe Tasks' Python API exposes no way to cap
+    # its own internal (XNNPACK) thread pool -- confirmed by inspecting
+    # BaseOptions/ImageSegmenterOptions, neither takes a num_threads
+    # argument -- and measured live that each worker process was actually
+    # running ~48 OS threads regardless of --threads-per-worker or the
+    # OMP_NUM_THREADS/TF_NUM_INTRAOP_THREADS env vars (one threadpool per
+    # MediaPipe model -- segmenter+pose+face -- each apparently sized off
+    # the real core count), driving load average to ~6x the real core
+    # count on a 16-core pod. Those env vars still get set (module top) in
+    # case a future MediaPipe version starts honoring them, but they can't
+    # be relied on. Restricting this process's own CPU affinity bounds the
+    # threads IT spawns to only the cores assigned to it, regardless of how
+    # many MediaPipe creates -- oversubscription then stays local to this
+    # worker's own share instead of spilling across every other worker's
+    # cores too, which is what was actually driving load average to ~96 on
+    # a 16-core box (all 4 workers' ~48 threads each fighting over all 16
+    # cores at once, not just their intended 4).
+    try:
+        full_affinity = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        full_affinity = None  # not available on Windows; no-op there
+    if full_affinity and total_workers > 0:
+        chunk = max(1, len(full_affinity) // total_workers)
+        start = (slot % total_workers) * chunk
+        my_cores = full_affinity[start:start + chunk] or full_affinity
+        try:
+            os.sched_setaffinity(0, set(my_cores))
+        except (AttributeError, OSError):
+            pass
 
     import cv2
     # Match cv2's own thread pool to the same --threads-per-worker value the
@@ -572,7 +603,7 @@ def main():
         total_frames = info["total_frames"]
         with mp.Pool(processes=args.workers, initializer=_init_worker,
                      initargs=(progress_array, worker_slot_counter, args.worker_stagger,
-                               args.threads_per_worker)) as pool:
+                               args.threads_per_worker, args.workers)) as pool:
             async_result = pool.map_async(_process_segment_star, job_args)
             start_wall = time.time()
             # One newline-terminated line per update (not an in-place \r bar):
