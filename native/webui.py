@@ -46,6 +46,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from presets import STYLE_PRESETS
 
+# Duplicated from cli.py rather than imported -- same reason as
+# _real_core_count() below: importing cli.py as a module runs its whole
+# top-level (sys.argv pre-scan, heavy mediapipe/tf imports) against
+# webui.py's own argv, which makes no sense here.
+QUALITY_PRESETS = {
+    "indistinguishable": 18, "optimized": 21, "balanced": 24,
+    "small": 28, "aggressive": 32, "maximum": 40,
+}
+
 NATIVE_DIR = Path(__file__).resolve().parent
 CLI_PATH = NATIVE_DIR / "cli.py"
 WEBSITE_DIR = NATIVE_DIR.parent  # the browser app's own index.html/style.css live here, when present
@@ -115,6 +124,10 @@ def index():
         f'<option value="{key}"{" selected" if key == "ultimate" else ""}>{val["label"]}</option>'
         for key, val in STYLE_PRESETS.items()
     )
+    quality_options = "".join(
+        f'<option value="{key}"{" selected" if key == "balanced" else ""}>{key} (CRF {crf_val})</option>'
+        for key, crf_val in QUALITY_PRESETS.items()
+    )
     cores = _real_core_count()
     # Same dynamic formula as cli.py's own default -- see that file's
     # --threads-per-worker help text for the validated reasoning
@@ -124,6 +137,7 @@ def index():
     default_workers = max(1, cores // threads_per_worker)
     return (
         PAGE_TEMPLATE.replace("__PRESET_OPTIONS__", preset_options)
+        .replace("__QUALITY_OPTIONS__", quality_options)
         .replace("__DEFAULT_WORKERS__", str(default_workers))
         .replace("__DEFAULT_THREADS_PER_WORKER__", str(threads_per_worker))
     )
@@ -171,12 +185,17 @@ def start_job(
     pose_lines: str = Form(""),
     face_contours: str = Form(""),
     encoder: str = Form("auto"),
+    quality: str = Form("balanced"),
+    crf: str = Form(""),
+    temporal_denoise: str = Form(""),
 ):
     input_path = input_path.strip().strip('"')
     if not os.path.isfile(input_path):
         return JSONResponse({"error": f"Input file not found: {input_path}"}, status_code=400)
     if preset not in STYLE_PRESETS:
         return JSONResponse({"error": f"Unknown preset: {preset}"}, status_code=400)
+    if quality not in QUALITY_PRESETS:
+        return JSONResponse({"error": f"Unknown quality tier: {quality}"}, status_code=400)
 
     out = output_path.strip().strip('"') or _default_output(input_path)
     job_id = uuid.uuid4().hex[:8]
@@ -186,7 +205,12 @@ def start_job(
         sys.executable, str(CLI_PATH), input_path, "-o", out,
         "--preset", preset, "--workers", str(workers),
         "--threads-per-worker", str(threads_per_worker), "--encoder", encoder,
+        "--quality", quality,
     ]
+    if crf.strip():
+        cmd += ["--crf", crf.strip()]
+    if temporal_denoise == "on":
+        cmd.append("--temporal-denoise")
     if max_dimension.strip():
         cmd += ["--max-dimension", max_dimension.strip()]
     if human_aware == "on":
@@ -248,6 +272,26 @@ def job_log(job_id: str):
     except FileNotFoundError:
         text = ""
     return JSONResponse({"log": text[-4000:]})
+
+
+@app.get("/jobs/{job_id}/download")
+def job_download(job_id: str):
+    """Streams the finished render back over the same connection the
+    browser used to reach this page -- so when this page is opened through
+    an SSH local port-forward (the documented way to drive a pod's webui
+    from your own PC), the download travels through that same tunnel and
+    lands whereever the browser is configured to save downloads, with no
+    separate transfer step or script needed."""
+    job = jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error": "unknown job"}, status_code=404)
+    if job["process"].poll() != 0:
+        return JSONResponse({"error": "job not finished successfully"}, status_code=409)
+    out_path = Path(job["output_path"])
+    if not out_path.is_file():
+        return JSONResponse({"error": f"output file missing: {out_path}"}, status_code=404)
+    from fastapi.responses import FileResponse
+    return FileResponse(str(out_path), filename=out_path.name, media_type="video/mp4")
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -413,10 +457,19 @@ PAGE_TEMPLATE = """<!doctype html>
           <input type="text" id="max_dimension" name="max_dimension" placeholder="">
         </div>
         <div class="control-group">
+          <label for="quality">Quality tier (output size)</label>
+          <select id="quality" name="quality">__QUALITY_OPTIONS__</select>
+        </div>
+        <div class="control-group">
+          <label for="crf">Custom CRF (blank = use quality tier above)</label>
+          <input type="number" id="crf" name="crf" placeholder="" min="0" max="51">
+        </div>
+        <div class="control-group">
           <label>Overlays</label>
           <div class="overlay-row">
             <label><input type="checkbox" name="pose_lines"> Pose lines</label>
             <label><input type="checkbox" name="face_contours"> Face contours</label>
+            <label><input type="checkbox" name="temporal_denoise" checked> Temporal denoise</label>
           </div>
         </div>
       </div>
@@ -438,6 +491,15 @@ PAGE_TEMPLATE = """<!doctype html>
 <script>
 const jobsDiv = document.getElementById('jobs');
 const knownJobs = JSON.parse(localStorage.getItem('linearty_jobs') || '[]');
+// Tracks which finished jobs already triggered a download -- persisted so a
+// page reload after a job finished doesn't re-download it, but a genuinely
+// new completion always does.
+const downloadedJobs = new Set(JSON.parse(localStorage.getItem('linearty_downloaded') || '[]'));
+
+function markDownloaded(jobId) {
+  downloadedJobs.add(jobId);
+  localStorage.setItem('linearty_downloaded', JSON.stringify([...downloadedJobs]));
+}
 
 function saveKnownJobs() {
   localStorage.setItem('linearty_jobs', JSON.stringify(knownJobs));
@@ -525,6 +587,20 @@ async function pollJob(jobId) {
     if (data.state === 'done') {
       el.classList.add('state-done');
       el.querySelector('.job-meta').textContent += ` — output: ${data.output_path}`;
+      if (!downloadedJobs.has(jobId)) {
+        // Auto-trigger the browser's own download -- lands wherever the
+        // browser is configured to save files, no manual click and no
+        // separate transfer step needed. Marked downloaded immediately so
+        // a later poll tick (every 2s, before this download even starts)
+        // can't fire it twice.
+        markDownloaded(jobId);
+        const a = document.createElement('a');
+        a.href = `/jobs/${jobId}/download`;
+        a.download = '';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
     } else if (data.state === 'failed') {
       el.classList.add('state-failed');
       el.querySelector('.job-meta').textContent = data.error || 'Failed — see log';
@@ -551,7 +627,7 @@ document.getElementById('renderForm').addEventListener('submit', async (e) => {
   const formData = new FormData(e.target);
   const params = new URLSearchParams();
   for (const [k, v] of formData.entries()) {
-    if (k === 'pose_lines' || k === 'face_contours') {
+    if (k === 'pose_lines' || k === 'face_contours' || k === 'temporal_denoise') {
       params.set(k, 'on');
     } else {
       params.set(k, v);
