@@ -51,6 +51,24 @@ CLI_PATH = NATIVE_DIR / "cli.py"
 WEBSITE_DIR = NATIVE_DIR.parent  # the browser app's own index.html/style.css live here, when present
 UPLOAD_DIR = NATIVE_DIR / "webui_uploads"
 
+
+def _real_core_count():
+    """Duplicated from cli.py rather than imported from it, deliberately --
+    importing cli.py as a module would run its whole top-level (sys.argv
+    scan, OMP/TF env var setup) using webui.py's OWN argv, which makes no
+    sense (that argv is --host/--port, not --threads-per-worker). Same
+    real bug this fixes as cli.py's own copy: os.cpu_count() reports a
+    container's HOST-level logical CPU count, not what's actually
+    allocated to it -- confirmed live, a pod with 16 real cores reported
+    128 via os.cpu_count(), and this page's own default --workers value
+    (populated from this function) fed that straight into a real render,
+    spawning 128 MediaPipe workers that oversubscribed 16 real cores into
+    a stall (load average 38-65)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 4
+
 app = FastAPI()
 jobs = {}  # job_id -> dict(process, log_path, output_path, cmd, start_time, cancelled)
 
@@ -97,8 +115,17 @@ def index():
         f'<option value="{key}"{" selected" if key == "ultimate" else ""}>{val["label"]}</option>'
         for key, val in STYLE_PRESETS.items()
     )
-    return PAGE_TEMPLATE.replace("__PRESET_OPTIONS__", preset_options).replace(
-        "__DEFAULT_WORKERS__", str(os.cpu_count() or 4)
+    cores = _real_core_count()
+    # Same dynamic formula as cli.py's own default -- see that file's
+    # --threads-per-worker help text for the validated reasoning
+    # (fewer, properly multi-threaded workers beats many single-threaded
+    # ones for MediaPipe specifically).
+    threads_per_worker = max(1, round(cores ** 0.5))
+    default_workers = max(1, cores // threads_per_worker)
+    return (
+        PAGE_TEMPLATE.replace("__PRESET_OPTIONS__", preset_options)
+        .replace("__DEFAULT_WORKERS__", str(default_workers))
+        .replace("__DEFAULT_THREADS_PER_WORKER__", str(threads_per_worker))
     )
 
 
@@ -138,6 +165,7 @@ def start_job(
     output_path: str = Form(""),
     preset: str = Form("ultimate"),
     workers: int = Form(...),
+    threads_per_worker: int = Form(...),
     max_dimension: str = Form(""),
     human_aware: str = Form("default"),
     pose_lines: str = Form(""),
@@ -156,7 +184,8 @@ def start_job(
 
     cmd = [
         sys.executable, str(CLI_PATH), input_path, "-o", out,
-        "--preset", preset, "--workers", str(workers), "--encoder", encoder,
+        "--preset", preset, "--workers", str(workers),
+        "--threads-per-worker", str(threads_per_worker), "--encoder", encoder,
     ]
     if max_dimension.strip():
         cmd += ["--max-dimension", max_dimension.strip()]
@@ -358,6 +387,10 @@ PAGE_TEMPLATE = """<!doctype html>
           <input type="number" id="workers" name="workers" value="__DEFAULT_WORKERS__" min="1">
         </div>
         <div class="control-group">
+          <label for="threads_per_worker">Threads per worker</label>
+          <input type="number" id="threads_per_worker" name="threads_per_worker" value="__DEFAULT_THREADS_PER_WORKER__" min="1">
+        </div>
+        <div class="control-group">
           <label for="human_aware">Human-aware</label>
           <select id="human_aware" name="human_aware">
             <option value="default">Default (on unless classic)</option>
@@ -410,25 +443,45 @@ function saveKnownJobs() {
   localStorage.setItem('linearty_jobs', JSON.stringify(knownJobs));
 }
 
-document.getElementById('upload_file').addEventListener('change', async (e) => {
+document.getElementById('upload_file').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
   const statusEl = document.getElementById('uploadStatus');
-  statusEl.textContent = `Uploading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)...`;
+  const sizeMb = (file.size / 1e6).toFixed(1);
+  const startTime = Date.now();
   const formData = new FormData();
   formData.append('file', file);
-  try {
-    const res = await fetch('/upload', { method: 'POST', body: formData });
-    const data = await res.json();
-    if (data.path) {
-      document.getElementById('input_path').value = data.path;
-      statusEl.textContent = `Uploaded -- server path: ${data.path}`;
-    } else {
-      statusEl.textContent = 'Upload failed.';
+
+  // fetch() has no visibility into upload (request body) progress -- only
+  // XMLHttpRequest exposes upload.onprogress, which is why this isn't a
+  // fetch() call. For a large file (real videos are often 1GB+) with no
+  // progress shown, it's indistinguishable from a hung/failed upload.
+  const xhr = new XMLHttpRequest();
+  xhr.upload.addEventListener('progress', (ev) => {
+    if (!ev.lengthComputable) return;
+    const pct = (ev.loaded / ev.total * 100).toFixed(1);
+    const elapsedS = (Date.now() - startTime) / 1000;
+    const mbps = (ev.loaded / 1e6 / elapsedS).toFixed(1);
+    const doneMb = (ev.loaded / 1e6).toFixed(1);
+    statusEl.textContent = `Uploading ${file.name}: ${doneMb} / ${sizeMb} MB (${pct}%) at ${mbps} MB/s`;
+  });
+  xhr.addEventListener('load', () => {
+    try {
+      const data = JSON.parse(xhr.responseText);
+      if (data.path) {
+        document.getElementById('input_path').value = data.path;
+        statusEl.textContent = `Uploaded -- server path: ${data.path}`;
+      } else {
+        statusEl.textContent = `Upload failed: ${xhr.responseText}`;
+      }
+    } catch (err) {
+      statusEl.textContent = `Upload failed: bad response (${err})`;
     }
-  } catch (err) {
-    statusEl.textContent = `Upload failed: ${err}`;
-  }
+  });
+  xhr.addEventListener('error', () => { statusEl.textContent = 'Upload failed: network error.'; });
+  xhr.open('POST', '/upload');
+  xhr.send(formData);
+  statusEl.textContent = `Uploading ${file.name} (${sizeMb} MB)... 0%`;
 });
 
 function jobCard(jobId) {

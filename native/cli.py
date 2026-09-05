@@ -7,13 +7,19 @@ ceiling, no checkpoint/resume machinery (a crashed process here costs a
 rerun, not an unrecoverable multi-hour browser session).
 
 Parallelism model: the source is split into `--workers` contiguous frame
-segments (default os.cpu_count()), each handed to one multiprocessing.Pool
-worker as a single starmap call. Because one worker processes its entire
-segment sequentially inside one function call, MediaPipe VIDEO mode's
-strictly-increasing-timestamp requirement is satisfied automatically — no
-cross-worker coordination needed. Segments are encoded to temp .mp4 files
-and concatenated (stream copy, no re-encode) at the end, then audio is
-muxed back in from the original input in one final plain ffmpeg pass.
+segments (default: real cores / --threads-per-worker, both dynamically
+detected -- see _real_core_count()'s docstring for why this isn't just
+os.cpu_count()), each handed to one multiprocessing.Pool worker as a single
+starmap call, and each worker's cv2/MediaPipe use --threads-per-worker
+threads internally rather than being restricted to one (validated live:
+fewer, properly multi-threaded workers substantially beats more
+single-threaded ones -- see the --threads-per-worker help text). Because
+one worker processes its entire segment sequentially inside one function
+call, MediaPipe VIDEO mode's strictly-increasing-timestamp requirement is
+satisfied automatically — no cross-worker coordination needed. Segments are
+encoded to temp .mp4 files and concatenated (stream copy, no re-encode) at
+the end, then audio is muxed back in from the original input in one final
+plain ffmpeg pass.
 
 On Windows, multiprocessing always uses "spawn" (never "fork"): every
 worker re-imports this module fresh in a new process, so the __main__
@@ -21,30 +27,68 @@ guard below is mandatory and the worker function must be a plain
 top-level, picklable callable — not a closure or a bound method.
 """
 
+import math
 import os
+import sys
+
+
+def _real_core_count():
+    """os.cpu_count() reports the HOST's total logical CPUs inside a
+    container, not what's actually allocated to it -- confirmed live on a
+    rented pod where os.cpu_count() said 128 (the host) while the container
+    was only given 16, and a --workers default trusting the former spawned
+    128 MediaPipe worker processes fighting over 16 real cores (severe
+    oversubscription -- load average 38-65 against a 16-core budget,
+    progress stalled outright). os.sched_getaffinity(0) respects the
+    container's actual cgroup/affinity-limited allocation on Linux; it
+    doesn't exist on Windows/macOS, where os.cpu_count() is already correct
+    since those platforms aren't usually run inside a shared-host container
+    the way this script's target rented-Linux-pod use case is."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 4
+
+
+# Read --threads-per-worker (or fall back to the same dynamic default main()
+# computes below) here, before any heavy import, since OMP/TF thread-count
+# env vars only take effect if set before mediapipe/TFLite's XNNPACK CPU
+# delegate initializes -- too late once `import human` below has run. This
+# is a plain sys.argv scan rather than argparse specifically so the real
+# argparse pass in parse_args() (which also validates everything else)
+# doesn't have to run twice.
+_cores = _real_core_count()
+_threads_arg = None
+for _i, _a in enumerate(sys.argv):
+    if _a == "--threads-per-worker" and _i + 1 < len(sys.argv):
+        _threads_arg = sys.argv[_i + 1]
+    elif _a.startswith("--threads-per-worker="):
+        _threads_arg = _a.split("=", 1)[1]
+_default_threads_per_worker = max(1, round(math.sqrt(_cores)))
+_threads_per_worker = int(_threads_arg) if _threads_arg else _default_threads_per_worker
 
 # Must run before `import human`/`cv2`/mediapipe pull in TFLite's XNNPACK
-# CPU delegate, which auto-sizes its own internal thread pool independent
-# of cv2.setNumThreads(1) below (that call only affects OpenCV's threading,
-# not TFLite's). Confirmed live: going from 8 to 14 worker PROCESSES made
-# throughput WORSE (5.5fps -> ~2.2fps) on this 18-core machine, consistent
-# with each MediaPipe-based worker already running its own multi-threaded
-# CPU inference -- more processes multiplies real OS thread count far past
-# what 18 cores can serve, causing oversubscription/context-switch thrash
-# rather than more throughput. These env vars are the only lever available
-# since the Python Tasks API (mediapipe.tasks.python.BaseOptions) exposes
-# no num_threads parameter to set this directly (checked live: its
-# constructor only takes model_asset_path/model_asset_buffer/delegate).
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
-os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+# CPU delegate, which auto-sizes its own internal thread pool independent of
+# cv2.setNumThreads() below (that call only affects OpenCV's own threading,
+# not TFLite's) -- these env vars are the only lever for TFLite specifically,
+# since the Python Tasks API (mediapipe.tasks.python.BaseOptions) exposes no
+# num_threads parameter directly (checked live: its constructor only takes
+# model_asset_path/model_asset_buffer/delegate). Previously hardcoded to "1"
+# to avoid N-single-threaded-processes oversubscription; confirmed live that
+# this was actively counterproductive once the architecture moved to fewer,
+# properly multi-threaded workers -- a standalone benchmark script with NO
+# thread cap hit ~51fps aggregate (4 workers x 4 threads on 16 cores) versus
+# this file's own 10-single-threaded-workers-capped-at-1 getting ~6fps on
+# the same class of hardware. Scale the cap to match --threads-per-worker
+# instead of always forcing it to 1.
+os.environ.setdefault("OMP_NUM_THREADS", str(_threads_per_worker))
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(_threads_per_worker))
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", str(_threads_per_worker))
 
 import argparse
 import json
-import math
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -206,7 +250,7 @@ def _build_settings(args):
     return settings
 
 
-def _init_worker(progress_array, worker_slot_counter, stagger_seconds):
+def _init_worker(progress_array, worker_slot_counter, stagger_seconds, threads_per_worker):
     # Claim a slot number and, if staggering, sleep proportionally to it
     # BEFORE this worker's _process_segment call starts spawning its own
     # ffmpeg decode/encode subprocesses. Root cause this addresses: spawning
@@ -225,7 +269,14 @@ def _init_worker(progress_array, worker_slot_counter, stagger_seconds):
         time.sleep(slot * stagger_seconds)
 
     import cv2
-    cv2.setNumThreads(1)  # avoid N processes x M internal cv2 threads oversubscribing cores
+    # Match cv2's own thread pool to the same --threads-per-worker value the
+    # OMP_NUM_THREADS/TF_NUM_INTRAOP_THREADS env vars at module top used for
+    # MediaPipe's TFLite delegate, so both actually agree on how many
+    # threads this worker process is meant to use -- was hardcoded to 1,
+    # which was fine for the old many-single-threaded-workers architecture
+    # but actively wastes cores now that fewer, properly multi-threaded
+    # workers is the validated-faster approach (see module-top comment).
+    cv2.setNumThreads(threads_per_worker)
     global _progress
     _progress = progress_array
 
@@ -235,7 +286,10 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
     import cv2
     import numpy as np
 
-    cv2.setNumThreads(1)
+    # cv2's thread count for this process was already set once in
+    # _init_worker -- no need to redo it per segment (this function only
+    # ever runs once per worker in the current one-segment-per-worker
+    # design anyway).
 
     human_aware = settings.get("human_aware")
     want_landmarks = bool(settings.get("pose_lines") or settings.get("face_contours"))
@@ -391,8 +445,30 @@ def parse_args():
                          help="Opt-in resolution cap. Omit for full source resolution (the default) -- "
                               "unlike the browser version, nothing is capped unless you ask for it.")
     parser.add_argument("--fps", type=float, default=None, help="Override output fps (default: source fps)")
-    parser.add_argument("--workers", type=int, default=os.cpu_count(),
-                         help="Parallel worker processes (default: all CPU cores)")
+    default_workers = max(1, _cores // _threads_per_worker)
+    parser.add_argument("--workers", type=int, default=default_workers,
+                         help=f"Parallel worker processes (default: real cores / threads-per-worker "
+                              f"= {_cores} / {_threads_per_worker} = {default_workers} on this machine). "
+                              f"Uses the container's actual allocation (os.sched_getaffinity), not "
+                              f"os.cpu_count() -- the latter reports the HOST's total inside a container, "
+                              f"which caused a real 128-workers-on-16-real-cores oversubscription bug.")
+    parser.add_argument("--threads-per-worker", type=int, default=_threads_per_worker,
+                         dest="threads_per_worker",
+                         help=f"Threads each worker's cv2/MediaPipe use internally (default: "
+                              f"round(sqrt(real cores)) = {_default_threads_per_worker} on this machine, "
+                              f"balancing process-count overhead against per-process thread-scaling "
+                              f"efficiency). Validated live: 4 workers x 4 threads on 16 real cores hit "
+                              f"~51fps aggregate vs. this same file's old always-1-thread default getting "
+                              f"~6fps on the same class of hardware -- MediaPipe's CPU delegate sizes its "
+                              f"own thread pool independent of cv2.setNumThreads() and scales well with "
+                              f"more threads per process, unlike naively adding more single-threaded "
+                              f"processes, which just oversubscribes past the real core count instead of "
+                              f"adding throughput. NOTE: changing this after cli.py has already started "
+                              f"has no effect on OMP_NUM_THREADS/TF_NUM_INTRAOP_THREADS (module-top comment "
+                              f"explains why those are read from sys.argv directly, before this parser "
+                              f"exists) -- this argument exists so --help/introspection show the value "
+                              f"actually in effect, and so cv2.setNumThreads() inside each worker agrees "
+                              f"with it; to actually change the thread count, pass this flag on every run.")
     parser.add_argument("--worker-stagger", type=float, default=1.0, dest="worker_stagger",
                          help="Seconds to stagger each worker's startup by (worker N waits N * this "
                               "long before spawning its own ffmpeg subprocesses). Confirmed on real "
@@ -448,7 +524,8 @@ def main():
         worker_slot_counter = mp.Value("i", 0)
         total_frames = info["total_frames"]
         with mp.Pool(processes=args.workers, initializer=_init_worker,
-                     initargs=(progress_array, worker_slot_counter, args.worker_stagger)) as pool:
+                     initargs=(progress_array, worker_slot_counter, args.worker_stagger,
+                               args.threads_per_worker)) as pool:
             async_result = pool.map_async(_process_segment_star, job_args)
             start_wall = time.time()
             # One newline-terminated line per update (not an in-place \r bar):
