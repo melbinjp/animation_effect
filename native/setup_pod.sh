@@ -11,9 +11,12 @@
 #     the actual input video, never on source code.
 #   - both requirements files (CLI + webui).
 #
-# Usage (as root on a fresh pod):
-#   curl -fsSL https://raw.githubusercontent.com/melbinjp/animation_effect/main/native/setup_pod.sh | bash
-# or, if you already copied this file up some other way:
+# The repo is private, so cloning needs a key with read access -- this
+# script expects a read-only deploy key already sitting at
+# ~/.ssh/animation_effect_deploy_key on the pod (copy it up with scp
+# before running this, e.g. as part of your own pod-bootstrap sequence).
+# It does NOT fetch itself from a public URL for the same reason; copy this
+# file up (scp/cat via SSH) alongside the deploy key, then:
 #   bash setup_pod.sh
 #
 # Idempotent: safe to re-run on a pod that's already set up (git pulls
@@ -22,18 +25,23 @@
 
 set -e
 
-REPO_URL="https://github.com/melbinjp/animation_effect.git"
+REPO_SSH_URL="git@github.com:melbinjp/animation_effect.git"
 REPO_DIR="/workspace/animation_effect"
+DEPLOY_KEY="$HOME/.ssh/animation_effect_deploy_key"
 
 echo "== apt packages =="
 apt-get update -qq
 apt-get install -y -qq ffmpeg git libegl1 libgl1 libgles2 python3-pip > /dev/null
 
 echo "== repo =="
+if [ -f "$DEPLOY_KEY" ]; then
+  chmod 600 "$DEPLOY_KEY"
+  export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o StrictHostKeyChecking=accept-new"
+fi
 if [ -d "$REPO_DIR/.git" ]; then
   git -C "$REPO_DIR" pull --ff-only
 else
-  git clone --depth 1 "$REPO_URL" "$REPO_DIR"
+  git clone --depth 1 "$REPO_SSH_URL" "$REPO_DIR"
 fi
 
 echo "== python deps =="
