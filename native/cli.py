@@ -21,10 +21,27 @@ guard below is mandatory and the worker function must be a plain
 top-level, picklable callable — not a closure or a bound method.
 """
 
+import os
+
+# Must run before `import human`/`cv2`/mediapipe pull in TFLite's XNNPACK
+# CPU delegate, which auto-sizes its own internal thread pool independent
+# of cv2.setNumThreads(1) below (that call only affects OpenCV's threading,
+# not TFLite's). Confirmed live: going from 8 to 14 worker PROCESSES made
+# throughput WORSE (5.5fps -> ~2.2fps) on this 18-core machine, consistent
+# with each MediaPipe-based worker already running its own multi-threaded
+# CPU inference -- more processes multiplies real OS thread count far past
+# what 18 cores can serve, causing oversubscription/context-switch thrash
+# rather than more throughput. These env vars are the only lever available
+# since the Python Tasks API (mediapipe.tasks.python.BaseOptions) exposes
+# no num_threads parameter to set this directly (checked live: its
+# constructor only takes model_asset_path/model_asset_buffer/delegate).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
 import argparse
 import json
 import math
-import os
 import shutil
 import subprocess
 import sys
@@ -72,8 +89,27 @@ def probe_video(path):
 
 
 def _encoder_extra_args(encoder):
+    # A 90s 1080p ink-line render came out to ~380MB against a 43MB source,
+    # which first looked like a missing-quality-flag bug on h264_qsv (ink
+    # output looks visually simpler than the source footage). Tested against
+    # the actual real ink pixel content (not a synthetic proxy) before
+    # committing to that theory: h264_qsv's plain default (no quality flag)
+    # produced output roughly the SAME size as libx264 -crf 20 on identical
+    # frames, and adding -global_quality 20 made it ~40% LARGER, not
+    # smaller -- the opposite of what a "fix" should do. So the real
+    # explanation is that ink/line-art content (hard binary edges, plus
+    # frame-to-frame edge jitter from source sensor noise amplified through
+    # Canny) is inherently harder for H.264's block-DCT+motion-prediction
+    # model to compress than smooth natural video, regardless of encoder --
+    # the source's small size reflects how well natural video compresses,
+    # not a bitrate target the ink output should also hit. h264_qsv is left
+    # at its plain default rather than an unverified "fix" that measurably
+    # made real content worse.
     if encoder == "h264_nvenc":
-        return ["-preset", "p4", "-cq", "20"]
+        # -rc vbr alongside -cq is the standard, well-documented pairing for
+        # reliable nvenc constant-quality behavior (unlike qsv's
+        # -global_quality above, this one isn't just an untested guess).
+        return ["-preset", "p4", "-rc", "vbr", "-cq", "20"]
     if encoder == "h264_vaapi":
         return ["-vaapi_device", "/dev/dri/renderD128", "-vf", "format=nv12,hwupload"]
     if encoder == "h264_qsv":
@@ -169,7 +205,24 @@ def _build_settings(args):
     return settings
 
 
-def _init_worker(progress_array):
+def _init_worker(progress_array, worker_slot_counter, stagger_seconds):
+    # Claim a slot number and, if staggering, sleep proportionally to it
+    # BEFORE this worker's _process_segment call starts spawning its own
+    # ffmpeg decode/encode subprocesses. Root cause this addresses: spawning
+    # --workers processes each of which also spawns 2 ffmpeg children means
+    # up to 3x --workers process-creation calls landing in a tight burst;
+    # confirmed live on this machine that a large burst (18 workers, ~54
+    # process creations) can hit a Windows-specific ceiling
+    # (`OSError: [WinError 1450] Insufficient system resources`) well before
+    # actual RAM or CPU are exhausted. Spreading worker startup out removes
+    # the burst without touching any per-frame processing -- same pixels,
+    # same settings, just not all-at-once.
+    with worker_slot_counter.get_lock():
+        slot = worker_slot_counter.value
+        worker_slot_counter.value += 1
+    if stagger_seconds > 0 and slot > 0:
+        time.sleep(slot * stagger_seconds)
+
     import cv2
     cv2.setNumThreads(1)  # avoid N processes x M internal cv2 threads oversubscribing cores
     global _progress
@@ -221,6 +274,7 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
             rgba = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 4))
 
             frame_settings = settings
+            rgb_for_human = None
             if human_aware:
                 rgb_for_human = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
                 human_result = human_mod.infer_human(rgb_for_human, src_w, src_h, settings, use_video_mode=True)
@@ -231,7 +285,10 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
                 else:
                     frame_settings["human_aware"] = False
 
-            out_rgb = pipeline.process_frame(rgba, frame_settings)
+            # Pass the RGB conversion already computed above (when
+            # human-aware) so process_frame doesn't redo the identical
+            # cv2.cvtColor call a second time -- same bytes either way.
+            out_rgb = pipeline.process_frame(rgba, frame_settings, rgb=rgb_for_human)
             if (out_w, out_h) != (src_w, src_h):
                 out_rgb = cv2.resize(out_rgb, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
@@ -325,6 +382,14 @@ def parse_args():
     parser.add_argument("--fps", type=float, default=None, help="Override output fps (default: source fps)")
     parser.add_argument("--workers", type=int, default=os.cpu_count(),
                          help="Parallel worker processes (default: all CPU cores)")
+    parser.add_argument("--worker-stagger", type=float, default=1.0, dest="worker_stagger",
+                         help="Seconds to stagger each worker's startup by (worker N waits N * this "
+                              "long before spawning its own ffmpeg subprocesses). Confirmed on real "
+                              "hardware that launching many workers (each of which also spawns 2 "
+                              "ffmpeg children) in one burst can hit a Windows process-creation limit "
+                              "well before RAM/CPU are actually exhausted; spreading startup out avoids "
+                              "it at the cost of a few extra seconds before full parallelism kicks in "
+                              "-- negligible next to render time. Set to 0 to disable.")
     parser.add_argument("--encoder", default="auto", choices=["auto", "nvenc", "vaapi", "qsv", "libx264"],
                          help="Video encoder. 'auto' tries hardware encoders in order and falls back to libx264.")
     parser.add_argument("--gpu-filter", action="store_true", dest="gpu_filter",
@@ -369,8 +434,10 @@ def main():
 
         import multiprocessing as mp
         progress_array = mp.Array("i", len(segments))
+        worker_slot_counter = mp.Value("i", 0)
         total_frames = info["total_frames"]
-        with mp.Pool(processes=args.workers, initializer=_init_worker, initargs=(progress_array,)) as pool:
+        with mp.Pool(processes=args.workers, initializer=_init_worker,
+                     initargs=(progress_array, worker_slot_counter, args.worker_stagger)) as pool:
             async_result = pool.map_async(_process_segment_star, job_args)
             start_wall = time.time()
             # One newline-terminated line per update (not an in-place \r bar):

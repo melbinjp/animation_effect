@@ -48,11 +48,17 @@ def _remove_small_components(edges, min_area):
     return edges
 
 
-def process_frame(rgba, settings):
+def process_frame(rgba, settings, rgb=None):
     """rgba: (H, W, 4) uint8 array (RGBA, matching the browser's ImageData
     layout — the alpha channel is dropped immediately, same as worker.js's
-    cv.COLOR_RGBA2RGB). Returns an (H, W, 3) uint8 RGB image."""
-    rgb = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
+    cv.COLOR_RGBA2RGB). Returns an (H, W, 3) uint8 RGB image.
+
+    rgb: pass the RGBA->RGB conversion of this same frame if the caller
+    already computed it (e.g. for human-aware segmentation, which needs its
+    own RGB copy) to skip redoing the exact same cv2.cvtColor call twice per
+    frame -- bit-identical either way, this only avoids the duplicate work."""
+    if rgb is None:
+        rgb = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
 
     if settings.get("white_balance"):
         rgb = apply_gray_world(rgb)
