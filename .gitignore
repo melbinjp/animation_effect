@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.hypothesis/
 dummy.mp4
 node_modules/

@@ -1,0 +1,9 @@
+# opencv-python is deliberately not listed here: mediapipe pulls in its own
+# opencv-contrib-python as a dependency, and installing both packages
+# side-by-side (they both provide the `cv2` module) risks a broken or
+# inconsistent cv2 install depending on install order. Let mediapipe manage
+# it -- confirmed during this port that mediapipe's pulled-in cv2 is a
+# strict superset (opencv-contrib-python includes everything in
+# opencv-python plus more).
+numpy
+mediapipe
