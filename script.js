@@ -2399,6 +2399,15 @@ async function renderVideoExport(resumeJob) {
                             try {
                                 throwIfCancelled();
                                 offCanvas = document.createElement('canvas');
+                                // Establish this canvas's context with the flag
+                                // *before* drawMediaToCanvas's own unflagged
+                                // getContext('2d') call below does — a canvas's
+                                // context is created once, and drawMediaToCanvas
+                                // (a write-only drawImage call, correctly
+                                // unflagged everywhere else it's used) would
+                                // otherwise win that race here, since renderToData
+                                // reads this same canvas moments later.
+                                offCanvas.getContext('2d', { willReadFrequently: true });
                                 await seekVideo(vEl, frameTime);
                                 ({ width: capturedW, height: capturedH } =
                                     drawMediaToCanvas(
