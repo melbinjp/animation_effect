@@ -17,9 +17,18 @@ const SEG_MODEL = new URL('mediapipe/models/selfie_multiclass_256x256.tflite', i
 const POSE_MODEL = new URL('mediapipe/models/pose_landmarker_lite.task', import.meta.url).href;
 const FACE_MODEL = new URL('mediapipe/models/face_landmarker.task', import.meta.url).href;
 
-let engines = null;
-let loadPromise = null;
+// Two independent sets of engines, one per MediaPipe running mode. VIDEO mode
+// is stateful (tracking assumes strictly-increasing timestamps on the same
+// instance, in the same order frames actually occur), so it's only correct
+// for a genuinely sequential stream — live camera/screen capture. Batch video
+// export processes frames concurrently across a decode pool for throughput,
+// which is fundamentally incompatible with that assumption, so it stays on
+// IMAGE mode. A single instance can't switch modes after creation, hence two
+// caches rather than one.
+const engineCache = { IMAGE: null, VIDEO: null };
+const loadPromise = { IMAGE: null, VIDEO: null };
 let wantLandmarks = false;
+let videoTimestampMs = 0;
 
 function quietLogs() {
     if (typeof window === 'undefined' || window.__lineartyQuiet) return;
@@ -53,14 +62,14 @@ function skipLandmarks() {
 
 const emptyDetect = { detect: () => ({ landmarks: [], faceLandmarks: [] }) };
 
-async function createWithDelegate(delegate) {
+async function createWithDelegate(delegate, mode) {
     const wasm = await FilesetResolver.forVisionTasks(WASM_PATH);
     const common = { delegate };
     const loadPose = wantLandmarks && !skipLandmarks();
     const [seg, pose, face] = await Promise.all([
         ImageSegmenter.createFromOptions(wasm, {
             baseOptions: { modelAssetPath: SEG_MODEL, ...common },
-            runningMode: 'IMAGE',
+            runningMode: mode,
             // Confidence masks (one float32 mask per class), not the hard
             // categoryMask: upsampling a per-class confidence value with
             // bilinear interpolation is correct; interpolating between two
@@ -72,7 +81,7 @@ async function createWithDelegate(delegate) {
         loadPose
             ? PoseLandmarker.createFromOptions(wasm, {
                 baseOptions: { modelAssetPath: POSE_MODEL, ...common },
-                runningMode: 'IMAGE',
+                runningMode: mode,
                 numPoses: 2,
                 minPoseDetectionConfidence: 0.35,
                 minPosePresenceConfidence: 0.35,
@@ -82,7 +91,7 @@ async function createWithDelegate(delegate) {
         loadPose
             ? FaceLandmarker.createFromOptions(wasm, {
                 baseOptions: { modelAssetPath: FACE_MODEL, ...common },
-                runningMode: 'IMAGE',
+                runningMode: mode,
                 numFaces: 2,
                 minFaceDetectionConfidence: 0.4,
                 minFacePresenceConfidence: 0.4,
@@ -102,29 +111,33 @@ async function createWithDelegate(delegate) {
     };
 }
 
+// options.mode: 'IMAGE' (default) or 'VIDEO'. Pass 'VIDEO' only for a
+// genuinely sequential stream — see the engineCache comment above.
 export async function ensureHuman(options = {}) {
+    const mode = options.mode === 'VIDEO' ? 'VIDEO' : 'IMAGE';
     if (options.landmarks) wantLandmarks = true;
-    if (engines && (!wantLandmarks || engines.poseConn.length)) return true;
+    const cached = engineCache[mode];
+    if (cached && (!wantLandmarks || cached.poseConn.length)) return true;
     quietLogs();
-    if (!loadPromise || (wantLandmarks && engines && !engines.poseConn.length)) {
-        engines = null;
-        loadPromise = (async () => {
+    if (!loadPromise[mode] || (wantLandmarks && cached && !cached.poseConn.length)) {
+        engineCache[mode] = null;
+        loadPromise[mode] = (async () => {
             try {
-                engines = await createWithDelegate('GPU');
-                return engines;
+                engineCache[mode] = await createWithDelegate('GPU', mode);
+                return engineCache[mode];
             } catch {
                 try {
-                    engines = await createWithDelegate('CPU');
-                    return engines;
+                    engineCache[mode] = await createWithDelegate('CPU', mode);
+                    return engineCache[mode];
                 } catch (err) {
                     console.warn('Linearty: body maps unavailable', err);
-                    engines = null;
+                    engineCache[mode] = null;
                     return null;
                 }
             }
         })();
     }
-    return !!(await loadPromise);
+    return !!(await loadPromise[mode]);
 }
 
 // Upsamples the model's 6 per-class confidence channels with bilinear
@@ -209,13 +222,21 @@ function drawConnections(buf, w, h, landmarks, connections, radius, val, minVis 
     }
 }
 
-export function inferHuman(image, width, height, settings) {
+// useVideoMode: true for a genuinely sequential stream (live camera/screen
+// capture, already processed one frame at a time) — uses segmentForVideo/
+// detectForVideo with a monotonically increasing timestamp, MediaPipe's own
+// documented mode for video frame sequences, which also enables tracking
+// continuity between frames. False (default) for batch export and single
+// images, where IMAGE mode's per-call independence is what's actually true.
+export function inferHuman(image, width, height, settings, useVideoMode = false) {
+    const mode = useVideoMode ? 'VIDEO' : 'IMAGE';
+    const engines = engineCache[mode];
     if (!engines || !settings.humanAware) return null;
     try {
         const { seg, pose, face } = engines;
         let classMask = new Uint8Array(width * height);
         let copied = false;
-        seg.segment(image, (result) => {
+        const onSegmentResult = (result) => {
             const masks = result.confidenceMasks;
             if (!masks || masks.length === 0) return;
             const mw = masks[0].width;
@@ -227,7 +248,13 @@ export function inferHuman(image, width, height, settings) {
             // target pixels align. See upsampleClassesBilinear.
             classMask = upsampleClassesBilinear(channels, mw, mh, width, height);
             copied = true;
-        });
+        };
+        if (useVideoMode) {
+            videoTimestampMs += 1;
+            seg.segmentForVideo(image, videoTimestampMs, onSegmentResult);
+        } else {
+            seg.segment(image, onSegmentResult);
+        }
         if (!copied) return null;
         let person = 0;
         for (let i = 0; i < classMask.length; i++) {
@@ -236,13 +263,13 @@ export function inferHuman(image, width, height, settings) {
         const personRatio = person / Math.max(1, classMask.length);
         const extraLines = new Uint8Array(width * height);
         if (settings.poseLines && pose && engines.poseConn.length) {
-            const poses = pose.detect(image);
+            const poses = useVideoMode ? pose.detectForVideo(image, videoTimestampMs) : pose.detect(image);
             for (const lm of poses.landmarks || []) {
                 drawConnections(extraLines, width, height, lm, engines.poseConn, 1.35, 220, 0.4);
             }
         }
         if (settings.faceContours && face && engines.faceContours.length) {
-            const faces = face.detect(image);
+            const faces = useVideoMode ? face.detectForVideo(image, videoTimestampMs) : face.detect(image);
             for (const lm of faces.faceLandmarks || []) {
                 drawConnections(extraLines, width, height, lm, engines.faceContours, 0.9, 255, 0);
                 drawConnections(extraLines, width, height, lm, engines.faceLips, 0.7, 200, 0);

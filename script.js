@@ -618,13 +618,21 @@ class LineArtProcessor {
     // that is genuinely re-rendering one static, unchanging frame (the seek-bar
     // preview) should pass true; every frame-advancing loop (live capture,
     // live playback, batch export) must pass false or omit it, or the cached
-    // mask goes stale against a moving subject. See inferCachedHuman.
+    // mask goes stale against a moving subject.
+    //
+    // opts.videoMode defaults to false too — pass true only for a genuinely
+    // sequential, one-frame-at-a-time-awaited loop (live capture, live
+    // playback); never for batch export's concurrent decode pool. See
+    // inferCachedHuman for why these two are independent.
     async renderToData(sourceCanvas, settings, opts = {}) {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
         const payload = { ...settings };
         try {
-            const human = await inferCachedHuman(sourceCanvas, width, height, settings, !!opts.allowHumanCache);
+            const human = await inferCachedHuman(
+                sourceCanvas, width, height, settings,
+                !!opts.allowHumanCache, !!opts.videoMode
+            );
             if (human) {
                 payload.classMask = human.classMask;
                 payload.extraLines = human.extraLines;
@@ -847,10 +855,23 @@ function fingerprintPixels(data, w, h) {
 // as ghosting/blur on anything moving. Defaulting allowCache to false at
 // every call site means a future caller I haven't accounted for fails safe
 // (always fresh inference) instead of silently reintroducing this bug.
-async function inferCachedHuman(canvas, width, height, settings, allowCache = false) {
+//
+// videoMode: independent from allowCache. MediaPipe's VIDEO running mode
+// assumes strictly sequential, strictly increasing-timestamp calls — true
+// for a loop that processes and awaits one frame at a time (live camera/
+// screen capture, live playback), never true for batch export's concurrent
+// decode pool. So a call site can be cache-skip + VIDEO mode (live capture),
+// cache-skip + IMAGE mode (batch export), or cache-allow + IMAGE mode
+// (renderPreview's single static frame) — never cache-allow + VIDEO mode,
+// since nothing sequential ever needs the cache. See human.js's engineCache.
+async function inferCachedHuman(canvas, width, height, settings, allowCache = false, videoMode = false) {
     if (!settings.humanAware) return null;
     const mod = await loadHumanModule();
-    const ok = await mod.ensureHuman({ landmarks: !!(settings.poseLines || settings.faceContours) });
+
+    const ok = await mod.ensureHuman({
+        landmarks: !!(settings.poseLines || settings.faceContours),
+        mode: videoMode ? 'VIDEO' : 'IMAGE',
+    });
     if (!ok) return null;
 
     let fp = null;
@@ -871,7 +892,7 @@ async function inferCachedHuman(canvas, width, height, settings, allowCache = fa
         }
     }
 
-    const maps = mod.inferHuman(canvas, width, height, settings);
+    const maps = mod.inferHuman(canvas, width, height, settings, videoMode);
     if (maps) {
         if (allowCache) {
             state.humanCache = {
@@ -932,6 +953,13 @@ function applyHumanPresetSliders(presetKey) {
         classic: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
         ultimate: { skinSmooth: 0.8, hairBoost: 1.32, silhouetteBoost: 0.72, subjectIsolation: 0.38 },
         studio: { skinSmooth: 0.78, hairBoost: 1.32, silhouetteBoost: 0.82, subjectIsolation: 0.38 },
+        // Pencil had no entry here at all — it silently inherited ultimate's
+        // values, tuned for a bolder line (xdogPhi 210 vs pencil's 70). A
+        // softer line makes ultimate's hair/silhouette boost overshoot more
+        // visibly, which is what the artifacts reported against pencil
+        // specifically were partly a symptom of. Scaled gentler throughout
+        // to match pencil's already-soft character.
+        pencil: { skinSmooth: 0.72, hairBoost: 1.2, silhouetteBoost: 0.6, subjectIsolation: 0.26 },
     };
     const vals = table[presetKey] || table.ultimate;
     const setSlider = (el, spanId, value) => {
@@ -959,8 +987,9 @@ async function playLiveVideo() {
         while (state.livePlay && !state.cancelRequested && !video.paused && !video.ended) {
             throwIfCancelled();
             drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
-            // Sequential playback of a real motion sequence — never cache.
-            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false });
+            // Sequential playback of a real motion sequence — never cache,
+            // and genuinely sequential enough to also benefit from VIDEO mode.
+            await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false, videoMode: true });
             paintLiveCapture();
             if (elements.videoSeeker) {
                 elements.videoSeeker.value = String(video.currentTime);
@@ -1578,8 +1607,9 @@ async function renderPreview() {
     throwIfCancelled();
     // The one caller where the same static frame genuinely can be re-rendered
     // unchanged (a settings tweak, re-selecting the same scrub position) —
-    // caching here is correct, not the bug the other three callers had.
-    await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: true });
+    // caching here is correct, not the bug the other three callers had. Not
+    // sequential, so IMAGE mode (the default) is the correct running mode too.
+    await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: true, videoMode: false });
     paintLiveCapture();
     clearRenderedOutput();
     setResultGlow(true);
@@ -2447,7 +2477,10 @@ async function renderVideoExport(resumeJob) {
                         // source video — never cache (this was the actual bug:
                         // fileKind === 'video' let this hit the cache before,
                         // reusing a stale human mask against a moving subject).
-                        let rawData = await processor.renderToData(offCanvas, settings, { allowHumanCache: false });
+                        // videoMode stays false: this loop processes frames
+                        // concurrently across a decode pool, which breaks VIDEO
+                        // mode's strictly-sequential-timestamp assumption.
+                        let rawData = await processor.renderToData(offCanvas, settings, { allowHumanCache: false, videoMode: false });
                         offCanvas = null; // release canvas backing store immediately
 
                         throwIfCancelled();
@@ -2780,8 +2813,8 @@ async function runLiveSource(stream, { label, fileName, successMessage }) {
     while (state.cameraLoop && !state.cancelRequested) {
         throwIfCancelled();
         drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
-        // Live camera/screen capture — never cache (unchanged behavior, now stated explicitly).
-        await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false });
+        // Live camera/screen capture — never cache, and sequential enough for VIDEO mode.
+        await processor.render(elements.sourceCanvas, elements.outputCanvas, getSettings(), { allowHumanCache: false, videoMode: true });
         paintLiveCapture();
     }
 }
