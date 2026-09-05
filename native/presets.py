@@ -203,7 +203,13 @@ HUMAN_TUNING = {
     "neon": {"skin_smooth": 0.55, "hair_boost": 1.32, "silhouette_boost": 0.88, "subject_isolation": 0.55},
     "blueprint": {"skin_smooth": 0.76, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.18},
     "classic": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.38},
-    "ultimate": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.38},
+    # subject_isolation raised from script.js's 0.38 -- deliberate divergence,
+    # not a port error: user feedback after reviewing a real RVM-based render
+    # was that the background still drew too much attention (residual noise/
+    # jitter there), asking for it quieted further. The website's own
+    # MediaPipe-based rendering wasn't reported as having this problem, so
+    # left unchanged there -- this bump is specific to the native pipeline.
+    "ultimate": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.46},
     "studio": {"skin_smooth": 0.78, "hair_boost": 1.32, "silhouette_boost": 0.82, "subject_isolation": 0.38},
     # Gentler throughout to match pencil's already-soft line (xdog_phi 70 vs.
     # ultimate's 210) — see the matching comment in script.js.

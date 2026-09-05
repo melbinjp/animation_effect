@@ -120,7 +120,11 @@ def process_frame(rgba, settings, rgb=None):
 
     new_prev_gray = gray
     if settings.get("temporal_denoise"):
-        gray = temporal_denoise_gray(gray, settings.get("prev_gray"))
+        gray = temporal_denoise_gray(
+            gray, settings.get("prev_gray"),
+            motion_threshold=settings.get("temporal_motion_threshold", 13.0),
+            base_alpha=settings.get("temporal_base_alpha", 0.6),
+        )
         new_prev_gray = gray
 
     # Three-stage adaptive normalize — see worker.js's comment for the full

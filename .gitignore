@@ -5,3 +5,4 @@ __pycache__/
 dummy.mp4
 node_modules/
 native/webui_job_*.log
+native/webui_uploads/

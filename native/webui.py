@@ -1,4 +1,4 @@
-"""Minimal local browser UI for cli.py.
+"""Minimal browser UI for cli.py -- local by default, remotely usable too.
 
 Picks a video + settings, launches a render as a plain subprocess -- the
 exact same `python cli.py ...` command you'd type by hand -- and shows live
@@ -6,32 +6,50 @@ progress parsed straight from cli.py's own "Progress: ..." log lines. No
 separate progress-tracking mechanism to keep in sync with cli.py; if cli.py's
 progress line format ever changes, update PROGRESS_RE to match.
 
-Local-only by design: binds to 127.0.0.1. This is a one-person tool for
-driving a script on your own machine/server, not a multi-user service -- no
-auth, and job state lives in memory (lost on restart, which is fine for a
-render you're actively watching in the same browser tab).
+Two ways to point it at an input video:
+  - a server-local path (same machine/pod as this script) -- fastest, no
+    copy needed
+  - a browser file upload (POST /upload) -- for when the browser is on a
+    different machine than the one running this script (e.g. driving a
+    rented pod's webui from your own PC): the file is saved server-side and
+    the returned path is used exactly like a typed-in path would be.
+
+Local-only by design, same as before: binds to 127.0.0.1. To reach it from
+your own PC when it's actually running on a rented pod, use an SSH local
+port-forward (`ssh -L 8765:localhost:8765 ...`) rather than exposing this
+on a public port -- SSH's own key auth secures the connection, so this
+script itself still needs no auth of its own, same threat model as
+"local-only" always had. Don't pass --host 0.0.0.0 to expose this
+directly on a public interface; it accepts uploads and runs subprocesses
+with no login of its own.
+
+Job state lives in memory -- lost on restart, which is fine for a render
+you're actively watching in the same browser tab.
 
 Run with: python webui.py [--host 127.0.0.1] [--port 8765]
-Then open http://127.0.0.1:8765/ in a browser.
+Then open http://127.0.0.1:8765/ in a browser (or, over an SSH tunnel from
+another machine, whatever local port you forwarded).
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from presets import STYLE_PRESETS
 
 NATIVE_DIR = Path(__file__).resolve().parent
 CLI_PATH = NATIVE_DIR / "cli.py"
-WEBSITE_DIR = NATIVE_DIR.parent  # the browser app's own index.html/style.css live here
+WEBSITE_DIR = NATIVE_DIR.parent  # the browser app's own index.html/style.css live here, when present
+UPLOAD_DIR = NATIVE_DIR / "webui_uploads"
 
 app = FastAPI()
 jobs = {}  # job_id -> dict(process, log_path, output_path, cmd, start_time, cancelled)
@@ -88,9 +106,30 @@ def index():
 def website_stylesheet():
     # Reuses the actual browser app's stylesheet (one directory up) so this
     # job-launcher page shares its exact color/type/component language
-    # instead of drifting into its own separate look.
+    # instead of drifting into its own separate look. Falls back to a
+    # minimal inline-equivalent palette when running somewhere that doesn't
+    # have the full repo checked out (e.g. a rented pod with just native/
+    # uploaded) -- same class names, so the page still renders sensibly.
     css_path = WEBSITE_DIR / "style.css"
-    return Response(css_path.read_text(encoding="utf-8"), media_type="text/css")
+    if css_path.is_file():
+        return Response(css_path.read_text(encoding="utf-8"), media_type="text/css")
+    return Response(FALLBACK_CSS, media_type="text/css")
+
+
+@app.post("/upload")
+def upload_video(file: UploadFile = File(...)):
+    """For when the browser driving this page is on a different machine
+    than the one running it (e.g. this webui running on a rented pod,
+    reached from your own PC over an SSH tunnel) -- your local file paths
+    don't exist on the pod's filesystem, so the file has to actually be
+    uploaded, not just referenced by path. Saves under webui_uploads/ and
+    returns that server-side path, which the page then fills into the
+    input path field exactly as if you'd typed it."""
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"path": str(dest)}
 
 
 @app.post("/jobs")
@@ -200,6 +239,41 @@ def cancel_job(job_id: str):
     return {"ok": True}
 
 
+FALLBACK_CSS = """
+:root {
+  --bg: #f4efe6; --bg-strong: #e7ddd0; --surface: #faf6ee; --surface-strong: #fffaf2;
+  --ink: #16212f; --ink-soft: #6e655b; --accent: #b85c38; --accent-strong: #8b3e1f;
+  --line: color-mix(in oklab, #16212f 12%, transparent);
+  --success: #1f6b4f; --warn: #a35a1c; --radius: 16px; --radius-sm: 12px;
+  --font-sans: "Outfit", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --font-display: "Fraunces", "Iowan Old Style", Palatino, Georgia, serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font-family: var(--font-sans); color: var(--ink); background: var(--bg); }
+h1, h2 { font-family: var(--font-display); font-weight: 500; }
+.page-shell { width: min(80rem, calc(100% - 2rem)); margin: 0 auto; padding: 0 0 2.5rem; }
+.site-header { display: flex; flex-direction: column; gap: 0.75rem; padding: 0.85rem 0 1rem; border-bottom: 1px solid var(--line); }
+.brand-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.brand-mark { display: flex; align-items: center; gap: 0.75rem; }
+.brand-icon { display: grid; place-items: center; width: 2.5rem; height: 2.5rem; border-radius: 12px; background: var(--accent); color: #fff8f2; }
+.eyebrow { margin: 0; font-size: 0.7rem; font-weight: 600; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
+.brand-name { margin: 0; font-family: var(--font-display); font-size: 1.1rem; }
+.hero h1 { font-size: 1.4rem; margin: 0.75rem 0 0.4rem; }
+.hero-copy { color: var(--ink-soft); line-height: 1.5; margin: 0; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.controls-panel { padding: 1rem; }
+.panel-heading h2 { margin: 0; font-size: 0.95rem; }
+.panel-heading p { margin: 0.35rem 0 0; color: var(--ink-soft); }
+.control-group, .control-grid { margin-top: 1rem; }
+.control-group label, .control-grid label { display: block; margin-bottom: 8px; font-weight: 600; }
+.control-group input, .control-group select, .control-grid select { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: #fff; color: var(--ink); }
+.control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 1.15rem; }
+.primary-button, .secondary-button { border: none; border-radius: 12px; padding: 11px 16px; min-height: 44px; cursor: pointer; font-weight: 500; }
+.primary-button { background: var(--ink); color: #fff; }
+.secondary-button { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+"""
+
 PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -262,8 +336,13 @@ PAGE_TEMPLATE = """<!doctype html>
     </div>
     <form id="renderForm">
       <div class="control-group">
-        <label for="input_path">Input video path</label>
+        <label for="input_path">Input video path (server-local)</label>
         <input type="text" id="input_path" name="input_path" placeholder="C:\\path\\to\\input.mp4" required>
+      </div>
+      <div class="control-group">
+        <label for="upload_file">...or upload from this browser (if it's on a different machine than this server, e.g. driving a rented pod over an SSH tunnel)</label>
+        <input type="file" id="upload_file" accept="video/*">
+        <div id="uploadStatus" style="margin-top:0.4rem;font-size:0.85rem;color:var(--ink-soft);"></div>
       </div>
       <div class="control-group">
         <label for="output_path">Output path (optional — defaults to same folder, "_linearty" suffix)</label>
@@ -330,6 +409,27 @@ const knownJobs = JSON.parse(localStorage.getItem('linearty_jobs') || '[]');
 function saveKnownJobs() {
   localStorage.setItem('linearty_jobs', JSON.stringify(knownJobs));
 }
+
+document.getElementById('upload_file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const statusEl = document.getElementById('uploadStatus');
+  statusEl.textContent = `Uploading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)...`;
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.path) {
+      document.getElementById('input_path').value = data.path;
+      statusEl.textContent = `Uploaded -- server path: ${data.path}`;
+    } else {
+      statusEl.textContent = 'Upload failed.';
+    }
+  } catch (err) {
+    statusEl.textContent = `Upload failed: ${err}`;
+  }
+});
 
 function jobCard(jobId) {
   let el = document.getElementById('job-' + jobId);

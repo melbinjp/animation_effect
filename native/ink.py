@@ -35,7 +35,7 @@ def clamp01(arr):
     return np.clip(arr, 0.0, 1.0)
 
 
-def temporal_denoise_gray(gray, prev_gray, motion_threshold=18.0, base_alpha=0.55):
+def temporal_denoise_gray(gray, prev_gray, motion_threshold=13.0, base_alpha=0.6):
     """Motion-adaptive temporal smoothing on the pre-Canny grayscale image --
     the architecturally correct fix for edge jitter, per this project's own
     measurements: denoising AFTER Canny (on the already-binarized ink
