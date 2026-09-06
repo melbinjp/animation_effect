@@ -121,6 +121,7 @@
                         <option value="pencil">Soft pencil</option>
                         <option value="neon">Neon Pop</option>
                         <option value="warm">Warm Sketch</option>
+                        <option value="body">Body Map</option>
                         <option value="vivid">Vivid Toon</option>
                         <option value="blueprint">Blueprint Draft</option>
                         <option value="classic">Classic Canny</option>
@@ -134,6 +135,7 @@
                         <button type="button" class="preset-chip" data-preset="manga">Manga</button>
                         <button type="button" class="preset-chip" data-preset="pencil">Soft pencil</button>
                         <button type="button" class="preset-chip" data-preset="warm">Warm</button>
+                        <button type="button" class="preset-chip" data-preset="body">Body Map</button>
                         <button type="button" class="preset-chip" data-preset="neon">Neon</button>
                         <button type="button" class="preset-chip" data-preset="vivid">Vivid</button>
                         <button type="button" class="preset-chip" data-preset="blueprint">Blueprint</button>
@@ -297,6 +299,12 @@
                     <div class="custom-slider-row" id="colorEdgesOpacityRow" hidden>
                         <label for="customColorOpacity">Color opacity <span id="customColorOpacityVal">100</span>%</label>
                         <input type="range" id="customColorOpacity" min="0" max="100" value="100">
+                    </div>
+                    <div class="custom-toggle-row">
+                        <label for="customBodyMapOverlay" class="toggle-label">
+                            <input type="checkbox" id="customBodyMapOverlay">
+                            Body map overlay <span class="toggle-hint">(blend multi-class body segmentation map over ink output)</span>
+                        </label>
                     </div>
                 </div>
 

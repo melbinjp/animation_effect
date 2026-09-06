@@ -242,16 +242,38 @@ const STYLE_PRESETS = {
         cleanSpeckles: false,
         mergeDoubleEdge: false
     },
+    body: {
+        label: 'Body Map',
+        engine: 'ultimate',
+        background: [255, 247, 232],
+        ink: [92, 44, 18],
+        lowThreshold: 32,
+        highThreshold: 104,
+        bilateralDiameter: 7,
+        sigma: 58,
+        smoothPasses: 1,
+        xdogSigma: 0.92,
+        xdogTau: 0.976,
+        xdogPhi: 160,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false,
+        bodyMapOverlay: true
+    },
     custom: {
         label: 'Custom / Experiment',
-        engine: 'classic',
-        background: [255, 255, 255],
-        ink: [0, 0, 0],
-        lowThreshold: 60,
-        highThreshold: 180,
-        bilateralDiameter: 13,
-        sigma: 90,
-        smoothPasses: 2
+        engine: 'ultimate',
+        background: [255, 247, 232],
+        ink: [92, 44, 18],
+        lowThreshold: 32,
+        highThreshold: 104,
+        bilateralDiameter: 7,
+        sigma: 58,
+        smoothPasses: 1,
+        xdogSigma: 0.92,
+        xdogTau: 0.976,
+        xdogPhi: 160,
+        cleanSpeckles: true,
+        mergeDoubleEdge: false
     }
 };
 
@@ -1064,12 +1086,17 @@ function hexToRgb(hex) {
 function getCustomPreset() {
     return {
         label: 'Custom / Experiment',
+        engine: 'ultimate',
         background: hexToRgb(document.getElementById('customBg').value),
         ink: hexToRgb(document.getElementById('customInk').value),
         lowThreshold: Number(document.getElementById('customLowThresh').value),
         highThreshold: Number(document.getElementById('customHighThresh').value),
         bilateralDiameter: Number(document.getElementById('customBilateral').value),
-        sigma: Number(document.getElementById('customSigma').value)
+        sigma: Number(document.getElementById('customSigma').value),
+        xdogSigma: 0.92,
+        xdogTau: 0.976,
+        xdogPhi: 160,
+        bodyMapOverlay: !!(document.getElementById('customBodyMapOverlay') && document.getElementById('customBodyMapOverlay').checked)
     };
 }
 
@@ -1099,8 +1126,11 @@ function getSettings() {
         videoFps: fps,
         isOriginalFps: elements.videoFps.value === 'original',
         customMode: presetKey === 'custom',
-        engine: preset.engine || (presetKey === 'custom' ? 'classic' : 'ultimate'),
+        engine: preset.engine || (presetKey === 'custom' ? 'ultimate' : 'ultimate'),
         whiteBalance: presetKey !== 'custom',
+        bodyMapOverlay: presetKey === 'custom'
+            ? !!(document.getElementById('customBodyMapOverlay') && document.getElementById('customBodyMapOverlay').checked)
+            : !!preset.bodyMapOverlay,
         useBilateral: presetKey === 'custom' && document.getElementById('customUseBilateral').checked,
         bilateralPasses: Number(document.getElementById('customBilateralPasses').value),
         useGaussian: presetKey === 'custom' && document.getElementById('customUseGaussian').checked,
@@ -3332,7 +3362,7 @@ elements.videoSeeker.addEventListener('change', async () => {
 });
 
 // Custom preset controls: update live labels and re-preview on change
-const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customAutoNormalize', 'customDarkBoost', 'customDarkBoostClip', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity', 'customColorEdges', 'customColorLowThresh', 'customColorHighThresh', 'customColorLineWeight', 'customColorSoftness', 'customColorOpacity'];
+const customInputIds = ['customBg', 'customInk', 'customLowThresh', 'customHighThresh', 'customBilateral', 'customSigma', 'customUseBilateral', 'customBilateralPasses', 'customUseGaussian', 'customGaussianPasses', 'customUseMedian', 'customMedianPasses', 'customCleanSpeckles', 'customCleanSpecklesIntensity', 'customAutoNormalize', 'customDarkBoost', 'customDarkBoostClip', 'customMergeDoubleEdge', 'customMergeDoubleEdgeIntensity', 'customColorEdges', 'customColorLowThresh', 'customColorHighThresh', 'customColorLineWeight', 'customColorSoftness', 'customColorOpacity', 'customBodyMapOverlay'];
 const customValueSpans = {
     customLowThresh: document.getElementById('customLowThreshVal'),
     customHighThresh: document.getElementById('customHighThreshVal'),

@@ -1,11 +1,4 @@
-"""Direct port of STYLE_PRESETS and the human-aware tuning table from
-script.js. Kept as plain dicts, not classes — mirrors the JS object literals
-exactly so the two can be diffed against each other by eye.
-
-If script.js's STYLE_PRESETS or applyHumanPresetSliders table ever change,
-this file needs the same edit made here too — there is no single shared
-source of truth between the browser and native versions.
-"""
+"""Style presets and human-aware segmentation tuning parameters."""
 
 STYLE_PRESETS = {
     "ultimate": {
@@ -181,40 +174,59 @@ STYLE_PRESETS = {
         "clean_speckles": False,
         "merge_double_edge": False,
     },
+    "body": {
+        "label": "Body Map",
+        "engine": "ultimate",
+        "background": (255, 247, 232),
+        "ink": (92, 44, 18),
+        "low_threshold": 32,
+        "high_threshold": 104,
+        "bilateral_diameter": 7,
+        "sigma": 58,
+        "smooth_passes": 1,
+        "xdog_sigma": 0.92,
+        "xdog_tau": 0.976,
+        "xdog_phi": 160,
+        "clean_speckles": True,
+        "merge_double_edge": False,
+        "body_map_overlay": True,
+    },
     "custom": {
         "label": "Custom / Experiment",
-        "engine": "classic",
-        "background": (255, 255, 255),
-        "ink": (0, 0, 0),
-        "low_threshold": 60,
-        "high_threshold": 180,
-        "bilateral_diameter": 13,
-        "sigma": 90,
-        "smooth_passes": 2,
+        "engine": "ultimate",
+        "background": (255, 247, 232),
+        "ink": (92, 44, 18),
+        "low_threshold": 32,
+        "high_threshold": 104,
+        "bilateral_diameter": 7,
+        "sigma": 58,
+        "smooth_passes": 1,
+        "xdog_sigma": 0.92,
+        "xdog_tau": 0.976,
+        "xdog_phi": 160,
+        "clean_speckles": True,
+        "merge_double_edge": False,
     },
 }
 
-# From applyHumanPresetSliders (script.js). A preset with no entry here falls
-# back to "ultimate", same as the JS `table[presetKey] || table.ultimate`.
+# Human-aware segmentation tuning parameters per preset. Unspecified presets default to ultimate.
 HUMAN_TUNING = {
+    "body": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.38},
+    "custom": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.38},
     "human": {"skin_smooth": 0.84, "hair_boost": 1.45, "silhouette_boost": 0.95, "subject_isolation": 0.28},
     "subject": {"skin_smooth": 0.7, "hair_boost": 1.32, "silhouette_boost": 1.0, "subject_isolation": 0.94},
     "manga": {"skin_smooth": 0.8, "hair_boost": 1.4, "silhouette_boost": 0.9, "subject_isolation": 0.22},
     "neon": {"skin_smooth": 0.55, "hair_boost": 1.32, "silhouette_boost": 0.88, "subject_isolation": 0.55},
     "blueprint": {"skin_smooth": 0.76, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.18},
     "classic": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.38},
-    # subject_isolation raised from script.js's 0.38 -- deliberate divergence,
-    # not a port error: user feedback after reviewing a real RVM-based render
-    # was that the background still drew too much attention (residual noise/
-    # jitter there), asking for it quieted further. The website's own
-    # MediaPipe-based rendering wasn't reported as having this problem, so
-    # left unchanged there -- this bump is specific to the native pipeline.
     "ultimate": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.46},
     "studio": {"skin_smooth": 0.78, "hair_boost": 1.32, "silhouette_boost": 0.82, "subject_isolation": 0.38},
-    # Gentler throughout to match pencil's already-soft line (xdog_phi 70 vs.
-    # ultimate's 210) — see the matching comment in script.js.
     "pencil": {"skin_smooth": 0.72, "hair_boost": 1.2, "silhouette_boost": 0.6, "subject_isolation": 0.26},
 }
+
+# Aliases for UI label consistency.
+STYLE_PRESETS["portrait"] = STYLE_PRESETS["human"]
+HUMAN_TUNING["portrait"] = HUMAN_TUNING["human"]
 
 
 def get_preset(name):

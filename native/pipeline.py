@@ -1,29 +1,11 @@
-"""Port of worker.js's process() method — the per-frame CPU pipeline: white
-balance, smoothing, 3-stage adaptive normalize, Canny, morphology, then
-either the "ultimate" (XDoG, via ink.py) or "classic" paint stage.
-
-Unlike worker.js, this file never manually allocates/frees kernels or Mats
-— that caching existed specifically to reduce WASM-heap churn across a
-browser-tab-shared FFmpeg/OpenCV.js memory budget (see worker.js's
-_getRectKernel comment). Native OpenCV kernels are tiny numpy arrays,
-garbage-collected normally; there's no equivalent constraint to work around
-here, so this file just creates them inline where used.
-
-settings is a plain dict, keys matching the JS settings object but
-snake_case (detail, preset, engine, custom_mode, white_balance,
-auto_normalize, dark_boost, dark_boost_clip, clean_speckles,
-clean_speckles_intensity, merge_double_edge, merge_double_edge_intensity,
-line_weight, color_edges, color_soft_ness, color_low_thresh,
-color_high_thresh, color_line_weight, color_opacity, class_mask,
-extra_lines, human_aware, skin_smooth, hair_boost, silhouette_boost,
-subject_isolation, pose_lines, face_contours) plus settings["preset"], the
-already-selected dict from presets.py (not just its name).
+"""Per-frame image processing pipeline: white balance, smoothing, adaptive normalization,
+Canny edge detection, morphology, and ink rendering (XDoG or classic).
 """
 
 import numpy as np
 import cv2
 
-from ink import apply_gray_world, paint_ultimate_ink, temporal_denoise_gray
+from ink import apply_gray_world, paint_ultimate_ink, temporal_denoise_gray, blend_body_overlay
 
 
 def _rect_kernel(size):
@@ -35,40 +17,45 @@ def _ellipse_kernel(size):
 
 
 def _remove_small_components(edges, min_area):
-    """Vectorized port of the connected-components speckle-cleanup loop in
-    worker.js: labels every contiguous white region, zeroes out any whose
-    area is below min_area. Continuous lines, however thin, always
-    accumulate enough pixels to survive; isolated specks don't."""
+    """Removes connected edge components with area strictly less than min_area pixels."""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8, ltype=cv2.CV_32S)
     areas = stats[:, cv2.CC_STAT_AREA]
     keep = areas >= min_area
-    keep[0] = True  # background label — irrelevant, never a foreground pixel below
+    keep[0] = True  # Retain background label
     small_mask = (~keep)[labels] & (labels != 0)
     edges[small_mask] = 0
     return edges
 
 
 def process_frame(rgba, settings, rgb=None):
-    """rgba: (H, W, 4) uint8 array (RGBA, matching the browser's ImageData
-    layout — the alpha channel is dropped immediately, same as worker.js's
-    cv.COLOR_RGBA2RGB). Returns (out_rgb, new_prev_gray): out_rgb is an
-    (H, W, 3) uint8 RGB image; new_prev_gray is the pre-Canny working gray
-    to pass back in as settings["prev_gray"] on the NEXT sequential frame
-    (None if settings["temporal_denoise"] is falsy -- nothing to carry).
+    """Process a single video frame or image with automatic VRAM OOM fallback.
 
-    rgb: pass the RGBA->RGB conversion of this same frame if the caller
-    already computed it (e.g. for human-aware segmentation, which needs its
-    own RGB copy) to skip redoing the exact same cv2.cvtColor call twice per
-    frame -- bit-identical either way, this only avoids the duplicate work.
+    Args:
+        rgba: Input image as (H, W, 4) uint8 RGBA array.
+        settings: Configuration dictionary containing preset parameters, thresholds, and flags.
+        rgb: Optional pre-computed (H, W, 3) uint8 RGB array to avoid redundant color conversion.
 
-    settings["temporal_denoise"]: opt-in motion-adaptive smoothing of the
-    pre-Canny gray image (see ink.temporal_denoise_gray) to damp the sensor-
-    noise-driven edge jitter that inflates encoded file size -- see that
-    function's docstring for why it only smooths where frame-to-frame change
-    is small, so real motion is never blurred. settings["prev_gray"] is the
-    previous frame's returned new_prev_gray, or None for a segment's first
-    frame; the caller (one sequential process per video segment, same as the
-    MediaPipe/RVM recurrent state) is responsible for carrying it forward."""
+    Returns:
+        tuple: (out_rgb, new_prev_gray) where out_rgb is (H, W, 3) uint8, and
+               new_prev_gray is (H, W) uint8 for sequential temporal denoising.
+    """
+    from hw_detect import is_gpu_active, set_force_cpu, clear_gpu_memory, is_oom_error
+
+    try:
+        return _process_frame_impl(rgba, settings, rgb=rgb)
+    except Exception as exc:
+        if is_oom_error(exc) and is_gpu_active():
+            print("[WARNING] GPU VRAM Out-of-Memory spike detected on frame. Flushing memory pool and retrying on CPU...", flush=True)
+            clear_gpu_memory()
+            set_force_cpu(True)
+            try:
+                return _process_frame_impl(rgba, settings, rgb=rgb)
+            finally:
+                set_force_cpu(False)
+        raise
+
+
+def _process_frame_impl(rgba, settings, rgb=None):
     if rgb is None:
         rgb = cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB)
 
@@ -89,7 +76,7 @@ def process_frame(rgba, settings, rgb=None):
 
     if not custom_mode:
         if settings.get("engine") == "ultimate":
-            # XDoG carries the stroke; skip heavy bilateral so it stays fast.
+            # XDoG engine: convert directly to grayscale without bilateral smoothing.
             gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         else:
             smoothed = cv2.bilateralFilter(rgb, diameter, sigma, sigma, borderType=cv2.BORDER_DEFAULT)
@@ -127,8 +114,7 @@ def process_frame(rgba, settings, rgb=None):
         )
         new_prev_gray = gray
 
-    # Three-stage adaptive normalize — see worker.js's comment for the full
-    # rationale (gamma lift / histogram stretch / adaptive CLAHE cascade).
+    # Three-stage adaptive normalization: gamma correction, min-max stretch, and CLAHE.
     last_mean = None
     if settings.get("auto_normalize"):
         mean_arr, std_arr = cv2.meanStdDev(gray_raw)
@@ -181,13 +167,14 @@ def process_frame(rgba, settings, rgb=None):
     else:
         out = _paint_classic(rgb, gray_raw, edges, settings, last_mean)
 
+    if settings.get("body_map_overlay") or settings.get("preset_name") == "body":
+        out = blend_body_overlay(out, settings.get("class_mask"))
+
     return out, new_prev_gray
 
 
 def _paint_classic(rgb, gray_raw, edges, settings, last_mean):
-    """The non-ultimate ("classic") paint stage: binary ink/background, with
-    an optional color-edges overlay in Custom mode. Vectorized with numpy
-    boolean indexing instead of worker.js's per-pixel loop."""
+    """Renders classic binary edge ink with optional colored edge overlay."""
     edges_inv = cv2.bitwise_not(edges)
     h, w = edges_inv.shape
     preset = settings["preset"]

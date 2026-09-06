@@ -209,5 +209,49 @@ function paintUltimateInk(grayMat, edgeMat, width, height, settings, classMask, 
             out32[i] = ((255 << 24) | (B << 16) | (G << 8) | R) >>> 0;
         }
     }
+
+    if (settings.bodyMapOverlay || preset.bodyMapOverlay) {
+        blendBodyOverlay(out, classMask, width, height);
+    }
+
     return out;
+}
+
+const BODY_PAL = [
+    [28, 28, 32],      // 0: HUMAN_BG
+    [196, 146, 72],    // 1: HUMAN_HAIR
+    [196, 112, 112],   // 2: HUMAN_BODY
+    [232, 186, 154],   // 3: HUMAN_FACE
+    [92, 124, 164],    // 4: HUMAN_CLOTHES
+    [92, 164, 148],    // 5: HUMAN_OTHER
+];
+
+function blendBodyOverlay(outU8, classMask, width, height) {
+    if (!classMask) return;
+    const n = width * height;
+    for (let i = 0; i < n; i++) {
+        const p = i * 4;
+        // 1. Dim ink output: 55% opacity over white
+        const dimR = outU8[p] * 0.55 + 255 * 0.45;
+        const dimG = outU8[p + 1] * 0.55 + 255 * 0.45;
+        const dimB = outU8[p + 2] * 0.55 + 255 * 0.45;
+
+        // 2. Class color & alpha blend over white
+        const cls = classMask[i] || 0;
+        const c = BODY_PAL[cls] || BODY_PAL[0];
+        const alpha = cls === 0 ? (70 / 255) : (200 / 255);
+        const overR = c[0] * alpha + 255 * (1 - alpha);
+        const overG = c[1] * alpha + 255 * (1 - alpha);
+        const overB = c[2] * alpha + 255 * (1 - alpha);
+
+        // 3. Multiply blend at 90% opacity
+        const multR = (dimR * overR) / 255.0;
+        const multG = (dimG * overG) / 255.0;
+        const multB = (dimB * overB) / 255.0;
+
+        outU8[p] = Math.round(dimR * 0.10 + multR * 0.90);
+        outU8[p + 1] = Math.round(dimG * 0.10 + multG * 0.90);
+        outU8[p + 2] = Math.round(dimB * 0.10 + multB * 0.90);
+        outU8[p + 3] = 255;
+    }
 }

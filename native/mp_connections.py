@@ -1,17 +1,4 @@
-"""Static MediaPipe landmark connection-topology tables (index pairs), sourced
-verbatim from mediapipe/python/solutions/{pose_connections,face_mesh_connections}.py
-in the google-ai-edge/mediapipe repo (Apache-2.0), fetched and range-checked against
-the known landmark counts (33 for pose, 468 for face mesh) during this port.
-
-The Python Tasks API (mediapipe.tasks.python.vision) does not expose these as class
-constants the way the JS tasks-vision package does (PoseLandmarker.POSE_CONNECTIONS,
-FaceLandmarker.FACE_LANDMARKS_CONTOURS/_LIPS/_LEFT_EYE/_RIGHT_EYE), and the legacy
-Python mediapipe.solutions API that used to have them was removed in the Tasks-only
-1.x package line - confirmed against an installed mediapipe==1.0.1 in this
-environment, not assumed. These tables are topology of the fixed landmark scheme
-these specific models output, not tied to any particular API surface or mediapipe
-version, so hardcoding them here is stable.
-"""
+"""MediaPipe landmark topology connection tables (index pairs) for pose and face mesh models."""
 
 POSE_CONNECTIONS = [
     (0, 1), (0, 4), (1, 2), (2, 3), (3, 7), (4, 5), (5, 6), (6, 8),

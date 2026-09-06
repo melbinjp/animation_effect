@@ -38,7 +38,26 @@ fi
 
 echo "== python deps =="
 cd "$REPO_DIR/native"
-pip install --quiet -r requirements.txt -r requirements-webui.txt
+python3 -m pip install --quiet -r requirements.txt -r requirements-webui.txt
+
+echo "== gpu check =="
+if command -v nvidia-smi &> /dev/null; then
+    echo "NVIDIA GPU detected. Installing cupy for hardware acceleration..."
+    # Determine CUDA major version to install the correct pre-built cupy wheel
+    CUDA_MAJOR=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+' || echo "")
+    if [ "$CUDA_MAJOR" = "12" ]; then
+        python3 -m pip install --quiet cupy-cuda12x
+        echo "Installed cupy-cuda12x"
+    elif [ "$CUDA_MAJOR" = "11" ]; then
+        python3 -m pip install --quiet cupy-cuda11x
+        echo "Installed cupy-cuda11x"
+    else
+        echo "Could not reliably determine CUDA version ($CUDA_MAJOR). Installing generic cupy (this may take time to compile)..."
+        python3 -m pip install --quiet cupy
+    fi
+else
+    echo "No NVIDIA GPU detected. Proceeding with CPU-only configuration."
+fi
 
 echo "== sanity checks =="
 python3 -c "

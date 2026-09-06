@@ -1,30 +1,5 @@
-"""Port of human.js: MediaPipe segmentation + optional pose/face landmark
-overlays, via the official Python `mediapipe` package instead of the JS
-Tasks Vision bundle. Loads the exact same bundled model files already in
-this repo (mediapipe/models/*), no re-fetching.
-
-Process model: this module's engine cache is per-process (plain module-level
-globals), not per-thread or global-to-the-run. cli.py's multiprocessing.Pool
-workers each import this module fresh in their own process and lazily build
-their own engines on first use — MediaPipe task objects aren't safely
-shareable across a process boundary. VIDEO running mode's sequential-
-timestamp requirement is satisfied as long as each worker processes its
-assigned frames in increasing time order, which is how cli.py assigns work
-(contiguous frame ranges per worker, not interleaved).
-
-The pose/face landmark overlay path (off by default, opt-in via
---pose-lines/--face-contours) is a cosmetic extra, not the point of this
-port. Verified live against an installed mediapipe==1.0.1: unlike the JS
-tasks-vision bundle, the Python Tasks API exposes no PoseLandmarker.
-POSE_CONNECTIONS-style class constants, and the legacy mediapipe.solutions
-API that used to have them is gone from the Tasks-only 1.x package line
-(confirmed by import failure, not assumed) - so connection topology comes
-from mp_connections.py instead, a static table fetched from mediapipe's own
-solutions source and range-checked against the known landmark counts. The
-try/except here stays anyway as a defensive backstop: if a future mediapipe
-release changes the landmark scheme, this degrades to "no overlay, a logged
-warning" rather than failing the whole frame - segmentation (the actual
-body-aware quieting) never depends on it.
+"""MediaPipe selfie multiclass segmentation and optional pose/face landmark overlays.
+Maintains per-process engine instances for multiprocessing worker isolation.
 """
 
 import os
@@ -45,15 +20,14 @@ SEG_MODEL = os.path.join(_MODELS_DIR, "selfie_multiclass_256x256.tflite")
 POSE_MODEL = os.path.join(_MODELS_DIR, "pose_landmarker_lite.task")
 FACE_MODEL = os.path.join(_MODELS_DIR, "face_landmarker.task")
 
-# Per-process state — see module docstring.
+# Per-process engine cache.
 _engines = {"IMAGE": None, "VIDEO": None}
 _want_landmarks = False
 _video_timestamp_ms = 0
 
 
 def _mp_modules():
-    # Imported lazily so a process that never needs human-aware processing
-    # (e.g. --no-human-aware) doesn't pay MediaPipe's import cost at all.
+    # Lazy import to avoid loading MediaPipe in processes where human-aware mode is disabled.
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
@@ -102,10 +76,7 @@ def _build_engines(delegate, mode, want_landmarks):
 
 
 def ensure_human(landmarks=False, mode="IMAGE"):
-    """Returns True if segmentation is available for this mode. Mirrors
-    human.js's ensureHuman: GPU delegate tried first, falls back to CPU on
-    any failure (GPU delegate success is more environment-dependent in
-    Python than in-browser — this fallback is not optional)."""
+    """Initializes segmentation and landmark engines, attempting GPU delegate first with CPU fallback."""
     global _want_landmarks
     if landmarks:
         _want_landmarks = True
@@ -128,12 +99,7 @@ def ensure_human(landmarks=False, mode="IMAGE"):
 
 
 def upsample_classes_bilinear(channels, out_w, out_h):
-    """channels: list of 2D float32 arrays (one per class, model-native
-    resolution). Bilinear-resizes each class's own confidence channel with
-    cv2's native (fast, well-tested) resize, then argmax across classes —
-    the numpy/cv2-native equivalent of human.js's upsampleClassesBilinear;
-    see that function's comment for why per-channel bilinear-then-argmax is
-    the mathematically correct way to upsample a categorical mask."""
+    """Upsamples class confidence channels via bilinear interpolation and returns the argmax class mask."""
     resized = [cv2.resize(ch, (out_w, out_h), interpolation=cv2.INTER_LINEAR) for ch in channels]
     stacked = np.stack(resized, axis=-1)
     return np.argmax(stacked, axis=-1).astype(np.uint8)
@@ -155,9 +121,7 @@ def _draw_connections(buf, w, h, landmarks, connections, radius, val, min_vis=0.
 
 
 def _pose_face_connections():
-    """Returns (pose_connections, face_contours, face_lips, face_left,
-    face_right) from the verified static tables in mp_connections.py — see
-    module docstring. Any may be None if that import ever fails."""
+    """Loads landmark connection topology tables from mp_connections."""
     try:
         import mp_connections as topo
         return (
@@ -173,8 +137,11 @@ _connections_cache = None
 
 
 def infer_human(image_rgb, width, height, settings, use_video_mode=False):
-    """image_rgb: (H, W, 3) uint8 RGB numpy array. Returns a dict matching
-    human.js's inferHuman return shape, or None."""
+    """Executes multiclass segmentation and optional landmark detection on an RGB frame.
+
+    Returns:
+        dict: Keys 'class_mask', 'extra_lines', 'person_ratio', and 'has_person', or None on failure.
+    """
     global _video_timestamp_ms, _connections_cache
 
     mode = "VIDEO" if use_video_mode else "IMAGE"
