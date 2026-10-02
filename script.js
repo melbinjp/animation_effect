@@ -660,13 +660,24 @@ class LineArtProcessor {
                 payload.extraLines = human.extraLines;
                 payload.hasPerson = human.hasPerson;
                 state.lastHuman = human;
+            } else if (opts.videoMode && state.lastHuman) {
+                // Inference returned null this frame (model hiccup, GPU stall,
+                // etc.). In video/live mode: reuse the previous known-good mask
+                // rather than dropping to no-mask, which would flash the full
+                // unmodified ink for one or more frames before the model recovers.
+                payload.classMask = state.lastHuman.classMask;
+                payload.extraLines = state.lastHuman.extraLines;
+                payload.hasPerson = state.lastHuman.hasPerson;
+                // Do not update state.lastHuman — keep the previous good frame.
             } else {
                 state.lastHuman = null;
             }
         } catch (err) {
             console.warn('Body maps skipped', err);
-            state.lastHuman = null;
+            // Same recovery for exceptions in video mode.
+            if (!opts.videoMode || !state.lastHuman) state.lastHuman = null;
         }
+
         const imageData = sourceCanvas
             .getContext('2d', { willReadFrequently: true })
             .getImageData(0, 0, width, height); // synchronous pixel copy
@@ -914,7 +925,14 @@ async function inferCachedHuman(canvas, width, height, settings, allowCache = fa
         }
     }
 
-    const maps = mod.inferHuman(canvas, width, height, settings, videoMode);
+    // Thread the previous hasPerson flag into settings so human.js can apply
+    // hysteretic turn-on/turn-off thresholds (2.5% on, 1.0% off) rather than
+    // a single threshold that toggles on borderline frames.
+    const settingsWithHysteresis = {
+        ...settings,
+        _prevHasPerson: !!(state.lastHuman && state.lastHuman.hasPerson),
+    };
+    const maps = mod.inferHuman(canvas, width, height, settingsWithHysteresis, videoMode);
     if (maps) {
         if (allowCache) {
             state.humanCache = {
@@ -934,6 +952,7 @@ async function inferCachedHuman(canvas, width, height, settings, allowCache = fa
 }
 
 function paintBodyOverlay(width, height) {
+
     const overlay = elements.bodyOverlay;
     if (!overlay) return;
     overlay.width = width;
@@ -1004,8 +1023,13 @@ async function playLiveVideo() {
     state.livePlay = true;
     setBusy(true);
     video.muted = true;
+    // Reset temporal segmentation state at the start of each new playback
+    // so the smoothing window starts fresh rather than blending the first
+    // frame against stale mask data from a previous session or file.
+    loadHumanModule().then((mod) => { if (mod.resetHumanTemporal) mod.resetHumanTemporal(); }).catch(() => {});
     try {
         await video.play();
+
         while (state.livePlay && !state.cancelRequested && !video.paused && !video.ended) {
             throwIfCancelled();
             drawMediaToCanvas(video, elements.sourceCanvas, getSettings().scale, getSettings().customMode);
@@ -2830,6 +2854,11 @@ async function runLiveSource(stream, { label, fileName, successMessage }) {
     state.cancelRequested = false;
     setBusy(true);
     refreshActions();
+    // Reset temporal segmentation state — stale mask data from a previous
+    // session (different person, different background) must not bleed into
+    // the new one's smoothing window.
+    loadHumanModule().then((mod) => { if (mod.resetHumanTemporal) mod.resetHumanTemporal(); }).catch(() => {});
+
 
     // Screen/tab shares (and some cameras) can end on their own — the
     // browser's own "Stop sharing" control, a closed tab, an unplugged

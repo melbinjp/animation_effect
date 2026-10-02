@@ -101,7 +101,16 @@ function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
         if (cls === HUMAN_BG) {
             treated = original * (1 - isolation);
         } else if (cls === HUMAN_FACE || cls === HUMAN_BODY) {
-            const keep = original > 0.58 ? 1 : 1 - skin;
+            // Soft sigmoid transition instead of a hard threshold at 0.58:
+            // pixels well above ~0.52 (strong edges — feature boundaries, eye
+            // lids, nostrils) are treated as 100% kept; pixels well below that
+            // fade smoothly toward the skin-smoothed value.  This eliminates the
+            // visible flash that occurred when a boundary pixel oscillated across
+            // the old hard `original > 0.58` step, because now neighbouring
+            // frames produce smoothly varying ink values rather than a step
+            // from (1-skin)*original to original.
+            const t = 1 / (1 + Math.exp(-14 * (original - 0.52)));
+            const keep = 1 - skin + skin * t;  // interpolate: skin-suppressed → full
             treated = original * keep;
         } else if (cls === HUMAN_HAIR) {
             treated = original * hair > 1 ? 1 : original * hair;
@@ -123,6 +132,7 @@ function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
         }
     }
 }
+
 
 function applyGrayWorld(rgbMat) {
     const data = rgbMat.data;
