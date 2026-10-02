@@ -192,23 +192,38 @@ function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
             const x1 = Math.min(sw - 1, x0 + 1);
             const fx = sx - x0;
 
-            let bestClass = 0;
-            let bestVal = -Infinity;
-            for (let c = 0; c < numClasses; c++) {
+            // Background channel (class 0)
+            const ch0 = channels[0];
+            const bgTop = ch0[rowY0 + x0] + (ch0[rowY0 + x1] - ch0[rowY0 + x0]) * fx;
+            const bgBot = ch0[rowY1 + x0] + (ch0[rowY1 + x1] - ch0[rowY1 + x0]) * fx;
+            const bgVal = bgTop + (bgBot - bgTop) * fy;
+
+            let bestFgClass = 0;
+            let bestFgVal = -Infinity;
+            for (let c = 1; c < numClasses; c++) {
                 const ch = channels[c];
                 const top = ch[rowY0 + x0] + (ch[rowY0 + x1] - ch[rowY0 + x0]) * fx;
                 const bot = ch[rowY1 + x0] + (ch[rowY1 + x1] - ch[rowY1 + x0]) * fx;
                 const val = top + (bot - top) * fy;
-                if (val > bestVal) {
-                    bestVal = val;
-                    bestClass = c;
+                if (val > bestFgVal) {
+                    bestFgVal = val;
+                    bestFgClass = c;
                 }
             }
-            out[y * dw + x] = bestClass;
+
+            // A non-background class must beat background by at least 0.06 margin
+            // and have at least 0.30 absolute confidence. This prevents weak spatial priors
+            // from hallucinating torso/clothes in flat plane spaces at the bottom of the frame.
+            if (bestFgVal >= 0.30 && bestFgVal > bgVal + 0.06) {
+                out[y * dw + x] = bestFgClass;
+            } else {
+                out[y * dw + x] = 0; // HUMAN_BG
+            }
         }
     }
     return out;
 }
+
 
 function paintDisk(buf, w, h, cx, cy, r, val) {
     const x0 = Math.max(0, Math.floor(cx - r));
@@ -375,12 +390,12 @@ export function inferHuman(image, width, height, settings, useVideoMode = false)
                 drawConnections(extraLines, width, height, lm, engines.faceRight, 0.7, 240, 0);
             }
         }
-        // Hysteretic hasPerson thresholds — separate turn-on (2.5%) and turn-off
-        // (1.0%) thresholds prevent the flag from toggling on and off when the
-        // person only partially fills the frame or moves quickly through it.
-        // The caller passes settings.prevHasPerson so we can apply hysteresis.
+        // Hysteretic hasPerson thresholds — turn-on (0.8%) and turn-off (0.3%)
+        // prevent the flag from toggling on and off when only a small portion of the
+        // body (e.g. head/neck at top of frame) is in view or moving fast.
         const prevHas = settings._prevHasPerson === true;
-        const hasPerson = prevHas ? personRatio > 0.010 : personRatio > 0.025;
+        const hasPerson = prevHas ? personRatio > 0.003 : personRatio > 0.008;
+
         return {
             width,
             height,

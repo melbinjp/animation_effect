@@ -138,10 +138,18 @@ def reset_temporal():
 
 
 def upsample_classes_bilinear(channels, out_w, out_h):
-    """Upsamples class confidence channels via bilinear interpolation and returns the argmax class mask."""
+    """Upsamples class confidence channels via bilinear interpolation and returns the argmax class mask with background margin."""
     resized = [cv2.resize(ch, (out_w, out_h), interpolation=cv2.INTER_LINEAR) for ch in channels]
     stacked = np.stack(resized, axis=-1)
-    return np.argmax(stacked, axis=-1).astype(np.uint8)
+    bg = stacked[..., 0]
+    fg_stack = stacked[..., 1:]
+    best_fg = np.max(fg_stack, axis=-1)
+    best_fg_class = np.argmax(fg_stack, axis=-1).astype(np.uint8) + 1
+    # Foreground must exceed background by 0.06 margin and have >= 0.30 confidence
+    # to prevent weak spatial priors in flat plane space from hallucinating body/clothes.
+    is_fg = (best_fg >= 0.30) & (best_fg > bg + 0.06)
+    return np.where(is_fg, best_fg_class, 0).astype(np.uint8)
+
 
 
 def _draw_connections(buf, w, h, landmarks, connections, radius, val, min_vis=0.35):
@@ -288,11 +296,11 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
                     _draw_connections(extra_lines, width, height, lm, face_left, 0.7, 240, 0)
                     _draw_connections(extra_lines, width, height, lm, face_right, 0.7, 240, 0)
 
-        # Hysteretic hasPerson thresholds — separate turn-on (2.5%) and turn-off
-        # (1.0%) values prevent the flag from toggling when the person only
-        # partially enters the frame or moves quickly through it.
-        has_person = (_prev_has_person and person_ratio > 0.010) or (person_ratio > 0.025)
+        # Hysteretic hasPerson thresholds — turn-on (0.8%) and turn-off (0.3%)
+        # prevent toggling when only a small portion of the body is in view.
+        has_person = (_prev_has_person and person_ratio > 0.003) or (person_ratio > 0.008)
         _prev_has_person = has_person
+
 
         return {
             "class_mask": class_mask,
