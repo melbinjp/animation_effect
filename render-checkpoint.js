@@ -18,21 +18,29 @@ const CHUNKS_STORE = 'chunks';
 
 function openCheckpointDB() {
     return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
-            const db = req.result;
-            if (!db.objectStoreNames.contains(JOBS_STORE)) {
-                db.createObjectStore(JOBS_STORE, { keyPath: 'jobId' });
-            }
-            if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
-                const store = db.createObjectStore(CHUNKS_STORE, { keyPath: 'key' });
-                store.createIndex('jobId', 'jobId', { unique: false });
-            }
-        };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        if (typeof indexedDB === 'undefined' || !indexedDB) {
+            return reject(new Error('IndexedDB is not available in this environment'));
+        }
+        try {
+            const req = indexedDB.open(DB_NAME, DB_VERSION);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(JOBS_STORE)) {
+                    db.createObjectStore(JOBS_STORE, { keyPath: 'jobId' });
+                }
+                if (!db.objectStoreNames.contains(CHUNKS_STORE)) {
+                    const store = db.createObjectStore(CHUNKS_STORE, { keyPath: 'key' });
+                    store.createIndex('jobId', 'jobId', { unique: false });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        } catch (err) {
+            reject(err);
+        }
     });
 }
+
 
 function promisifyRequest(req) {
     return new Promise((resolve, reject) => {

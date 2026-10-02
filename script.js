@@ -65,8 +65,10 @@ const elements = {
     hairBoost: document.getElementById('hairBoost'),
     silhouetteBoost: document.getElementById('silhouetteBoost'),
     subjectIsolation: document.getElementById('subjectIsolation'),
+    cacheHumanMask: document.getElementById('cacheHumanMask'),
     humanStatusHint: document.getElementById('humanStatusHint')
 };
+
 
 const STYLE_PRESETS = {
     ultimate: {
@@ -650,14 +652,16 @@ class LineArtProcessor {
         const width = sourceCanvas.width;
         const height = sourceCanvas.height;
         const payload = { ...settings };
+        const allowCache = opts.allowHumanCache != null ? !!opts.allowHumanCache : !!settings.cacheHumanMask;
         try {
             const human = await inferCachedHuman(
                 sourceCanvas, width, height, settings,
-                !!opts.allowHumanCache, !!opts.videoMode
+                allowCache, !!opts.videoMode
             );
             if (human) {
                 payload.classMask = human.classMask;
                 payload.extraLines = human.extraLines;
+
                 payload.hasPerson = human.hasPerson;
                 state.lastHuman = human;
             } else if (opts.videoMode && state.lastHuman) {
@@ -1184,9 +1188,11 @@ function getSettings() {
         skinSmooth: Number(elements.skinSmooth && elements.skinSmooth.value) || 0.8,
         hairBoost: Number(elements.hairBoost && elements.hairBoost.value) || 1.32,
         silhouetteBoost: Number(elements.silhouetteBoost && elements.silhouetteBoost.value) || 0.72,
-        subjectIsolation: Number(elements.subjectIsolation && elements.subjectIsolation.value) || 0.38
+        subjectIsolation: Number(elements.subjectIsolation && elements.subjectIsolation.value) || 0.38,
+        cacheHumanMask: !!(elements.cacheHumanMask && elements.cacheHumanMask.checked)
     };
 }
+
 
 function computeScaledSize(width, height, scale, noCap = false) {
     const largestSide = Math.max(width, height);
@@ -3369,8 +3375,9 @@ elements.videoSeeker.addEventListener('change', async () => {
     await onPreviewClick();
 });
 
-['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps', 'humanAware', 'poseLines', 'faceContours', 'skinSmooth', 'hairBoost', 'silhouetteBoost', 'subjectIsolation'].forEach((id) => {
+['preset', 'detail', 'lineWeight', 'scale', 'qualityCap', 'videoFps', 'customVideoFps', 'humanAware', 'poseLines', 'faceContours', 'skinSmooth', 'hairBoost', 'silhouetteBoost', 'subjectIsolation', 'cacheHumanMask'].forEach((id) => {
     const el = document.getElementById(id);
+
     if (!el) return;
     el.addEventListener('change', async () => {
         if (id === 'preset') {

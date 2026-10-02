@@ -1015,8 +1015,10 @@ class CpuProcessor {
 // ── Initialisation ────────────────────────────────────────────────────────────
 
 async function initGpu() {
+    if (self.__FORCE_CPU__) throw new Error('CPU-only mode requested');
     if (!self.navigator?.gpu) throw new Error('WebGPU not available in this context');
     const adapter = await self.navigator.gpu.requestAdapter();
+
     if (!adapter) throw new Error('No WebGPU adapter found');
     const device = await adapter.requestDevice();
 

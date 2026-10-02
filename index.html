@@ -449,7 +449,14 @@
                             Face landmark mesh <span class="toggle-hint">(wireframe eyes and lips — off by default)</span>
                         </label>
                     </div>
+                    <div class="custom-toggle-row">
+                        <label for="cacheHumanMask" class="toggle-label">
+                            <input type="checkbox" id="cacheHumanMask">
+                            Cache body mask <span class="toggle-hint">(reuse fingerprint on static scenes — off by default)</span>
+                        </label>
+                    </div>
                     <p class="control-hint" id="humanStatusHint">Body maps idle — they load in the background.</p>
+
                 </div>
                 <canvas id="recCanvas" hidden aria-hidden="true"></canvas>
 
