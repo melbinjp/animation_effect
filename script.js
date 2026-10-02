@@ -663,6 +663,7 @@ class LineArtProcessor {
                 payload.extraLines = human.extraLines;
 
                 payload.hasPerson = human.hasPerson;
+                payload.humanPresence = human.humanPresence;
                 state.lastHuman = human;
             } else if (opts.videoMode && state.lastHuman) {
                 // Inference returned null this frame (model hiccup, GPU stall,
@@ -672,7 +673,9 @@ class LineArtProcessor {
                 payload.classMask = state.lastHuman.classMask;
                 payload.extraLines = state.lastHuman.extraLines;
                 payload.hasPerson = state.lastHuman.hasPerson;
+                payload.humanPresence = state.lastHuman.humanPresence;
                 // Do not update state.lastHuman — keep the previous good frame.
+
             } else {
                 state.lastHuman = null;
             }

@@ -85,8 +85,9 @@ function computeClassConfidence(classMask, w, h) {
 function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
     if (!classMask || !settings.humanAware) return;
     const n = width * height;
-    if (classMask.length !== n) return;
-    const isolation = settings.subjectIsolation == null ? 0.38 : settings.subjectIsolation;
+    const rawIsolation = settings.subjectIsolation == null ? 0.38 : settings.subjectIsolation;
+    const presence = settings.humanPresence != null ? settings.humanPresence : (settings.hasPerson != null ? (settings.hasPerson ? 1.0 : 0.0) : 1.0);
+    const isolation = rawIsolation * presence;
     const skin = settings.skinSmooth == null ? 0.8 : settings.skinSmooth;
     const hair = settings.hairBoost == null ? 1.32 : settings.hairBoost;
     const silB = settings.silhouetteBoost == null ? 0.72 : settings.silhouetteBoost;
@@ -100,6 +101,7 @@ function applyHumanInk(ink, classMask, extraLines, width, height, settings) {
         let treated = original;
         if (cls === HUMAN_BG) {
             treated = original * (1 - isolation);
+
         } else if (cls === HUMAN_FACE || cls === HUMAN_BODY) {
             // Soft sigmoid transition instead of a hard threshold at 0.58:
             // pixels well above ~0.52 (strong edges — feature boundaries, eye

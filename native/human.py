@@ -127,28 +127,59 @@ def reset_temporal():
     history from the previous session does not bleed into the new one.
     """
     global _prev_channels, _prev_chan_shape, _prev_mask, _prev_mask_shape
-    global _hold_count, _prev_has_person, _video_session_start
+    global _hold_count, _prev_has_person, _video_session_start, _human_presence
     _prev_channels = None
     _prev_chan_shape = None
     _prev_mask = None
     _prev_mask_shape = None
     _hold_count = 0
     _prev_has_person = False
+    _human_presence = 0.0
     _video_session_start = 0.0
 
 
+
 def upsample_classes_bilinear(channels, out_w, out_h):
-    """Upsamples class confidence channels via bilinear interpolation and returns the argmax class mask with background margin."""
-    resized = [cv2.resize(ch, (out_w, out_h), interpolation=cv2.INTER_LINEAR) for ch in channels]
-    stacked = np.stack(resized, axis=-1)
-    bg = stacked[..., 0]
-    fg_stack = stacked[..., 1:]
+    """Upsamples class confidence channels with dynamic contrast margin and 256x256 island filtering."""
+    native_stacked = np.stack(channels, axis=-1)
+    ch0 = native_stacked[..., 0]
+    fg_stack = native_stacked[..., 1:]
     best_fg = np.max(fg_stack, axis=-1)
     best_fg_class = np.argmax(fg_stack, axis=-1).astype(np.uint8) + 1
-    # Foreground must exceed background by 0.06 margin and have >= 0.30 confidence
-    # to prevent weak spatial priors in flat plane space from hallucinating body/clothes.
-    is_fg = (best_fg >= 0.30) & (best_fg > bg + 0.06)
-    return np.where(is_fg, best_fg_class, 0).astype(np.uint8)
+
+    peak_fg = float(np.max(best_fg))
+    contrast = np.clip((peak_fg - 0.35) / 0.45, 0.0, 1.0)
+    dynamic_margin = 0.12 - 0.09 * contrast
+    min_fg_conf = 0.36 - 0.12 * contrast
+
+    is_fg = (best_fg >= min_fg_conf) & (best_fg > ch0 + dynamic_margin)
+    native_mask = np.where(is_fg, best_fg_class, 0).astype(np.uint8)
+
+    # Filter out isolated noise clusters < 40 pixels at 256x256
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((native_mask > 0).astype(np.uint8), connectivity=8)
+    if num_labels > 1:
+        small_labels = np.where(stats[:, cv2.CC_STAT_AREA] < 40)[0]
+        if len(small_labels) > 0:
+            native_mask[np.isin(labels, small_labels)] = 0
+
+    # Condition channels at 256x256
+    cond_channels = [ch.copy() for ch in channels]
+    noise_mask = (native_mask == 0)
+    cond_channels[0] = np.maximum(cond_channels[0], 0.95 * noise_mask)
+    for c in range(1, len(channels)):
+        cond_channels[c][noise_mask] = 0.0
+
+    # Bilinear upsample to target resolution
+    resized = [cv2.resize(ch, (out_w, out_h), interpolation=cv2.INTER_LINEAR) for ch in cond_channels]
+    stacked = np.stack(resized, axis=-1)
+    out_bg = stacked[..., 0]
+    out_fg_stack = stacked[..., 1:]
+    out_best_fg = np.max(out_fg_stack, axis=-1)
+    out_best_fg_class = np.argmax(out_fg_stack, axis=-1).astype(np.uint8) + 1
+
+    final_is_fg = (out_best_fg > out_bg) & (out_best_fg > 0.20)
+    return np.where(final_is_fg, out_best_fg_class, 0).astype(np.uint8)
+
 
 
 
@@ -296,18 +327,22 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
                     _draw_connections(extra_lines, width, height, lm, face_left, 0.7, 240, 0)
                     _draw_connections(extra_lines, width, height, lm, face_right, 0.7, 240, 0)
 
-        # Hysteretic hasPerson thresholds — turn-on (0.8%) and turn-off (0.3%)
-        # prevent toggling when only a small portion of the body is in view.
-        has_person = (_prev_has_person and person_ratio > 0.003) or (person_ratio > 0.008)
+        # Dynamic presence tracking:
+        # Smooth presence across frames to prevent full-screen strobe flashing
+        instant_presence = 1.0 if person_ratio > 0.002 else 0.0
+        p_rate = 0.40 if instant_presence > _human_presence else 0.18
+        _human_presence += (instant_presence - _human_presence) * p_rate
+        has_person = _human_presence > 0.15
         _prev_has_person = has_person
-
 
         return {
             "class_mask": class_mask,
             "extra_lines": extra_lines,
             "person_ratio": person_ratio,
             "has_person": has_person,
+            "human_presence": _human_presence,
         }
     except Exception as err:
+
         warnings.warn(f"Linearty: human inference failed ({err})")
         return None

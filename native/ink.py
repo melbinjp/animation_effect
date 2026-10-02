@@ -95,8 +95,12 @@ def apply_human_ink(ink, class_mask, extra_lines, settings):
     if class_mask is None or not settings.get("human_aware"):
         return ink
     xp = get_xp()
-    
-    isolation = settings.get("subject_isolation", 0.38)
+    raw_isolation = float(settings.get("subject_isolation", 0.38))
+    presence = settings.get("human_presence")
+    if presence is None:
+        presence = 1.0 if settings.get("has_person", True) else 0.0
+    isolation = raw_isolation * float(presence)
+
     skin = settings.get("skin_smooth", 0.8)
     hair = settings.get("hair_boost", 1.32)
     sil_boost = settings.get("silhouette_boost", 0.72)
@@ -109,6 +113,7 @@ def apply_human_ink(ink, class_mask, extra_lines, settings):
 
     bg_mask = class_mask == HUMAN_BG
     treated = xp.where(bg_mask, original * (1 - isolation), treated)
+
 
     skin_mask = (class_mask == HUMAN_FACE) | (class_mask == HUMAN_BODY)
     # Soft sigmoid transition instead of a hard step at 0.58.  Pixels well above
@@ -143,9 +148,14 @@ def apply_human_ink_alpha(ink, alpha, extra_lines, settings):
         return ink
     xp = get_xp()
 
-    isolation = settings.get("subject_isolation", 0.38)
+    raw_isolation = float(settings.get("subject_isolation", 0.38))
+    presence = settings.get("human_presence")
+    if presence is None:
+        presence = 1.0 if settings.get("has_person", True) else 0.0
+    isolation = raw_isolation * float(presence)
     skin = settings.get("skin_smooth", 0.8)
     sil_boost = settings.get("silhouette_boost", 0.72)
+
 
     binary_mask = (alpha > 0.5).astype(xp.uint8)
     sil = silhouette_mask(binary_mask)

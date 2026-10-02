@@ -52,6 +52,34 @@ let _prevMask = null;       // last good Uint8Array classMask at output resoluti
 let _prevMaskW = 0;
 let _prevMaskH = 0;
 let _holdCount = 0;
+let _humanPresence = 0.0;   // 0.0 to 1.0 smoothed subject presence (eliminates strobe flashing)
+const _visitedBuf = new Uint8Array(256 * 256);
+const _queueBuf = new Int32Array(256 * 256);
+
+function filterSmallComponents(mask, w, h, minArea) {
+    if (w * h > _visitedBuf.length) return;
+    _visitedBuf.fill(0);
+    const n = w * h;
+    for (let i = 0; i < n; i++) {
+        if (!mask[i] || _visitedBuf[i]) continue;
+        let qHead = 0, qTail = 0;
+        _queueBuf[qTail++] = i;
+        _visitedBuf[i] = 1;
+        while (qHead < qTail) {
+            const idx = _queueBuf[qHead++];
+            const x = idx % w;
+            const y = (idx - x) / w;
+            if (x > 0) { const nb = idx - 1; if (mask[nb] && !_visitedBuf[nb]) { _visitedBuf[nb] = 1; _queueBuf[qTail++] = nb; } }
+            if (x < w - 1) { const nb = idx + 1; if (mask[nb] && !_visitedBuf[nb]) { _visitedBuf[nb] = 1; _queueBuf[qTail++] = nb; } }
+            if (y > 0) { const nb = idx - w; if (mask[nb] && !_visitedBuf[nb]) { _visitedBuf[nb] = 1; _queueBuf[qTail++] = nb; } }
+            if (y < h - 1) { const nb = idx + w; if (mask[nb] && !_visitedBuf[nb]) { _visitedBuf[nb] = 1; _queueBuf[qTail++] = nb; } }
+        }
+        if (qTail < minArea) {
+            for (let j = 0; j < qTail; j++) mask[_queueBuf[j]] = 0;
+        }
+    }
+}
+
 
 
 function quietLogs() {
@@ -174,6 +202,56 @@ export async function ensureHuman(options = {}) {
 // visibly blocky, jagged mask edges once upsampled past a few hundred pixels.
 function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
     const numClasses = channels.length;
+    const n = sw * sh;
+
+    // 1. Dynamic Signal-to-Noise & Contrast Analysis across the frame:
+    // Compute peak foreground confidence across all non-background channels.
+    let peakFg = 0.0;
+    const ch0 = channels[0];
+    for (let i = 0; i < n; i++) {
+        for (let c = 1; c < numClasses; c++) {
+            const v = channels[c][i];
+            if (v > peakFg) peakFg = v;
+        }
+    }
+
+    // Dynamic contrast adaptation:
+    // If scene contrast is high (clear subject, peakFg ~ 0.8+), margin is lean (0.03) to preserve fine facial/hair edges.
+    // If scene contrast is low or ambiguous (peakFg < 0.50), margin increases to 0.12 to suppress flat plane false positives.
+    const contrast = Math.max(0, Math.min(1, (peakFg - 0.35) / 0.45));
+    const dynamicMargin = 0.12 - 0.09 * contrast;
+    const minFgConf = 0.36 - 0.12 * contrast;
+
+    // 2. Classify native 256x256 candidates and filter small noise islands:
+    const nativeMask = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+        const bgVal = ch0[i];
+        let bestC = 0, bestV = -Infinity;
+        for (let c = 1; c < numClasses; c++) {
+            const v = channels[c][i];
+            if (v > bestV) { bestV = v; bestC = c; }
+        }
+        if (bestV >= minFgConf && bestV > bgVal + dynamicMargin) {
+            nativeMask[i] = bestC;
+        }
+    }
+
+    // Filter out isolated clusters < 40 pixels at 256x256 (corresponds to < 0.06% of screen)
+    // to eradicate flat-plane creeping noise without clipping real human anatomy.
+    filterSmallComponents(nativeMask, sw, sh, 40);
+
+    // 3. Conditioned channels: suppress foreground at spatial noise pixels so bilinear
+    // interpolation cannot bleed phantom body boundaries into flat plane areas
+    const condChannels = new Array(numClasses);
+    for (let c = 0; c < numClasses; c++) condChannels[c] = new Float32Array(channels[c]);
+    for (let i = 0; i < n; i++) {
+        if (nativeMask[i] === 0) {
+            condChannels[0][i] = Math.max(condChannels[0][i], 0.95);
+            for (let c = 1; c < numClasses; c++) condChannels[c][i] = 0.0;
+        }
+    }
+
+    // 4. Bilinear upsampling on conditioned channels to arbitrary output resolution (1080p, 4K)
     const out = new Uint8Array(dw * dh);
     const scaleX = (sw - 1) / Math.max(dw - 1, 1);
     const scaleY = (sh - 1) / Math.max(dh - 1, 1);
@@ -192,16 +270,14 @@ function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
             const x1 = Math.min(sw - 1, x0 + 1);
             const fx = sx - x0;
 
-            // Background channel (class 0)
-            const ch0 = channels[0];
-            const bgTop = ch0[rowY0 + x0] + (ch0[rowY0 + x1] - ch0[rowY0 + x0]) * fx;
-            const bgBot = ch0[rowY1 + x0] + (ch0[rowY1 + x1] - ch0[rowY1 + x0]) * fx;
+            const bgTop = condChannels[0][rowY0 + x0] + (condChannels[0][rowY0 + x1] - condChannels[0][rowY0 + x0]) * fx;
+            const bgBot = condChannels[0][rowY1 + x0] + (condChannels[0][rowY1 + x1] - condChannels[0][rowY1 + x0]) * fx;
             const bgVal = bgTop + (bgBot - bgTop) * fy;
 
             let bestFgClass = 0;
             let bestFgVal = -Infinity;
             for (let c = 1; c < numClasses; c++) {
-                const ch = channels[c];
+                const ch = condChannels[c];
                 const top = ch[rowY0 + x0] + (ch[rowY0 + x1] - ch[rowY0 + x0]) * fx;
                 const bot = ch[rowY1 + x0] + (ch[rowY1 + x1] - ch[rowY1 + x0]) * fx;
                 const val = top + (bot - top) * fy;
@@ -211,10 +287,7 @@ function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
                 }
             }
 
-            // A non-background class must beat background by at least 0.06 margin
-            // and have at least 0.30 absolute confidence. This prevents weak spatial priors
-            // from hallucinating torso/clothes in flat plane spaces at the bottom of the frame.
-            if (bestFgVal >= 0.30 && bestFgVal > bgVal + 0.06) {
+            if (bestFgVal > bgVal && bestFgVal > 0.20) {
                 out[y * dw + x] = bestFgClass;
             } else {
                 out[y * dw + x] = 0; // HUMAN_BG
@@ -223,6 +296,7 @@ function upsampleClassesBilinear(channels, sw, sh, dw, dh) {
     }
     return out;
 }
+
 
 
 function paintDisk(buf, w, h, cx, cy, r, val) {
@@ -390,11 +464,13 @@ export function inferHuman(image, width, height, settings, useVideoMode = false)
                 drawConnections(extraLines, width, height, lm, engines.faceRight, 0.7, 240, 0);
             }
         }
-        // Hysteretic hasPerson thresholds — turn-on (0.8%) and turn-off (0.3%)
-        // prevent the flag from toggling on and off when only a small portion of the
-        // body (e.g. head/neck at top of frame) is in view or moving fast.
-        const prevHas = settings._prevHasPerson === true;
-        const hasPerson = prevHas ? personRatio > 0.003 : personRatio > 0.008;
+        // Dynamic person presence tracking:
+        // Smooth presence across frames with an attack/decay filter so background
+        // isolation transitions smoothly rather than flashing on a single-frame toggle.
+        const instantPresence = personRatio > 0.002 ? 1.0 : 0.0;
+        const pRate = instantPresence > _humanPresence ? 0.40 : 0.18;
+        _humanPresence += (instantPresence - _humanPresence) * pRate;
+        const hasPerson = _humanPresence > 0.15;
 
         return {
             width,
@@ -403,6 +479,7 @@ export function inferHuman(image, width, height, settings, useVideoMode = false)
             extraLines,
             personRatio,
             hasPerson,
+            humanPresence: _humanPresence,
         };
     } catch (err) {
         console.warn('Linearty: human inference failed', err);
@@ -419,8 +496,10 @@ export function resetHumanTemporal() {
     _prevMaskW = 0;
     _prevMaskH = 0;
     _holdCount = 0;
+    _humanPresence = 0.0;
     videoSessionStart = 0;
 }
+
 
 
 
