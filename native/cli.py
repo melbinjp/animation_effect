@@ -241,6 +241,10 @@ def _process_segment(seg_idx, input_path, start_frame, end_frame, fps, src_w, sr
     want_landmarks = bool(settings.get("pose_lines") or settings.get("face_contours"))
     if human_aware:
         human_mod.ensure_human(landmarks=want_landmarks, mode="VIDEO")
+        # Reset temporal smoothing at the start of every segment so stale channel
+        # history from a previous segment or file does not bleed into this one.
+        human_mod.reset_temporal()
+
 
     start_time = start_frame / fps
     num_frames = end_frame - start_frame

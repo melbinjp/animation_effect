@@ -111,8 +111,14 @@ def apply_human_ink(ink, class_mask, extra_lines, settings):
     treated = xp.where(bg_mask, original * (1 - isolation), treated)
 
     skin_mask = (class_mask == HUMAN_FACE) | (class_mask == HUMAN_BODY)
-    keep = xp.where(original > 0.58, 1.0, 1 - skin)
+    # Soft sigmoid transition instead of a hard step at 0.58.  Pixels well above
+    # ~0.52 (strong feature edges) get keep=1; pixels well below fade smoothly to
+    # the skin-suppressed value.  This eliminates the flash when a boundary pixel
+    # oscillates across the old hard threshold between frames.
+    t = 1.0 / (1.0 + xp.exp(-14.0 * (original - 0.52)))
+    keep = (1 - skin) + skin * t   # interpolate: suppressed → full
     treated = xp.where(skin_mask, original * keep, treated)
+
 
     hair_mask = class_mask == HUMAN_HAIR
     treated = xp.where(hair_mask, xp.minimum(original * hair, 1.0), treated)
@@ -146,8 +152,10 @@ def apply_human_ink_alpha(ink, alpha, extra_lines, settings):
 
     original = ink
     bg_treated = original * (1 - isolation)
-    keep = xp.where(original > 0.58, 1.0, 1 - skin)
+    t = 1.0 / (1.0 + xp.exp(-14.0 * (original - 0.52)))
+    keep = (1 - skin) + skin * t
     fg_treated = original * keep
+
 
     a = alpha.astype(xp.float32)
     treated = bg_treated * (1 - a) + fg_treated * a

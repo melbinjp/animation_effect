@@ -3,6 +3,7 @@ Maintains per-process engine instances for multiprocessing worker isolation.
 """
 
 import os
+import time
 import warnings
 
 import numpy as np
@@ -23,7 +24,28 @@ FACE_MODEL = os.path.join(_MODELS_DIR, "face_landmarker.task")
 # Per-process engine cache.
 _engines = {"IMAGE": None, "VIDEO": None}
 _want_landmarks = False
-_video_timestamp_ms = 0
+
+# VIDEO-mode timestamp: use real wall-clock time (monotonic ms) so MediaPipe's
+# temporal tracking model gets correct inter-frame deltas.  The old approach of
+# incrementing by 1 ms per call told the tracker every frame was 1 ms apart,
+# suppressing the motion-continuity tracking it is designed to exploit.
+_video_session_start: float = 0.0  # monotonic seconds at session start
+
+# Temporal smoothing state — one set of EWA-smoothed confidence channels per
+# process (safe because each worker process runs infer_human sequentially).
+# Smoothing at confidence-channel level (before argmax) prevents label leakage:
+# a pixel can only take a non-background class when its smoothed confidence is
+# genuinely elevated in that region.  Blending hard argmax labels instead
+# scattered stale body labels into background areas when the mask changed.
+_CHAN_ALPHA = 0.55        # weight on the incoming frame; 1-_CHAN_ALPHA on history
+_HOLD_FRAMES = 8          # max consecutive null-inference frames before giving up
+
+_prev_channels = None     # list of ndarray (float32) per class at model resolution
+_prev_chan_shape = None   # (mh, mw) of _prev_channels
+_prev_mask = None         # last good uint8 class mask at output resolution (for hold)
+_prev_mask_shape = None   # (h, w) of _prev_mask
+_hold_count = 0
+_prev_has_person = False  # for hysteretic hasPerson threshold
 
 
 def _mp_modules():
@@ -98,6 +120,23 @@ def ensure_human(landmarks=False, mode="IMAGE"):
             return False
 
 
+def reset_temporal():
+    """Reset per-process temporal smoothing state when starting a new video session.
+
+    Call this whenever a new source (file, camera) is opened so stale channel
+    history from the previous session does not bleed into the new one.
+    """
+    global _prev_channels, _prev_chan_shape, _prev_mask, _prev_mask_shape
+    global _hold_count, _prev_has_person, _video_session_start
+    _prev_channels = None
+    _prev_chan_shape = None
+    _prev_mask = None
+    _prev_mask_shape = None
+    _hold_count = 0
+    _prev_has_person = False
+    _video_session_start = 0.0
+
+
 def upsample_classes_bilinear(channels, out_w, out_h):
     """Upsamples class confidence channels via bilinear interpolation and returns the argmax class mask."""
     resized = [cv2.resize(ch, (out_w, out_h), interpolation=cv2.INTER_LINEAR) for ch in channels]
@@ -142,7 +181,9 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
     Returns:
         dict: Keys 'class_mask', 'extra_lines', 'person_ratio', and 'has_person', or None on failure.
     """
-    global _video_timestamp_ms, _connections_cache
+    global _connections_cache
+    global _prev_channels, _prev_chan_shape, _prev_mask, _prev_mask_shape
+    global _hold_count, _prev_has_person, _video_session_start
 
     mode = "VIDEO" if use_video_mode else "IMAGE"
     engines = _engines.get(mode)
@@ -154,17 +195,69 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
 
         seg = engines["seg"]
+
+        # Real wall-clock timestamp for VIDEO mode. MediaPipe's temporal tracker
+        # uses inter-frame deltas to compute motion velocity — a constant +1 ms
+        # per call told the model every frame was 1 ms apart, suppressing the
+        # tracking continuity it is designed to exploit.
+        ts_ms = None
         if use_video_mode:
-            _video_timestamp_ms += 1
-            result = seg.segment_for_video(mp_image, _video_timestamp_ms)
+            if not _video_session_start:
+                _video_session_start = time.monotonic()
+            ts_ms = max(1, round((time.monotonic() - _video_session_start) * 1000) + 1)
+            result = seg.segment_for_video(mp_image, ts_ms)
         else:
             result = seg.segment(mp_image)
 
         masks = result.confidence_masks
         if not masks:
+            # Inference produced no mask (model hiccup, scheduler contention).
+            # Return the last known-good mask for up to _HOLD_FRAMES consecutive
+            # failures rather than immediately returning None and flashing blank.
+            if (_prev_mask is not None and
+                    _prev_mask_shape == (height, width) and
+                    _hold_count < _HOLD_FRAMES):
+                _hold_count += 1
+                person_ratio = float(np.count_nonzero(_prev_mask != HUMAN_BG)) / max(1, _prev_mask.size)
+                return {
+                    "class_mask": _prev_mask,
+                    "extra_lines": np.zeros((height, width), dtype=np.uint8),
+                    "person_ratio": person_ratio,
+                    "has_person": person_ratio > 0.010,
+                    "_held": True,
+                }
             return None
-        channels = [m.numpy_view() for m in masks]
-        class_mask = upsample_classes_bilinear(channels, width, height)
+
+        _hold_count = 0
+        channels = [m.numpy_view() for m in masks]  # list of float32 ndarray at model resolution
+        mh, mw = channels[0].shape[:2]
+
+        # Temporal smoothing at confidence-channel level (EWA before argmax).
+        # Blend each per-class float32 channel with the previous frame's smoothed
+        # channels at the model's native 256x256 resolution, then re-run bilinear
+        # upsample + argmax on the blended result.
+        #
+        # Why not blend hard argmax labels?
+        # Label blending placed stale body labels into background regions when the
+        # mask changed, causing body detection to extend into non-body areas.
+        # Float blending is safe: background channel 0 stays high wherever the
+        # person has moved away, so the EWA argmax stays HUMAN_BG there.
+        #
+        # Only active in VIDEO mode. IMAGE mode frames are independent.
+        if use_video_mode and _prev_channels is not None and _prev_chan_shape == (mh, mw):
+            channels_to_use = [
+                _CHAN_ALPHA * ch + (1.0 - _CHAN_ALPHA) * prev
+                for ch, prev in zip(channels, _prev_channels)
+            ]
+        else:
+            channels_to_use = channels
+
+        _prev_channels = [ch.copy() for ch in channels_to_use]
+        _prev_chan_shape = (mh, mw)
+
+        class_mask = upsample_classes_bilinear(channels_to_use, width, height)
+        _prev_mask = class_mask
+        _prev_mask_shape = (height, width)
 
         person_ratio = float(np.count_nonzero(class_mask != HUMAN_BG)) / max(1, class_mask.size)
         extra_lines = np.zeros((height, width), dtype=np.uint8)
@@ -176,7 +269,7 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
 
             if settings.get("pose_lines") and engines["pose"] and pose_conn:
                 poses = (
-                    engines["pose"].detect_for_video(mp_image, _video_timestamp_ms)
+                    engines["pose"].detect_for_video(mp_image, ts_ms)
                     if use_video_mode
                     else engines["pose"].detect(mp_image)
                 )
@@ -185,7 +278,7 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
 
             if settings.get("face_contours") and engines["face"] and face_contours:
                 faces = (
-                    engines["face"].detect_for_video(mp_image, _video_timestamp_ms)
+                    engines["face"].detect_for_video(mp_image, ts_ms)
                     if use_video_mode
                     else engines["face"].detect(mp_image)
                 )
@@ -195,11 +288,17 @@ def infer_human(image_rgb, width, height, settings, use_video_mode=False):
                     _draw_connections(extra_lines, width, height, lm, face_left, 0.7, 240, 0)
                     _draw_connections(extra_lines, width, height, lm, face_right, 0.7, 240, 0)
 
+        # Hysteretic hasPerson thresholds — separate turn-on (2.5%) and turn-off
+        # (1.0%) values prevent the flag from toggling when the person only
+        # partially enters the frame or moves quickly through it.
+        has_person = (_prev_has_person and person_ratio > 0.010) or (person_ratio > 0.025)
+        _prev_has_person = has_person
+
         return {
             "class_mask": class_mask,
             "extra_lines": extra_lines,
             "person_ratio": person_ratio,
-            "has_person": person_ratio > 0.012,
+            "has_person": has_person,
         }
     except Exception as err:
         warnings.warn(f"Linearty: human inference failed ({err})")
