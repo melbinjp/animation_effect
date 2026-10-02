@@ -35,17 +35,24 @@ let wantLandmarks = false;
 // motion continuity it is designed to exploit.
 let videoSessionStart = 0;
 
-// Temporal smoothing state — keeps the segmentation stable across frames.
-// When inference returns a fresh mask we blend it with the previous result
-// (MASK_ALPHA controls how quickly new results take over). When inference
-// fails entirely we return the last good mask for up to MASK_HOLD_FRAMES
-// frames rather than exposing null and causing a flash.
-const MASK_ALPHA = 0.60;        // 0 = never update, 1 = no smoothing
-const MASK_HOLD_FRAMES = 8;     // max consecutive null-inference frames before giving up
-let _prevMask = null;           // Float32Array per-pixel probability for each class
+// Temporal smoothing state.
+// Smoothing is done on the raw per-class confidence channels at the model's
+// native 256×256 resolution, BEFORE bilinear upsampling and argmax.
+// This is the correct level: blending float confidence values means a pixel
+// can only receive a non-background label if its EWA-smoothed confidence is
+// genuinely elevated there. Blending hard argmax labels (previous approach)
+// scattered old body labels into background regions when the mask changed,
+// producing the "extending to non-body areas" artifact.
+const CHAN_ALPHA = 0.55;    // weight on the incoming frame; 1-CHAN_ALPHA on history
+const MASK_HOLD_FRAMES = 8; // max consecutive null-inference frames before giving up
+let _prevChannels = null;   // Float32Array[numClasses] at model resolution
+let _prevChanW = 0;
+let _prevChanH = 0;
+let _prevMask = null;       // last good Uint8Array classMask at output resolution (for hold)
 let _prevMaskW = 0;
 let _prevMaskH = 0;
 let _holdCount = 0;
+
 
 function quietLogs() {
     if (typeof window === 'undefined' || window.__lineartyQuiet) return;
@@ -306,52 +313,43 @@ export function inferHuman(image, width, height, settings, useVideoMode = false)
         }
         _holdCount = 0;
 
-        // Temporal smoothing: blend the fresh mask with the previous one using
-        // per-pixel alpha. A pixel that changed class between frames gets a
-        // weighted vote rather than an abrupt switch, which kills the frame-to-
-        // frame flicker that is most visible on moving skin boundaries and
-        // background/foreground transitions.
+        // Temporal smoothing at confidence-channel level (EWA before argmax).
+        // Blend each of the 6 per-class float32 channels with the previous
+        // frame's smoothed channels at the model's native 256×256 resolution,
+        // then re-run bilinear upsample + argmax on the blended result.
         //
-        // MASK_ALPHA = 0.60 → each frame brings the mask 60% of the way to the
-        // new result, keeping the previous 40%. This is fast enough to track a
-        // walking person without lag but slow enough to damp single-frame noise.
-        // IMAGE mode (batch export / still images) bypasses smoothing because
-        // frames are independent and blending across them is wrong.
-        if (useVideoMode && _prevMask && _prevMaskW === width && _prevMaskH === height) {
-            const n = width * height;
-            const blended = new Uint8Array(n);
-            for (let i = 0; i < n; i++) {
-                // Simple per-pixel alpha blend on the hard argmax label:
-                // keep previous class with weight (1-MASK_ALPHA) and new class
-                // with MASK_ALPHA. Because we only have the hard label (not raw
-                // confidence floats at output resolution), use a random
-                // Bernoulli draw weighted by MASK_ALPHA — equivalent to a
-                // first-order IIR in expectation and much cheaper than storing
-                // all 6 float channels for the previous frame.
-                blended[i] = (Math.random() < MASK_ALPHA) ? classMask[i] : _prevMask[i];
-            }
-            // Second pass: remove isolated single-pixel islands that survived
-            // blending (a background pixel surrounded by skin, or vice versa).
-            // This is a fast 4-neighbor majority-vote correction that kills
-            // salt-and-pepper noise in the blended mask without touching solid
-            // regions.
-            for (let y = 1; y < height - 1; y++) {
-                for (let x = 1; x < width - 1; x++) {
-                    const i = y * width + x;
-                    const c = blended[i];
-                    const n4 = blended[i - 1] + blended[i + 1] + blended[i - width] + blended[i + width];
-                    // If all 4 neighbours agree on a class different from c,
-                    // snap this pixel to the majority neighbour class.
-                    if (blended[i - 1] === blended[i + 1] &&
-                        blended[i - 1] === blended[i - width] &&
-                        blended[i - 1] === blended[i + width] &&
-                        blended[i - 1] !== c) {
-                        blended[i] = blended[i - 1];
-                    }
+        // Why here and not on the output argmax mask?
+        // Blending hard labels (the old approach) randomly placed stale body
+        // labels in regions the current frame classifies as background, causing
+        // body detection to "extend" into non-body areas. Blending floats is
+        // safe because background confidence in channel 0 stays high wherever
+        // the person has moved away — the EWA-smoothed argmax stays background.
+        //
+        // Only active in VIDEO mode (live camera / sequential video playback).
+        // IMAGE mode (batch export, stills) processes each frame independently.
+        let channelsToUpsample = rawChannels;
+        if (useVideoMode && _prevChannels &&
+            _prevChanW === maskW && _prevChanH === maskH) {
+            const n = maskW * maskH;
+            channelsToUpsample = rawChannels.map((ch, c) => {
+                const prev = _prevChannels[c];
+                const out = new Float32Array(n);
+                for (let i = 0; i < n; i++) {
+                    out[i] = CHAN_ALPHA * ch[i] + (1 - CHAN_ALPHA) * prev[i];
                 }
-            }
-            classMask = blended;
+                return out;
+            });
         }
+        // Store the (possibly smoothed) channels for the next frame.
+        _prevChannels = channelsToUpsample.map((ch) => ch.slice());
+        _prevChanW = maskW;
+        _prevChanH = maskH;
+
+        // If smoothing produced different channels, re-derive classMask from them.
+        if (channelsToUpsample !== rawChannels) {
+            classMask = upsampleClassesBilinear(channelsToUpsample, maskW, maskH, width, height);
+        }
+        // Save output-resolution mask for the null-frame hold path.
         _prevMask = classMask;
         _prevMaskW = width;
         _prevMaskH = height;
@@ -399,12 +397,16 @@ export function inferHuman(image, width, height, settings, useVideoMode = false)
 
 // Reset temporal state when starting a new video session or switching sources.
 export function resetHumanTemporal() {
+    _prevChannels = null;
+    _prevChanW = 0;
+    _prevChanH = 0;
     _prevMask = null;
     _prevMaskW = 0;
     _prevMaskH = 0;
     _holdCount = 0;
     videoSessionStart = 0;
 }
+
 
 
 const PAL = [
