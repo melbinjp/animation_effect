@@ -54,9 +54,16 @@ if (-not (Test-Path -LiteralPath $CredentialStore)) {
     throw "Credential-store script was not found: $CredentialStore"
 }
 if (-not (Test-Path -LiteralPath $KeyPath) -or -not (Test-Path -LiteralPath "$KeyPath.pub")) {
-    throw "Dedicated RunPod key pair was not found at $KeyPath and $KeyPath.pub"
+    $keyDir = Split-Path -Parent $KeyPath
+    if (-not (Test-Path -LiteralPath $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
+    Write-Host "Dedicated RunPod key pair not found. Generating an unencrypted ed25519 key at $KeyPath..."
+    & ssh-keygen.exe -t ed25519 -f $KeyPath -N "" -q
+    if (-not (Test-Path -LiteralPath "$KeyPath.pub")) {
+        throw "Could not generate dedicated RunPod key pair at $KeyPath."
+    }
 }
 if (Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue) {
+
     throw "Local port $LocalPort is already in use. Choose another -LocalPort."
 }
 
@@ -173,13 +180,19 @@ if ($health.StatusCode -ne 200 -or $health.Content -notmatch 'Linearty native') 
     throw "Tunnel started but did not serve the expected Web UI at http://127.0.0.1:$LocalPort/"
 }
 
-[pscustomobject]@{
+$summary = [pscustomobject]@{
     PodId          = $podId
     ComputeType    = $ComputeType
     Hardware       = if ($ComputeType -eq 'GPU') { $pod.gpuTypeId } else { "$($pod.vcpuCount) vCPUs" }
     PodSshEndpoint = "$podHost`:$sshPort"
     WebUi          = "http://127.0.0.1:$LocalPort/"
     TunnelProcess  = $tunnel.Id
-    CostPerHour    = $pod.costPerHr
+    CostPerHour    = "`$$($pod.costPerHr)/hr"
     OutputFolder   = '/workspace/animation_effect/native/webui_outputs'
 }
+$summary
+
+Write-Host "`n[DEPLOYED] Studio running at http://127.0.0.1:$LocalPort/"
+Write-Host "To shut down this pod and stop billing when finished:"
+Write-Host "  .\manage-runpod.ps1 -Terminate '$podId'`n"
+

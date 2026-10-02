@@ -98,6 +98,12 @@ python cli.py input.mp4 -o output.mp4 [OPTIONS]
 
 FastAPI-based studio interface providing frame preview, split-view comparison, timeline scrubbing, parameter tuning, and render queue execution.
 
+### 1-Click Launch (Windows)
+
+Double-click `run-server.bat` in the root (or `native/run-server.bat`). It will check dependencies, start the server, and open your browser to `http://127.0.0.1:8765/`.
+
+### Manual Launch (Cross-platform)
+
 ```bash
 python webui.py --host 127.0.0.1 --port 8765
 ```
@@ -118,16 +124,35 @@ Navigate to `http://127.0.0.1:8765/`.
 
 ## RunPod Cloud Deployment
 
-### Method A: Automated Deployment (PowerShell)
+### Automated Deployment (PowerShell)
 
-Automates pod provisioning, environment setup, Web UI launch, and SSH tunnel creation:
+Provisions a RunPod pod, bootstraps dependencies, starts the studio in the background, establishes an SSH tunnel to your local machine, and prints the URL:
 
 ```powershell
 cd native
-.\deploy-runpod-webui.ps1
+
+# GPU Pod (e.g. RTX 3090):
+.\deploy-runpod.ps1 -ComputeType GPU -GpuTypeId 'NVIDIA GeForce RTX 3090'
+
+# CPU Pod (e.g. 32 vCPUs):
+.\deploy-runpod.ps1 -ComputeType CPU -VcpuCount 32
 ```
 
-*Prerequisites:* RunPod API key configured in credential store and SSH key generated at `~/.ssh/runpod_animation_effect_ed25519`.
+*(Note: `deploy-runpod-gpu.ps1` and `deploy-runpod-webui.ps1` remain available as backward-compatible wrappers).*
+
+### Managing & Terminating Cloud Pods
+
+```powershell
+# List active pods and billing rates:
+.\manage-runpod.ps1 -List
+
+# Terminate a pod and close its SSH tunnel when finished:
+.\manage-runpod.ps1 -Terminate '<pod-id>'
+
+# Close all local tunnel background processes:
+.\manage-runpod.ps1 -CloseTunnels
+```
+
 
 ### Method B: Manual Deployment (Linux / Any OS)
 

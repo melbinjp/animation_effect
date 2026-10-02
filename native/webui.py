@@ -2260,11 +2260,38 @@ window.addEventListener('DOMContentLoaded', () => {
 
 if __name__ == "__main__":
     import uvicorn
+    import shutil
+    import webbrowser
+    import threading
+    from hw_detect import log_hardware_status
 
     parser = argparse.ArgumentParser(description="Local browser UI for the Linearty native CLI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-open", action="store_true", help="Do not automatically open browser on launch")
     args = parser.parse_args()
 
-    print(f"Linearty Studio web UI at http://{args.host}:{args.port}/")
+    # Preflight hardware and system dependency checks
+    log_hardware_status()
+    missing_deps = []
+    if not shutil.which("ffmpeg"):
+        missing_deps.append("ffmpeg")
+    if not shutil.which("ffprobe"):
+        missing_deps.append("ffprobe")
+    if missing_deps:
+        print(f"[WARNING] Missing system dependencies: {', '.join(missing_deps)}. Video probe and rendering require FFmpeg in PATH.", file=sys.stderr)
+
+    url = f"http://{args.host}:{args.port}/"
+    print(f"[READY] Linearty Studio web UI live at {url}")
+
+    if not args.no_open and args.host in ("127.0.0.1", "localhost"):
+        def _open_browser():
+            time.sleep(1.2)
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        threading.Thread(target=_open_browser, daemon=True).start()
+
     uvicorn.run(app, host=args.host, port=args.port)
+
