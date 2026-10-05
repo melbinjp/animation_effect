@@ -790,6 +790,7 @@ def index():
                 "ink": "#%02x%02x%02x" % v.get("ink", (0, 0, 0)),
                 "clean_speckles": v.get("clean_speckles", True),
                 "merge_double_edge": v.get("merge_double_edge", False),
+                "skip_auto_normalize": bool(v.get("skip_auto_normalize", False)),
             }
             for k, v in STYLE_PRESETS.items()
         }
@@ -1814,6 +1815,16 @@ presetChips.forEach(chip => {
       humanAwareEl.checked = false;
     } else if (!humanAwareEl.checked && pKey !== 'custom') {
       humanAwareEl.checked = true;
+    }
+
+    const autoEl = document.getElementById('autoNormalize');
+    const meta = (typeof PRESET_DATA !== 'undefined') ? PRESET_DATA[pKey] : null;
+    if (autoEl && meta && meta.skip_auto_normalize) {
+      if (autoEl.dataset.held === undefined) autoEl.dataset.held = autoEl.checked ? '1' : '0';
+      autoEl.checked = false;
+    } else if (autoEl && autoEl.dataset.held !== undefined) {
+      autoEl.checked = autoEl.dataset.held === '1';
+      delete autoEl.dataset.held;
     }
 
     schedulePreview();

@@ -6,6 +6,8 @@ import numpy as np
 import cv2
 
 from ink import apply_gray_world, paint_ultimate_ink, temporal_denoise_gray, blend_body_overlay
+from anime_cel import paint_anime
+from scene_seg import segment_rgb
 
 
 def _rect_kernel(size):
@@ -163,6 +165,16 @@ def _process_frame_impl(rgba, settings, rgb=None):
             class_mask=settings.get("class_mask"),
             extra_lines=settings.get("extra_lines"),
             alpha=settings.get("alpha"),
+        )
+    elif settings.get("engine") == "anime":
+        seg = segment_rgb(rgb)
+        out = paint_anime(
+            rgb, edges,
+            class_mask=settings.get("class_mask"),
+            scene_mask=seg["mask"],
+            scene_class=seg["klass"],
+            extra_lines=settings.get("extra_lines"),
+            ink=tuple(preset.get("ink", (28, 18, 42))),
         )
     else:
         out = _paint_classic(rgb, gray_raw, edges, settings, last_mean)

@@ -33,6 +33,7 @@ For high-throughput, multi-core, or CUDA GPU server-side rendering, refer to the
 | `blueprint` | XDoG | Architectural drafting style with pale cyan canvas and deep navy lines. |
 | `classic` | Canny | Direct OpenCV Canny edge extraction without XDoG shading. |
 | `body` | XDoG + Seg | Multi-class body segmentation map blended directly over ink layer. |
+| `anime` | Anime cel | Flat colour taken from the frame. Saturated, brightly lit, ink on region borders and strong smoothed edges. Restyles the picture. It does not invent motion. |
 
 ---
 

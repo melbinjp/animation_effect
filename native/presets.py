@@ -191,6 +191,23 @@ STYLE_PRESETS = {
         "merge_double_edge": False,
         "body_map_overlay": True,
     },
+    "anime": {
+        "label": "Anime",
+        "engine": "anime",
+        "background": (255, 250, 245),
+        "ink": (28, 18, 42),
+        "low_threshold": 40,
+        "high_threshold": 120,
+        "bilateral_diameter": 9,
+        "sigma": 120,
+        "smooth_passes": 2,
+        "xdog_sigma": 0.8,
+        "xdog_tau": 0.98,
+        "xdog_phi": 180,
+        "clean_speckles": True,
+        "merge_double_edge": True,
+        "skip_auto_normalize": True,
+    },
     "custom": {
         "label": "Custom / Experiment",
         "engine": "ultimate",
@@ -222,6 +239,7 @@ HUMAN_TUNING = {
     "ultimate": {"skin_smooth": 0.8, "hair_boost": 1.32, "silhouette_boost": 0.72, "subject_isolation": 0.46},
     "studio": {"skin_smooth": 0.78, "hair_boost": 1.32, "silhouette_boost": 0.82, "subject_isolation": 0.38},
     "pencil": {"skin_smooth": 0.72, "hair_boost": 1.2, "silhouette_boost": 0.6, "subject_isolation": 0.26},
+    "anime": {"skin_smooth": 0.92, "hair_boost": 1.1, "silhouette_boost": 0.5, "subject_isolation": 0.12},
 }
 
 # Aliases for UI label consistency.

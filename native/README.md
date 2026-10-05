@@ -76,7 +76,7 @@ python cli.py input.mp4 -o output.mp4 [OPTIONS]
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `-o, --output` | string | `output.mp4` | Destination video path. |
-| `--preset` | string | `ultimate` | Style preset (`ultimate`, `portrait`, `subject`, `studio`, `manga`, `pencil`, `neon`, `vivid`, `warm`, `blueprint`, `classic`, `body`, `custom`). |
+| `--preset` | string | `ultimate` | Style preset (`ultimate`, `portrait`, `subject`, `studio`, `manga`, `pencil`, `neon`, `vivid`, `warm`, `blueprint`, `classic`, `body`, `anime`, `custom`). |
 | `--detail` | integer | `62` | Detail extraction slider (1–100). |
 | `--line-weight` | integer | `1` | Dilation pass count for line thickness. |
 | `--human-aware` | flag | Auto | Enables MediaPipe segmentation (default `True` except for `classic`). |

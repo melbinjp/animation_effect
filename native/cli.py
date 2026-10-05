@@ -180,6 +180,8 @@ def _build_settings(args):
         # libx264 args with the right CRF instead of a hardcoded one.
         "crf": args.crf,
     }
+    if preset.get("skip_auto_normalize"):
+        settings["auto_normalize"] = False
     if preset_name == "custom":
         settings.update({"use_bilateral": True, "use_gaussian": False, "use_median": False})
     if args.human_aware:
