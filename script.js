@@ -261,6 +261,25 @@ const STYLE_PRESETS = {
         mergeDoubleEdge: false,
         bodyMapOverlay: true
     },
+    anime: {
+        label: 'Anime',
+        engine: 'anime',
+        background: [255, 250, 245],
+        ink: [28, 18, 42],
+        lowThreshold: 40,
+        highThreshold: 120,
+        bilateralDiameter: 9,
+        sigma: 120,
+        smoothPasses: 2,
+        xdogSigma: 0.8,
+        xdogTau: 0.98,
+        xdogPhi: 180,
+        cleanSpeckles: true,
+        mergeDoubleEdge: true,
+        // Contrast stretch fights the flat tones. Structural ink comes from
+        // the smoothed frame instead.
+        skipAutoNormalize: true
+    },
     custom: {
         label: 'Custom / Experiment',
         engine: 'ultimate',
@@ -316,7 +335,10 @@ const state = {
     // updates these before each ffmpeg.exec() call so the bar moves in the
     // correct sub-range (encoding vs. final concat/mux).
     encodePhaseOffset: 90,
-    encodePhaseScale: 0.1
+    encodePhaseScale: 0.1,
+    // Live Anime playback may reuse one scene mask for two frames. Batch
+    // export leaves this null because those frames are not in order.
+    animeHold: null
 };
 
 // All thresholds are advisory only — the app never blocks processing based on
@@ -689,6 +711,18 @@ class LineArtProcessor {
             .getContext('2d', { willReadFrequently: true })
             .getImageData(0, 0, width, height); // synchronous pixel copy
 
+        if (payload.engine === 'anime' && typeof SceneSeg !== 'undefined') {
+            const seq = !!opts.videoMode;
+            const step = SceneSeg.nextScene(
+                imageData.data, width, height, 4,
+                seq ? state.animeHold : null,
+                seq
+            );
+            payload.sceneMask = step.mask;
+            payload.sceneClass = step.klass;
+            state.animeHold = step.hold;
+        }
+
         const id = this._idCounter++;
         const workerIndex = await this._acquireWorker();
         if (workerIndex === -1) {
@@ -1008,6 +1042,7 @@ function applyHumanPresetSliders(presetKey) {
         // specifically were partly a symptom of. Scaled gentler throughout
         // to match pencil's already-soft character.
         pencil: { skinSmooth: 0.72, hairBoost: 1.2, silhouetteBoost: 0.6, subjectIsolation: 0.26 },
+        anime: { skinSmooth: 0.92, hairBoost: 1.1, silhouetteBoost: 0.5, subjectIsolation: 0.12 },
     };
     const vals = table[presetKey] || table.ultimate;
     const setSlider = (el, spanId, value) => {
@@ -1034,6 +1069,7 @@ async function playLiveVideo() {
     // so the smoothing window starts fresh rather than blending the first
     // frame against stale mask data from a previous session or file.
     loadHumanModule().then((mod) => { if (mod.resetHumanTemporal) mod.resetHumanTemporal(); }).catch(() => {});
+    state.animeHold = null;
     try {
         await video.play();
 
@@ -1172,7 +1208,9 @@ function getSettings() {
             ? document.getElementById('customCleanSpeckles').checked
             : preset.cleanSpeckles !== false,
         cleanSpecklesIntensity: Number(document.getElementById('customCleanSpecklesIntensity').value),
-        autoNormalize: presetKey !== 'custom' || document.getElementById('customAutoNormalize').checked,
+        autoNormalize: preset.skipAutoNormalize
+            ? false
+            : (presetKey !== 'custom' || document.getElementById('customAutoNormalize').checked),
         darkBoost: presetKey === 'custom' && document.getElementById('customDarkBoost').checked,
         darkBoostClip: Number(document.getElementById('customDarkBoostClip').value),
         mergeDoubleEdge: presetKey === 'custom'
@@ -2867,7 +2905,7 @@ async function runLiveSource(stream, { label, fileName, successMessage }) {
     // session (different person, different background) must not bleed into
     // the new one's smoothing window.
     loadHumanModule().then((mod) => { if (mod.resetHumanTemporal) mod.resetHumanTemporal(); }).catch(() => {});
-
+    state.animeHold = null;
 
     // Screen/tab shares (and some cameras) can end on their own — the
     // browser's own "Stop sharing" control, a closed tab, an unplugged
@@ -2980,6 +3018,7 @@ async function handleFileSelection(file) {
         state.cancelRequested = false;
         resetProgress();
         clearRenderedOutput();
+        state.animeHold = null;
         state.selectedFile = file;
         await readSelectedFile(file);
         await renderPreview();
@@ -3010,6 +3049,7 @@ function resetWorkspace() {
     }
     state.selectedFile = null;
     state.fileKind = null;
+    state.animeHold = null;
     state.sourceImage = null;
     state.sourceVideo = null;
     state.mediaWidth = null;

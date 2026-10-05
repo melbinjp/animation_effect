@@ -1,5 +1,8 @@
 'use strict';
 
+importScripts('scene-segmentation.js');
+importScripts('anime-cel.js');
+
 // ─────────────────────────────────────────────────────────────────────────────
 // gpu-worker.js — WebGPU-accelerated line-art pipeline with OpenCV CPU fallback
 //
@@ -864,6 +867,13 @@ class CpuProcessor {
         cv.cvtColor(this.src, this.rgb, cv.COLOR_RGBA2RGB);
         if (settings.whiteBalance) applyGrayWorld(this.rgb);
 
+        // Anime samples this copy. Later bilateral passes reuse this.rgb.
+        let animeColor = null;
+        if (settings.engine === 'anime') {
+            animeColor = new Uint8Array(this.rgb.data.length);
+            animeColor.set(this.rgb.data);
+        }
+
         const detailFactor  = settings.detail / 62;
         const lowThreshold  = Math.max(12, Math.round(settings.preset.lowThreshold  / detailFactor));
         const highThreshold = Math.max(lowThreshold + 24, Math.round(settings.preset.highThreshold / detailFactor));
@@ -996,6 +1006,24 @@ class CpuProcessor {
             return paintUltimateInk(this.gray, this.edges, width, height, settings, settings.classMask, settings.extraLines);
         }
 
+        if (settings.engine === 'anime') {
+            if (typeof AnimeCel === 'undefined') {
+                throw new Error('Anime renderer failed to load.');
+            }
+            return AnimeCel.paint({
+                rgb: animeColor || this.rgb.data,
+                channels: 3,
+                width,
+                height,
+                edges: this.edges.data,
+                classMask: settings.classMask || null,
+                sceneMask: settings.sceneMask || null,
+                sceneClass: settings.sceneClass || null,
+                extraLines: settings.extraLines || null,
+                ink: settings.preset.ink
+            });
+        }
+
         cv.bitwise_not(this.edges, this.edges);
 
         const bg    = settings.preset.background;
@@ -1077,7 +1105,7 @@ initGpu()
 
 self.onmessage = function ({ data: msg }) {
     if (msg.type === 'process') {
-        const reqCpu = msg.settings.autoNormalize || msg.settings.darkBoost || msg.settings.cleanSpeckles || msg.settings.engine === 'ultimate' || msg.settings.whiteBalance;
+        const reqCpu = msg.settings.autoNormalize || msg.settings.darkBoost || msg.settings.cleanSpeckles || msg.settings.engine === 'ultimate' || msg.settings.engine === 'anime' || msg.settings.whiteBalance;
         if (reqCpu && cpuProcessor) {
             try {
                 const result = cpuProcessor.process(msg.rgbaData, msg.width, msg.height, msg.settings);
